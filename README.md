@@ -78,6 +78,13 @@ rather than retrying early. Retries, including requests that timed out after bei
 processed remotely, can incur additional cost. Authentication/validation failures
 and malformed successful responses are not retried.
 
+A stopped GPT completion can omit candidate IDs. Valid returned judgments are
+retained as a partial batch; omitted candidates remain explicit errors with null
+labels, never `skip`. Unknown/duplicate IDs and malformed judgments still fail
+validation. Jev's three probabilities may sum within 0.015 of one to accommodate
+two-decimal rounding. Their reported values and selected label are preserved, not
+renormalized; classification JSONL and summary counts flag rounding discrepancies.
+
 Credentials are required before requests begin. The run refuses to overwrite an
 existing `results/run/requests.jsonl`, preventing an accidental paid rerun into the
 same directory. There is no automatic resume. If a retry of the whole experiment
@@ -112,6 +119,14 @@ are overwritten; the request log and manifest are never overwritten. Interrupted
 runs retain completed batches; an unterminated, malformed final log line is
 flagged and omitted. Malformed interior lines or conflicting identities fail
 reporting rather than silently mixing results.
+
+Report-only processing also re-extracts saved HTTP-200 validation failures with
+the current parser. This recovers valid answers rejected by earlier batch-wide
+checks **without new API calls or edits to the original request log**. Reports
+record the extraction version and source-log hash. `recorded_failed_attempts`
+retains the original failure count; `failed_attempts` reflects current validation.
+`partial_batches` have some valid answers; `failed_batches` have none.
+Cost, token usage, request timing, and wall time remain the original measurements.
 
 ## Reading the numbers
 

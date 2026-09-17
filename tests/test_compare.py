@@ -323,16 +323,14 @@ def test_answer_mapping_and_usage(prepared, provider):
         assert all(answer["reason"] is None for answer in answers)
 
 
-@pytest.mark.parametrize("failure", ["missing", "extra", "duplicate", "label", "reason", "refusal", "truncated"])
+@pytest.mark.parametrize("failure", ["extra", "duplicate", "label", "reason", "refusal", "truncated"])
 def test_gpt_rejects_invalid_answers(prepared, failure):
     _, jobs = prepared
     batch, payload = jobs["gpt"]["furniture.co.uk"][0]
     body = response_for("gpt", payload)
     message = body["choices"][0]["message"]
     judgments = json.loads(message["content"])["judgments"]
-    if failure == "missing":
-        judgments.pop()
-    elif failure == "extra":
+    if failure == "extra":
         judgments.append({"id": "unknown", "label": "skip", "reason": ""})
     elif failure == "duplicate":
         judgments.append(judgments[0])
@@ -657,6 +655,7 @@ def test_failed_and_missing_pairs_do_not_enter_agreement(completed_run):
     failed = next(record for record in records if record["record_type"] == "batch")
     failed.update(status="error", error="invalid_response", answers=[])
     failed["attempts"][0]["error"] = "invalid_response"
+    failed["raw_response"]["choices"][0]["message"]["content"] = "unparseable response"
     missing = next(record for record in reversed(records) if record["record_type"] == "batch")
     records = [record for record in records if record is not missing and record["record_type"] != "run_end"
                and not (record["record_type"] == "group_end" and record["provider"] == missing["provider"]
@@ -795,3 +794,106 @@ def test_no_completed_batches_reports_unknown_not_zero(completed_run):
         assert group["cost_estimate"]["priced_attempts_subtotal_usd"] is None
     assert all(value["agreement_rate"] is None for value in summary["agreement"].values())
     assert not summary["all_pairs_classified"] and not summary["run_complete"]
+
+
+@pytest.mark.parametrize("probability_sum", [0.985, 0.99, 1.01, 1.015])
+def test_jev_rounding_preserves_reported_values(prepared, probability_sum):
+    _, jobs = prepared
+    batch, payload = jobs["jev"]["furniture.co.uk"][0]
+    body = response_for("jev", payload)
+    original = body["answers"]["candidate_0"]["probabilities"]
+    original["positive"] += probability_sum - 1
+    snapshot = copy.deepcopy(body)
+    answers = compare.parse_answers("jev", body, batch)
+    assert answers[0]["probabilities"] == original and body == snapshot
+    assert answers[0]["probability_sum"] == pytest.approx(probability_sum)
+    assert answers[0]["probability_rounding_warning"] is True
+    assert answers[0]["label"] == "positive"
+
+
+@pytest.mark.parametrize("probability_sum", [0.984, 1.016])
+def test_jev_rounding_tolerance_remains_bounded(prepared, probability_sum):
+    _, jobs = prepared
+    batch, payload = jobs["jev"]["furniture.co.uk"][0]
+    body = response_for("jev", payload)
+    body["answers"]["candidate_0"]["probabilities"]["positive"] += probability_sum - 1
+    with pytest.raises(ValueError, match="rounding tolerance"):
+        compare.parse_answers("jev", body, batch)
+
+
+@pytest.mark.parametrize("missing_count", [1, 4, 20])
+def test_gpt_partial_answers_preserve_id_mapping(prepared, missing_count):
+    _, jobs = prepared
+    batch, payload = jobs["gpt"]["furniture.co.uk"][0]
+    body = response_for("gpt", payload)
+    message = body["choices"][0]["message"]
+    judgments = json.loads(message["content"])["judgments"]
+    returned = judgments[missing_count:]
+    message["content"] = json.dumps({"judgments": returned})
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))) as client:
+        result = compare.run_batch(client, "gpt", "furniture.co.uk", batch, payload, "dummy")
+    assert result["status"] == ("partial" if returned else "error")
+    assert result["error"] == "missing_candidate_answers" and result["retries"] == 0
+    assert len(result["answers"]) == len(returned)
+    returned_ids = {row["id"] for row in returned}
+    assert {answer["candidate_id"] for answer in result["answers"]} == returned_ids
+    assert all(json.loads(answer["pair_id"])[3] == answer["candidate_id"] for answer in result["answers"])
+
+
+def test_offline_reextraction_preserves_log_and_accounting(completed_run):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    baseline = compare.write_reports(path, directory)
+    records, _ = compare.read_request_log(log_path)
+    gpt = next(record for record in records if record["record_type"] == "batch" and record["provider"] == "gpt")
+    jev = next(record for record in records if record["record_type"] == "batch" and record["provider"] == "jev")
+    message = gpt["raw_response"]["choices"][0]["message"]
+    judgments = json.loads(message["content"])["judgments"]
+    missing_id = judgments.pop()["id"]
+    message["content"] = json.dumps({"judgments": judgments})
+    jev["raw_response"]["answers"]["candidate_0"]["probabilities"]["positive"] = 0.79
+    for record in (gpt, jev):
+        record.update(status="error", error="invalid_response", answers=[])
+        record["attempts"][-1]["error"] = "invalid_response"
+    write_blocks(log_path, records)
+    original_log, original_manifest = log_path.read_bytes(), path.read_bytes()
+    summary = compare.write_reports(path, directory)
+    assert log_path.read_bytes() == original_log and path.read_bytes() == original_manifest
+    assert summary["extraction"]["request_log_sha256"] == hashlib.sha256(original_log).hexdigest()
+    for key, old in baseline["groups"].items():
+        new = summary["groups"][key]
+        assert new["wall_seconds"] == old["wall_seconds"]
+        assert new["request_latency_seconds"] == old["request_latency_seconds"]
+        assert new["cost_estimate"] == old["cost_estimate"] and new["usage"] == old["usage"]
+    shop = gpt["shop"]
+    assert summary["agreement"][shop]["paired_success"] == 399
+    gpt_group, jev_group = summary["groups"][f"gpt/{shop}"], summary["groups"][f"jev/{shop}"]
+    assert gpt_group["successful_pairs"] == 399 and gpt_group["failed_pairs"] == 1
+    assert gpt_group["partial_batches"] == 1 and gpt_group["failed_batches"] == 0
+    assert jev_group["successful_pairs"] == 400 and jev_group["failed_pairs"] == 0
+    assert jev_group["failed_attempts"] == 0 and jev_group["recorded_failed_attempts"] == 1
+    assert jev_group["probability_rounding_warnings"] == 1
+    assert gpt_group["reextracted_batches"] == jev_group["reextracted_batches"] == 1
+    classifications = [json.loads(line) for line in (directory / "gpt_classifications.jsonl").read_text().splitlines()]
+    errors = [row for row in classifications if row["status"] != "ok"]
+    assert len(errors) == 1 and errors[0]["candidate_id"] == missing_id
+    assert errors[0]["label"] is None and errors[0]["error"] == "missing_candidate_answer"
+    assert summary["run_complete"] and not summary["all_pairs_classified"]
+    before = {file.name: file.read_bytes() for file in directory.iterdir()}
+    assert compare.write_reports(path, directory) == summary
+    assert {file.name: file.read_bytes() for file in directory.iterdir()} == before
+
+
+def test_new_partial_record_reports_returned_answers(completed_run):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    records, _ = compare.read_request_log(log_path)
+    record = next(record for record in records if record["record_type"] == "batch")
+    record["answers"].pop()
+    record["status"], record["error"] = "partial", "missing_candidate_answers"
+    record["attempts"][-1]["error"] = record["error"]
+    write_blocks(log_path, records)
+    summary = compare.write_reports(path, directory)
+    group = summary["groups"][f"{record['provider']}/{record['shop']}"]
+    assert group["successful_pairs"] == 399 and group["failed_pairs"] == 1
+    assert group["partial_batches"] == 1 and group["reextracted_batches"] == 0

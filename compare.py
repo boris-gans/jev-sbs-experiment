@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import copy
 import csv
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -44,6 +45,8 @@ ENDPOINTS = {
 MAX_RETRIES = 2
 TIMEOUT_SECONDS = 120.0
 MAX_RETRY_DELAY = 60.0
+PROBABILITY_SUM_TOLERANCE = 0.015  # Three probabilities rounded to two decimal places.
+EXTRACTION_VERSION = "partial-answers-v2"
 PRICING = {
     "as_of": "2026-09-17", "currency": "USD", "unit": "per million tokens",
     "gpt": {"input": 0.05, "cached_input": 0.005, "output": 0.40,
@@ -350,7 +353,8 @@ def strict_json(text: str) -> object:
 
 def parse_answers(provider: str, body: dict, batch: dict) -> list:
     require(isinstance(body.get("model"), str) and bool(body["model"]), "Missing served model")
-    ids = [item["candidate_id"] for item in batch["candidates"]]
+    items = batch["candidates"]
+    ids = [item["candidate_id"] for item in items]
     if provider == "gpt":
         require(len(body["choices"]) == 1, "Expected one completion")
         choice = body["choices"][0]
@@ -359,13 +363,15 @@ def parse_answers(provider: str, body: dict, batch: dict) -> list:
         parsed = strict_json(choice["message"]["content"])
         require(set(parsed) == {"judgments"}, "Invalid completion object")
         answers = index_records(parsed["judgments"], "id")
-        require(set(answers) == set(ids), "Missing or unknown candidate answers")
+        require(set(answers) <= set(ids), "Unknown candidate answers")
         for answer in answers.values():
             require(set(answer) == {"id", "label", "reason"}, "Invalid judgment fields")
             require(answer["label"] in LABELS, "Invalid label")
             require(isinstance(answer["reason"], str) and len(answer["reason"]) <= 80, "Invalid reason")
-        normalized = [{"label": answers[identity]["label"], "reason": answers[identity]["reason"],
-                       "probabilities": None, "confidence": None} for identity in ids]
+        items = [item for item in items if item["candidate_id"] in answers]
+        normalized = [{"label": answers[item["candidate_id"]]["label"],
+                       "reason": answers[item["candidate_id"]]["reason"],
+                       "probabilities": None, "confidence": None} for item in items]
     else:
         answers = body["answers"]
         require(set(answers) == {f"candidate_{i}" for i in range(len(ids))}, "Missing or unknown question answers")
@@ -378,12 +384,22 @@ def parse_answers(provider: str, body: dict, batch: dict) -> list:
             values = [*probabilities.values(), answer["confidence"]]
             require(all(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1
                         for value in values), "Invalid probability or confidence")
-            require(math.isclose(sum(probabilities.values()), 1, abs_tol=1e-6), "Probabilities do not sum to one")
+            probability_sum = sum(probabilities.values())
+            require(math.isclose(probability_sum, 1, rel_tol=0, abs_tol=PROBABILITY_SUM_TOLERANCE + 1e-12),
+                    "Probabilities do not sum to one within rounding tolerance")
             require(probabilities[answer["choice"]] >= max(probabilities.values()) - 1e-6, "Choice is not maximal")
             normalized.append({"label": answer["choice"], "reason": None,
-                               "probabilities": probabilities, "confidence": answer["confidence"]})
+                               "probabilities": probabilities, "confidence": answer["confidence"],
+                               "probability_sum": probability_sum,
+                               "probability_rounding_warning": not math.isclose(probability_sum, 1, abs_tol=1e-6)})
     return [{"pair_id": item["pair_id"], "candidate_id": item["candidate_id"], **answer}
-            for item, answer in zip(batch["candidates"], normalized, strict=True)]
+            for item, answer in zip(items, normalized, strict=True)]
+
+
+def extraction_status(answers: list, expected_count: int) -> tuple[str, str | None]:
+    if len(answers) == expected_count:
+        return "ok", None
+    return ("partial" if answers else "error"), "missing_candidate_answers"
 
 
 def normalize_usage(provider: str, raw: dict | None) -> dict:
@@ -456,7 +472,7 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
                 attempt["usage"] = normalize_usage(provider, attempt["raw_usage"])
                 if status == 200:
                     record["answers"] = parse_answers(provider, body, batch)
-                    record["status"] = "ok"
+                    record["status"], attempt["error"] = extraction_status(record["answers"], record["batch_size"])
             except (ValueError, KeyError, TypeError, AttributeError, IndexError):
                 attempt["error"] = "invalid_response"
             if status != 200:
@@ -546,6 +562,24 @@ def attempt_cost(provider: str, usage: dict) -> float | None:
     return ((inputs - cached) * rates["input"] + cached * rates["cached_input"] + outputs * rates["output"]) / 1_000_000
 
 
+def reextract_record(record: dict, batch: dict) -> dict:
+    if (record["error"] != "invalid_response" or record["raw_response"] is None
+            or record["attempts"][-1]["http_status"] != 200):
+        return record
+    try:
+        normalize_usage(record["provider"], record["raw_response"].get("usage"))
+        answers = parse_answers(record["provider"], record["raw_response"], batch)
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+        return record
+    result = copy.deepcopy(record)
+    result["recorded_status"], result["recorded_error"] = record["status"], record["error"]
+    result["answers"] = answers
+    result["status"], result["error"] = extraction_status(answers, record["batch_size"])
+    result["attempts"][-1]["recorded_error"] = record["attempts"][-1]["error"]
+    result["attempts"][-1]["error"] = result["error"]
+    return result
+
+
 def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int) -> dict:
     attempts = [attempt for record in records for attempt in record["attempts"]]
     complete = end is not None and len(records) == len(expected)
@@ -569,7 +603,7 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
     priced = [cost for cost in costs if cost is not None]
     subtotal = math.fsum(priced) if priced else None
     cost_complete = complete and bool(attempts) and len(priced) == len(attempts)
-    successes = [answer for record in records if record["status"] == "ok" for answer in record["answers"]]
+    successes = [answer for record in records if record["status"] in ("ok", "partial") for answer in record["answers"]]
     expected_pairs = sum(len(batch["candidates"]) for batch in expected)
     recorded_pairs = sum(record["batch_size"] for record in records)
     return {
@@ -577,7 +611,11 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
         "expected_batches": len(expected), "batch_requests": len(records), "http_attempts": len(attempts),
         "retries": sum(len(record["attempts"]) - 1 for record in records),
         "failed_attempts": sum(attempt["error"] is not None for attempt in attempts),
+        "recorded_failed_attempts": sum(attempt.get("recorded_error", attempt["error"]) is not None for attempt in attempts),
         "failed_batches": sum(record["status"] == "error" for record in records),
+        "partial_batches": sum(record["status"] == "partial" for record in records),
+        "reextracted_batches": sum("recorded_status" in record for record in records),
+        "probability_rounding_warnings": sum(answer.get("probability_rounding_warning", False) for answer in successes),
         "successful_pairs": len(successes), "failed_pairs": recorded_pairs - len(successes),
         "missing_pairs": expected_pairs - recorded_pairs,
         "pairs_per_second": len(successes) / wall if wall else None,
@@ -654,16 +692,21 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
                         "Unexpected generation override")
             require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]], "Batch pair mismatch")
             require(record["batch_size"] == len(batch["candidates"]), "Batch size mismatch")
-            require(record["status"] in ("ok", "error") and bool(record["attempts"]), "Invalid batch status/attempts")
+            require(record["status"] in ("ok", "partial", "error") and bool(record["attempts"]), "Invalid batch status/attempts")
             answers = index_records(record["answers"], "pair_id")
-            required_ids = set(record["pair_ids"]) if record["status"] == "ok" else set()
-            require(set(answers) == required_ids, "Invalid batch answer coverage")
+            if record["status"] == "partial":
+                require(bool(answers) and set(answers) < set(record["pair_ids"]), "Invalid partial answer coverage")
+            else:
+                required_ids = set(record["pair_ids"]) if record["status"] == "ok" else set()
+                require(set(answers) == required_ids, "Invalid batch answer coverage")
             require(all(answer["label"] in LABELS for answer in answers.values()), "Invalid recorded label")
-            observed[key] = record
+            observed[key] = reextract_record(record, batch)
 
     classifications = {provider: {} for provider in manifest["models"]}
     summary = {
         "schema_version": "jev-sbs-report-v1", "manifest_sha256": sha256(raw_manifest),
+        "extraction": {"version": EXTRACTION_VERSION, "probability_sum_tolerance": PROBABILITY_SUM_TOLERANCE,
+                       "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes())},
         "models": manifest["models"], "pricing": PRICING, "run_settings": start, "truncated_final_line": truncated,
         "limitations": [*manifest["limitations"],
                         "Interrupted runs can omit in-flight attempts; usage subtotals cover recorded attempts only."],
@@ -685,10 +728,13 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
                     "provider": provider, "shop": shop, "direction": batch["direction"],
                     "pair_id": item["pair_id"], "batch_id": batch["batch_id"],
                     "anchor_id": batch["anchor_id"], "candidate_id": item["candidate_id"],
-                    "status": record["status"] if record else "missing",
-                    "error": record["error"] if record else "batch_not_recorded",
+                    "status": "ok" if answer else ("error" if record else "missing"),
+                    "error": None if answer else ("missing_candidate_answer" if record and record["status"] == "partial"
+                                                  else record["error"] if record else "batch_not_recorded"),
+                    "recorded_batch_status": record.get("recorded_status", record["status"]) if record else None,
                     "served_model": record["served_model"] if record else None,
-                    **{key: answer.get(key) for key in ("label", "reason", "probabilities", "confidence")},
+                    **{key: answer.get(key) for key in ("label", "reason", "probabilities", "confidence",
+                                                      "probability_sum", "probability_rounding_warning")},
                 }
 
     paired = []
@@ -774,7 +820,7 @@ def main() -> None:
     except (OSError, ValueError) as error:
         parser.exit(1, f"Execution failed: {error}\n")
     if failures:
-        parser.exit(1, f"Run finished with {failures} failed batches; inspect requests.jsonl before any rerun.\n")
+        parser.exit(1, f"Run finished with {failures} incomplete batches; inspect requests.jsonl before any rerun.\n")
     print(f"All batches completed. Inspect {args.output_dir / 'summary.json'} and disagreements.csv.")
 
 
