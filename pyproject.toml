@@ -1,0 +1,16 @@
+[project]
+name = "jev-sbs-experiment"
+version = "0.1.0"
+description = "One-off Jev / GPT nano comparison on frozen SBS pairs"
+requires-python = ">=3.11"
+dependencies = ["httpx==0.28.1"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+package = false

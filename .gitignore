@@ -6,4 +6,6 @@ __pycache__/
 *.py[cod]
 .claude/plans/
 inputs/
-results/
+/results/
+/data/
+.pytest_cache/
