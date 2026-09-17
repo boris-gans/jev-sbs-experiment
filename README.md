@@ -53,7 +53,54 @@ The supplied snapshots produce **62 batches per provider**, 124 initial HTTP
 requests total, and 1,600 pair evaluations across the two providers. Reverse
 batches are often smaller than 20. Preflight prints the actual counts.
 
-## Paid run — Boris operates this
+## Reusable GPT baseline — Boris operates paid completion
+
+Import the existing GPT responses **offline** (including the 795 valid labels
+already returned). This preserves the original run and does not call either API:
+
+```sh
+.venv/bin/python compare.py --prepare-baseline --import-run results/run
+```
+
+Baseline data lives under `results/baselines/<gpt-input-fingerprint>/`:
+
+- `spec.json`: exact GPT requests and directed pair identities, published once.
+- `imported.jsonl`: immutable snapshot of the initial run; only GPT records are used.
+- `repairs/*.jsonl`: a new durable log for each paid completion invocation, with
+  each HTTP attempt flushed separately. Prior logs are never appended to or replaced.
+- `baseline.json`: created only when all expected labels exist; immutable thereafter.
+
+The fingerprint covers GPT prompts/examples, product evidence, candidate grouping,
+pair direction, model and request settings. Jev settings/criteria are excluded.
+Only the first valid answer for each pair is retained; later answers cannot replace
+it. Changing GPT inputs selects a different baseline, never silently reuses old labels.
+
+With `OPENAI_API_KEY` set securely, complete the missing answers explicitly:
+
+```sh
+.venv/bin/python compare.py --prepare-baseline --execute
+```
+
+Only incomplete batches are requested. The current baseline needs **two batches
+to fill five missing answers**, not a rerun of all 62 GPT batches. Retries send the
+original full prompt/candidate batch so context stays unchanged; only missing IDs
+are merged. Partial-answer and transient-error retries share a limit of **three
+HTTP attempts per incomplete batch per invocation**. Completed batches are skipped.
+No Jev credential or call is involved. Repeating this command after completion
+makes zero requests, even without credentials.
+
+If still incomplete, the command exits nonzero with progress preserved. A later
+explicit invocation resumes from the saved answers; it is not an unlimited loop.
+An interrupted attempt that reached the provider but was not persisted might be
+billed again. Completed attempts are checkpointed before retrying. Historical usage
+and wall times remain separate from repair usage and wall times in the baseline.
+File locking prevents concurrent baseline preparation on macOS/Linux. Completed
+baseline loading is offline-only and rejects absent, incomplete, or changed history.
+
+The separate Jev experiment command/directories are added in Step 6. Until then,
+`--execute` without `--prepare-baseline` still means the original two-provider run.
+
+## Original combined paid run — Boris operates this
 
 Keep credentials out of source, shell history, chat, and logs. Supply
 `OPENAI_API_KEY` and `TYPESAFE_API_KEY` in the process environment using your local
@@ -76,7 +123,8 @@ errors, 408, 429, and 5xx get at most two retries (up to 372 attempts for this
 workload). `Retry-After` is honored up to 60 seconds; longer waits stop that batch
 rather than retrying early. Retries, including requests that timed out after being
 processed remotely, can incur additional cost. Authentication/validation failures
-and malformed successful responses are not retried.
+and malformed successful responses are not retried. GPT responses missing candidate
+answers are retried within the same attempt budget, retaining first-valid answers.
 
 A stopped GPT completion can omit candidate IDs. Valid returned judgments are
 retained as a partial batch; omitted candidates remain explicit errors with null

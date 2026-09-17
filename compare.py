@@ -7,13 +7,17 @@ import copy
 import csv
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import statistics
+import tempfile
+import threading
 import time
+import uuid
 
 import httpx
 
@@ -434,7 +438,8 @@ def retry_delay(header: str | None, attempt: int) -> float | None:
     return max(0.0, delay) if delay <= MAX_RETRY_DELAY else None
 
 
-def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, payload: dict, key: str) -> dict:
+def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, payload: dict, key: str,
+              *, initial_answers: list | None = None, on_attempt=None) -> dict:
     started = time.perf_counter()
     record = {
         "record_type": "batch", "provider": provider, "shop": shop,
@@ -443,10 +448,16 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
         "requested_model": payload["model"], "served_model": None, "request": payload,
         "status": "error", "error": None, "answers": [], "raw_response": None, "attempts": [],
     }
+    collected = index_records(initial_answers or [], "pair_id")
+    require(set(collected) <= set(record["pair_ids"]), "Unexpected initial answers")
+    if len(collected) == record["batch_size"]:
+        record.update(status="ok", answers=list(collected.values()), retries=0, wall_seconds=0.0)
+        return record
     for number in range(MAX_RETRIES + 1):
+        record["raw_response"] = None
         attempt = {"number": number + 1, "http_status": None, "request_id": None, "served_model": None,
                    "usage": normalize_usage(provider, None), "raw_usage": None, "error": None,
-                   "retry_delay_seconds": None}
+                   "retry_delay_seconds": None, "raw_response": None, "answers": []}
         retry = False
         header = None
         tick = time.perf_counter()
@@ -467,27 +478,40 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
                 require(isinstance(body, dict), "Invalid response object")
                 if status == 200:
                     record["raw_response"] = body
+                    attempt["raw_response"] = body
                 attempt["served_model"] = body.get("model")
                 attempt["raw_usage"] = body.get("usage")
                 attempt["usage"] = normalize_usage(provider, attempt["raw_usage"])
                 if status == 200:
-                    record["answers"] = parse_answers(provider, body, batch)
-                    record["status"], attempt["error"] = extraction_status(record["answers"], record["batch_size"])
+                    attempt["answers"] = parse_answers(provider, body, batch)
+                    _, attempt["error"] = extraction_status(attempt["answers"], record["batch_size"])
+                    for answer in attempt["answers"]:
+                        collected.setdefault(answer["pair_id"], answer)
+                    retry = provider == "gpt" and len(collected) < record["batch_size"]
             except (ValueError, KeyError, TypeError, AttributeError, IndexError):
                 attempt["error"] = "invalid_response"
             if status != 200:
                 attempt["error"] = f"http_{status}"
                 retry = status in (408, 429) or 500 <= status < 600
         record["attempts"].append(attempt)
-        record["served_model"] = attempt["served_model"]
-        record["error"] = attempt["error"]
-        if not retry or number == MAX_RETRIES:
-            break
-        delay = retry_delay(header, number)
-        if delay is None:
+        if attempt["served_model"] is not None:
+            record["served_model"] = attempt["served_model"]
+        record["answers"] = [collected[identity] for identity in record["pair_ids"] if identity in collected]
+        record["status"], missing_error = extraction_status(record["answers"], record["batch_size"])
+        record["error"] = (attempt["error"] or missing_error) if missing_error else None
+        delay = retry_delay(header, number) if retry and number < MAX_RETRIES else None
+        if retry and number < MAX_RETRIES and delay is None:
             attempt["retry_not_scheduled"] = "retry_after_exceeds_budget"
-            break
         attempt["retry_delay_seconds"] = delay
+        if on_attempt is not None:
+            checkpoint = copy.deepcopy(record)
+            checkpoint.update(answers=attempt["answers"], attempts=[attempt], raw_response=attempt["raw_response"],
+                              retries=0, wall_seconds=attempt["latency_seconds"])
+            checkpoint["status"], missing_error = extraction_status(attempt["answers"], record["batch_size"])
+            checkpoint["error"] = attempt["error"] or missing_error
+            on_attempt(checkpoint)
+        if delay is None:
+            break
         time.sleep(delay)
     record["retries"] = len(record["attempts"]) - 1
     record["wall_seconds"] = time.perf_counter() - started
@@ -547,11 +571,11 @@ def read_request_log(path: Path) -> tuple[list, bool]:
     return records, truncated
 
 
-def attempt_cost(provider: str, usage: dict) -> float | None:
+def attempt_cost(provider: str, usage: dict, pricing: dict | None = None) -> float | None:
     inputs = usage["input_tokens"]
     if inputs is None:
         return None
-    rates = PRICING[provider]
+    rates = (PRICING if pricing is None else pricing)[provider]
     if provider == "jev":
         return inputs * rates["input"] / 1_000_000
     cached, outputs = usage["cached_input_tokens"], usage["output_tokens"]
@@ -563,7 +587,7 @@ def attempt_cost(provider: str, usage: dict) -> float | None:
 
 
 def reextract_record(record: dict, batch: dict) -> dict:
-    if (record["error"] != "invalid_response" or record["raw_response"] is None
+    if (record["status"] != "error" or record["answers"] or record["error"] != "invalid_response" or record["raw_response"] is None
             or record["attempts"][-1]["http_status"] != 200):
         return record
     try:
@@ -578,6 +602,208 @@ def reextract_record(record: dict, batch: dict) -> dict:
     result["attempts"][-1]["recorded_error"] = record["attempts"][-1]["error"]
     result["attempts"][-1]["error"] = result["error"]
     return result
+
+
+def baseline_spec(manifest: dict) -> dict:
+    requests = []
+    for shop, data in sorted(manifest["shops"].items()):
+        for batch in sorted(data["batches"], key=lambda item: item["batch_id"]):
+            identity = {key: batch[key] for key in ("batch_id", "direction", "anchor_id")}
+            identity["candidates"] = [{key: item[key] for key in ("pair_id", "candidate_id")}
+                                      for item in batch["candidates"]]
+            requests.append({"shop": shop, "batch": identity,
+                             "request": render_request("gpt", manifest["models"]["gpt"], data, batch)})
+    return {"schema_version": "gpt-input-v1", "requests": requests}
+
+
+def immutable_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)  # Atomic publication without replacing an existing file.
+            except FileExistsError:
+                require(path.read_bytes() == content, f"Refusing to replace immutable baseline file: {path}")
+        finally:
+            temporary.unlink()
+
+
+def check_baseline_record(record: dict, expected: dict) -> dict:
+    key = (record["shop"], record["batch_id"])
+    require(record["provider"] == "gpt" and key in expected, "Unknown GPT baseline batch")
+    job = expected[key]
+    batch = job["batch"]
+    require(record["request"] == job["request"], "GPT baseline request mismatch")
+    require(record["requested_model"] == job["request"]["model"], "GPT baseline model mismatch")
+    require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]], "GPT baseline pair mismatch")
+    require(record["anchor_id"] == batch["anchor_id"] and record["direction"] == batch["direction"], "Baseline direction mismatch")
+    require(record["batch_size"] == len(batch["candidates"]) and bool(record["attempts"]), "Invalid baseline attempt")
+    return job
+
+
+def baseline_state(directory: Path, spec: dict, pricing: dict | None = None) -> dict:
+    fingerprint = sha256(canonical_json(spec))
+    pricing = copy.deepcopy({key: PRICING[key] for key in ("as_of", "currency", "unit", "gpt")}) if pricing is None else pricing
+    expected = {(job["shop"], job["batch"]["batch_id"]): job for job in spec["requests"]}
+    all_ids = [item["pair_id"] for job in spec["requests"] for item in job["batch"]["candidates"]]
+    require(len(all_ids) == len(set(all_ids)), "Duplicate baseline pair identity")
+    answers, sources = {}, []
+    attempts = {"historical": [], "repair": []}
+    wall_times = {"historical": [], "repair": []}
+    finished = {"historical": True, "repair": True}
+    paths = ([directory / "imported.jsonl"] if (directory / "imported.jsonl").exists() else [])
+    paths += sorted((directory / "repairs").glob("*.jsonl"))
+    for path in paths:
+        kind = "historical" if path.name == "imported.jsonl" else "repair"
+        relative = str(path.relative_to(directory))
+        records, truncated = read_request_log(path)
+        if kind == "repair":
+            require(records[0]["baseline_fingerprint"] == fingerprint, "Repair log fingerprint mismatch")
+        finished[kind] &= not truncated and records[-1]["record_type"] == "run_end"
+        sources.append({"path": relative, "sha256": sha256(path.read_bytes()), "kind": kind,
+                        "truncated_final_line": truncated, "run_settings": records[0]})
+        seen = set()
+        for index, record in enumerate(records):
+            if record["record_type"] == "group_end" and record["provider"] == "gpt":
+                wall_times[kind].append({"source_log": relative, "shop": record["shop"], "wall_seconds": record["wall_seconds"]})
+            if record["record_type"] != "batch" or record["provider"] != "gpt":
+                continue
+            job = check_baseline_record(record, expected)
+            identity = record["baseline_attempt_id"] if kind == "repair" else record["batch_id"]
+            require(identity not in seen, "Duplicate baseline history record")
+            seen.add(identity)
+            attempts[kind].extend(record["attempts"])
+            for number, attempt in enumerate(record["attempts"]):
+                body = attempt.get("raw_response") if "raw_response" in attempt else (
+                    record["raw_response"] if number == len(record["attempts"]) - 1 else None)
+                if attempt["http_status"] != 200 or body is None:
+                    continue
+                try:
+                    normalize_usage("gpt", body.get("usage"))
+                    parsed = parse_answers("gpt", body, job["batch"])
+                except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+                    continue
+                for answer in parsed:
+                    answers.setdefault(answer["pair_id"], {
+                        **answer, "provider": "gpt", "status": "ok", "shop": job["shop"],
+                        "direction": job["batch"]["direction"], "anchor_id": job["batch"]["anchor_id"],
+                        "batch_id": job["batch"]["batch_id"], "served_model": body["model"],
+                        "source_log": relative, "source_record": index, "source_attempt": number,
+                    })
+    accounting = {}
+    for kind, calls in attempts.items():
+        usage = {}
+        for field in ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_tokens"):
+            values = [call["usage"][field] for call in calls if call["usage"][field] is not None]
+            require(all(type(value) is int and value >= 0 for value in values), "Invalid baseline token usage")
+            subtotal = sum(values) if values else None
+            usage[field] = {"reported_subtotal": subtotal, "missing_attempts": len(calls) - len(values),
+                            "total": subtotal if finished[kind] and len(values) == len(calls) else None}
+        costs = [attempt_cost("gpt", call["usage"], pricing) for call in calls]
+        priced = [cost for cost in costs if cost is not None]
+        subtotal = math.fsum(priced) if priced else None
+        accounting[kind] = {
+            "http_attempts": len(calls), "sessions_complete": finished[kind], "usage": usage,
+            "group_wall_times": wall_times[kind], "priced_attempts_subtotal_usd": subtotal,
+            "cost_estimate_usd": subtotal if finished[kind] and len(priced) == len(calls) else None,
+        }
+    missing = [identity for identity in all_ids if identity not in answers]
+    return {"schema_version": "gpt-baseline-v1", "fingerprint": fingerprint, "complete": not missing,
+            "classifications": [answers[identity] for identity in all_ids if identity in answers],
+            "missing_pair_ids": missing, "sources": sources, "accounting": accounting, "pricing": pricing}
+
+
+def load_completed_baseline(manifest: dict, root: Path) -> dict:
+    spec = baseline_spec(manifest)
+    directory = root / sha256(canonical_json(spec))
+    require((directory / "baseline.json").is_file(),
+            f"No completed matching GPT baseline at {directory}; prepare it explicitly before running experiments")
+    require(strict_json((directory / "spec.json").read_text()) == spec, "GPT baseline spec mismatch")
+    saved = strict_json((directory / "baseline.json").read_text())
+    state = baseline_state(directory, spec, saved["pricing"])
+    require(state["complete"] and saved == state, "Completed GPT baseline or its response history changed")
+    return saved
+
+
+def prepare_gpt_baseline(manifest: dict, root: Path, *, import_run: Path | None = None,
+                         paid: bool = False, transport: httpx.BaseTransport | None = None) -> tuple[Path, dict]:
+    spec = baseline_spec(manifest)
+    fingerprint = sha256(canonical_json(spec))
+    directory = root / fingerprint
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("Another process is preparing this GPT baseline; no requests started") from None
+        immutable_bytes(directory / "spec.json", canonical_json(spec))
+        if import_run is not None:
+            source = import_run / "requests.jsonl"
+            records, _ = read_request_log(source)
+            expected = {(job["shop"], job["batch"]["batch_id"]): job for job in spec["requests"]}
+            imported = [record for record in records if record["record_type"] == "batch" and record["provider"] == "gpt"]
+            require(bool(imported), "Import contains no GPT batches")
+            for record in imported:
+                check_baseline_record(record, expected)
+            require((directory / "imported.jsonl").exists() or not any((directory / "repairs").glob("*.jsonl")),
+                    "Cannot introduce a historical import after baseline repair has started")
+            immutable_bytes(directory / "imported.jsonl", source.read_bytes())
+        if (directory / "baseline.json").exists():
+            return directory, load_completed_baseline(manifest, root)
+        state = baseline_state(directory, spec)
+        if paid and not state["complete"]:
+            key = os.environ.get("OPENAI_API_KEY")
+            require(bool(key), "Missing credential: OPENAI_API_KEY; no requests started")
+            missing = set(state["missing_pair_ids"])
+            jobs = [job for job in spec["requests"] if any(item["pair_id"] in missing for item in job["batch"]["candidates"])]
+            seed = {answer["pair_id"]: answer for answer in state["classifications"]}
+            repairs = directory / "repairs"
+            repairs.mkdir(exist_ok=True)
+            sequence = len(list(repairs.glob("*.jsonl")))
+            name = f"{sequence:06d}-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
+            with (repairs / f"{name}.jsonl").open("x", encoding="utf-8") as handle:
+                writer_lock = threading.Lock()
+
+                def emit(record):
+                    with writer_lock:
+                        handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+
+                def checkpoint(record):
+                    record["baseline_attempt_id"] = uuid.uuid4().hex
+                    emit(record)
+
+                emit({"record_type": "run_start", "baseline_fingerprint": fingerprint,
+                      "started_at": datetime.now(timezone.utc).isoformat(), "concurrency": manifest["concurrency"],
+                      "script_sha256": sha256(Path(__file__).read_bytes()), "max_retries": MAX_RETRIES,
+                      "timeout_seconds": TIMEOUT_SECONDS})
+                print(f"GPT baseline completion: {len(jobs)} incomplete batches, {len(missing)} missing pairs; "
+                      f"at most {len(jobs) * (MAX_RETRIES + 1)} HTTP attempts this invocation.", flush=True)
+                for shop in sorted({job["shop"] for job in jobs}):
+                    work = [job for job in jobs if job["shop"] == shop]
+                    emit({"record_type": "group_start", "provider": "gpt", "shop": shop, "batches": len(work)})
+                    started = time.perf_counter()
+                    with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, transport=transport) as client:
+                        with ThreadPoolExecutor(max_workers=manifest["concurrency"]) as pool:
+                            futures = [pool.submit(
+                                run_batch, client, "gpt", shop, job["batch"], job["request"], key,
+                                initial_answers=[seed[item["pair_id"]] for item in job["batch"]["candidates"]
+                                                 if item["pair_id"] in seed], on_attempt=checkpoint,
+                            ) for job in work]
+                            for future in as_completed(futures):
+                                future.result()
+                    emit({"record_type": "group_end", "provider": "gpt", "shop": shop,
+                          "wall_seconds": time.perf_counter() - started})
+                emit({"record_type": "run_end"})
+            state = baseline_state(directory, spec)
+        if state["complete"]:
+            immutable_bytes(directory / "baseline.json", canonical_json(state))
+        return directory, state
 
 
 def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int) -> dict:
@@ -785,7 +1011,14 @@ def main() -> None:
     mode.add_argument("--execute", action="store_true", help="Make paid API requests (Boris runs this explicitly)")
     mode.add_argument("--report-only", action="store_true", help="Rebuild reports from the saved manifest and request log, offline")
     parser.add_argument("--output-dir", type=Path, default=Path("results/run"))
+    parser.add_argument("--prepare-baseline", action="store_true", help="Import/prepare the GPT baseline; add --execute for paid completion")
+    parser.add_argument("--import-run", type=Path, help="Existing comparison run directory to seed the GPT baseline")
+    parser.add_argument("--baseline-root", type=Path, default=Path("results/baselines"))
     args = parser.parse_args()
+    if args.import_run and not args.prepare_baseline:
+        parser.error("--import-run requires --prepare-baseline")
+    if args.prepare_baseline and args.report_only:
+        parser.error("--prepare-baseline cannot be combined with --report-only")
     if args.report_only:
         try:
             summary = write_reports(args.manifest, args.output_dir)
@@ -796,8 +1029,19 @@ def main() -> None:
         return
     try:
         manifest = build_manifest(args.data_dir, args.concurrency)
-        jobs = prepare_requests(manifest)
         digest = write_manifest(args.manifest, manifest)
+        if args.prepare_baseline:
+            directory, baseline = prepare_gpt_baseline(
+                manifest, args.baseline_root, import_run=args.import_run, paid=args.execute)
+            print(f"GPT baseline: {directory}")
+            print(f"Retained {len(baseline['classifications'])} labels; {len(baseline['missing_pair_ids'])} missing. "
+                  f"Complete: {baseline['complete']}.")
+            if not args.execute:
+                print("No API requests made. Add --execute only when ready to complete missing GPT answers.")
+            elif not baseline["complete"]:
+                parser.exit(1, "GPT baseline remains incomplete after bounded attempts; saved progress is reusable.\n")
+            return
+        jobs = prepare_requests(manifest)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(1, f"Preparation failed: {error}\n")
     print(f"Offline manifest: {args.manifest} (SHA256 {digest})")

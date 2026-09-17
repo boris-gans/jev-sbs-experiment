@@ -1,5 +1,6 @@
 import copy
 import csv
+import fcntl
 import hashlib
 import json
 import socket
@@ -822,7 +823,8 @@ def test_jev_rounding_tolerance_remains_bounded(prepared, probability_sum):
 
 
 @pytest.mark.parametrize("missing_count", [1, 4, 20])
-def test_gpt_partial_answers_preserve_id_mapping(prepared, missing_count):
+def test_gpt_partial_answers_preserve_id_mapping(prepared, missing_count, monkeypatch):
+    monkeypatch.setattr(compare.time, "sleep", lambda delay: None)
     _, jobs = prepared
     batch, payload = jobs["gpt"]["furniture.co.uk"][0]
     body = response_for("gpt", payload)
@@ -833,7 +835,7 @@ def test_gpt_partial_answers_preserve_id_mapping(prepared, missing_count):
     with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))) as client:
         result = compare.run_batch(client, "gpt", "furniture.co.uk", batch, payload, "dummy")
     assert result["status"] == ("partial" if returned else "error")
-    assert result["error"] == "missing_candidate_answers" and result["retries"] == 0
+    assert result["error"] == "missing_candidate_answers" and result["retries"] == 2
     assert len(result["answers"]) == len(returned)
     returned_ids = {row["id"] for row in returned}
     assert {answer["candidate_id"] for answer in result["answers"]} == returned_ids
@@ -897,3 +899,296 @@ def test_new_partial_record_reports_returned_answers(completed_run):
     group = summary["groups"][f"{record['provider']}/{record['shop']}"]
     assert group["successful_pairs"] == 399 and group["failed_pairs"] == 1
     assert group["partial_batches"] == 1 and group["reextracted_batches"] == 0
+
+
+@pytest.fixture
+def baseline_seed(completed_run):
+    manifest_path, directory = completed_run
+    manifest = json.loads(manifest_path.read_text())
+    records, _ = compare.read_request_log(directory / "requests.jsonl")
+    missing = set()
+    for shop, count in (("furniture.co.uk", 4), ("themeatboys.nl", 1)):
+        record = next(row for row in records if row["record_type"] == "batch" and row["provider"] == "gpt" and row["shop"] == shop)
+        body = record["raw_response"]
+        message = body["choices"][0]["message"]
+        judgments = json.loads(message["content"])["judgments"]
+        ids = {row["id"] for row in judgments[:count]}
+        missing.update(pair for pair in record["pair_ids"] if json.loads(pair)[3] in ids)
+        message["content"] = json.dumps({"judgments": judgments[count:]})
+        record.update(status="partial", error="missing_candidate_answers", answers=[])
+        # Change the raw attempt too, as new request logs retain every response.
+        record["attempts"][-1].update(raw_response=body, answers=[], error="missing_candidate_answers")
+    write_blocks(directory / "requests.jsonl", records)
+    assert len(missing) == 5
+    return manifest, directory, missing
+
+
+def test_baseline_offline_import_and_incomplete_loader(baseline_seed, tmp_path, monkeypatch):
+    manifest, source, missing = baseline_seed
+    original = (source / "requests.jsonl").read_bytes()
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Import must be offline"))
+    root = tmp_path / "baselines"
+    directory, state = compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    assert len(state["classifications"]) == 795 and set(state["missing_pair_ids"]) == missing
+    assert not state["complete"] and not (directory / "baseline.json").exists()
+    assert state["accounting"]["historical"]["http_attempts"] == 40
+    assert state["accounting"]["repair"]["http_attempts"] == 0
+    assert (directory / "imported.jsonl").read_bytes() == original
+    assert (source / "requests.jsonl").read_bytes() == original
+    assert compare.prepare_gpt_baseline(manifest, root, import_run=source)[1] == state
+    with pytest.raises(ValueError, match="No completed matching GPT baseline"):
+        compare.load_completed_baseline(manifest, root)
+
+
+def test_baseline_completes_only_missing_batches_and_reuses_without_keys(baseline_seed, tmp_path, monkeypatch):
+    manifest, source, missing = baseline_seed
+    root = tmp_path / "baselines"
+    _, imported = compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    calls = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        body = response_for("gpt", payload)
+        message = body["choices"][0]["message"]
+        judgments = json.loads(message["content"])["judgments"]
+        for judgment in judgments:
+            judgment["label"] = "skip"  # Existing positive labels must not be replaced.
+        message["content"] = json.dumps({"judgments": judgments})
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy-baseline-key")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    directory, state = compare.prepare_gpt_baseline(manifest, root, paid=True, transport=httpx.MockTransport(handler))
+    assert state["complete"] and len(calls) == 2 and len(state["classifications"]) == 800
+    rows = {row["pair_id"]: row for row in state["classifications"]}
+    assert all(rows[row["pair_id"]] == row for row in imported["classifications"])
+    assert all(rows[identity]["label"] == "skip" for identity in missing)
+    assert state["accounting"]["historical"] == imported["accounting"]["historical"]
+    assert state["accounting"]["repair"]["http_attempts"] == 2
+    assert len(state["accounting"]["repair"]["group_wall_times"]) == 2
+    expected = [job["request"] for job in compare.baseline_spec(manifest)["requests"]
+                if any(item["pair_id"] in missing for item in job["batch"]["candidates"])]
+    assert calls == expected
+    before = {str(file.relative_to(directory)): file.read_bytes() for file in directory.rglob("*") if file.is_file()}
+    monkeypatch.delenv("OPENAI_API_KEY")
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Completed baseline must not call GPT"))
+    assert compare.load_completed_baseline(manifest, root) == state
+    assert compare.prepare_gpt_baseline(manifest, root, paid=True)[1] == state
+    assert {str(file.relative_to(directory)): file.read_bytes() for file in directory.rglob("*") if file.is_file()} == before
+
+
+@pytest.mark.parametrize("change", ["evidence", "system_prompt", "examples", "model", "reasoning", "pair_identity", "batch_order"])
+def test_baseline_fingerprint_changes_with_gpt_inputs(prepared, change):
+    manifest, _ = prepared
+    changed = copy.deepcopy(manifest)
+    data = changed["shops"]["furniture.co.uk"]
+    if change == "evidence":
+        data["products"][data["batches"][0]["anchor_id"]]["text"] += " Changed evidence."
+    elif change in ("system_prompt", "examples"):
+        data["policy"][change] += " Changed policy."
+    elif change == "model":
+        changed["models"]["gpt"]["model"] = "different-model"
+    elif change == "reasoning":
+        changed["models"]["gpt"]["reasoning_effort"] = "low"
+    elif change == "pair_identity":
+        data["batches"][0]["candidates"][0]["pair_id"] += "changed"
+    else:
+        data["batches"][0]["candidates"].reverse()
+    assert compare.baseline_spec(changed) != compare.baseline_spec(manifest)
+
+
+def test_baseline_ignores_jev_configuration_and_rejects_corruption(completed_run, tmp_path, monkeypatch):
+    path, source = completed_run
+    manifest = json.loads(path.read_text())
+    root = tmp_path / "baselines"
+    directory, state = compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    changed = copy.deepcopy(manifest)
+    changed["models"]["jev"] = {"model": "another-jev", "criteria": "a prompt-only experiment"}
+    assert compare.baseline_spec(changed) == compare.baseline_spec(manifest)
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Load is offline-only"))
+    assert compare.load_completed_baseline(changed, root) == state
+    monkeypatch.setitem(compare.PRICING, "gpt", {**compare.PRICING["gpt"], "input": 123})
+    assert compare.load_completed_baseline(changed, root) == state  # Preserve the baseline's dated prices.
+    changed["models"]["gpt"]["model"] = "another-gpt"
+    with pytest.raises(ValueError, match="No completed matching"):
+        compare.load_completed_baseline(changed, root)
+    damaged = copy.deepcopy(state)
+    damaged["classifications"][0]["label"] = "skip"
+    write_json(directory / "baseline.json", damaged)
+    with pytest.raises(ValueError, match="response history changed"):
+        compare.load_completed_baseline(manifest, root)
+
+
+def test_baseline_rejects_mismatched_or_replaced_import(baseline_seed, tmp_path):
+    manifest, source, _ = baseline_seed
+    root = tmp_path / "baselines"
+    directory, _ = compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    snapshot = (directory / "imported.jsonl").read_bytes()
+    records, _ = compare.read_request_log(source / "requests.jsonl")
+    batch = next(row for row in records if row["record_type"] == "batch" and row["provider"] == "gpt")
+    batch["request"]["reasoning_effort"] = "low"
+    write_blocks(source / "requests.jsonl", records)
+    with pytest.raises(ValueError, match="request mismatch"):
+        compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    assert (directory / "imported.jsonl").read_bytes() == snapshot
+    original_records = [json.loads(line) for line in snapshot.decode().splitlines()]
+    original_records[0]["started_at"] = "a different valid run"
+    write_blocks(source / "requests.jsonl", original_records)
+    with pytest.raises(ValueError, match="Refusing to replace immutable"):
+        compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    assert (directory / "imported.jsonl").read_bytes() == snapshot
+
+
+def test_partial_and_transport_retries_share_budget(prepared, monkeypatch):
+    _, jobs = prepared
+    batch, payload = jobs["gpt"]["furniture.co.uk"][0]
+    full = response_for("gpt", payload)
+    seed = compare.parse_answers("gpt", full, batch)[:-2]
+    ids = [item["candidate_id"] for item in batch["candidates"]]
+    calls, checkpoints, sleeps = [], [], []
+    monkeypatch.setattr(compare.time, "sleep", sleeps.append)
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        if len(calls) == 2:
+            raise httpx.ReadTimeout("synthetic", request=request)
+        body = copy.deepcopy(full)
+        message = body["choices"][0]["message"]
+        judgments = json.loads(message["content"])["judgments"]
+        wanted = set(ids[:-1]) if len(calls) == 1 else {ids[-1]}
+        for row in judgments:
+            row["label"] = "skip"
+        message["content"] = json.dumps({"judgments": [row for row in judgments if row["id"] in wanted]})
+        return httpx.Response(200, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = compare.run_batch(client, "gpt", "furniture.co.uk", batch, payload, "dummy",
+                                   initial_answers=seed, on_attempt=checkpoints.append)
+    assert result["status"] == "ok" and result["error"] is None and result["retries"] == 2
+    assert calls == [payload, payload, payload] and sleeps == [1, 2]
+    assert len(checkpoints) == 3 and all(len(row["attempts"]) == 1 for row in checkpoints)
+    assert [row["label"] for row in result["answers"]] == ["positive"] * 18 + ["skip"] * 2
+    assert checkpoints[0]["raw_response"] is not None and checkpoints[1]["raw_response"] is None
+
+
+def test_incomplete_baseline_resumes_only_remaining_batches(baseline_seed, tmp_path, monkeypatch):
+    manifest, source, _ = baseline_seed
+    root = tmp_path / "baselines"
+    compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    monkeypatch.setattr(compare.time, "sleep", lambda delay: None)
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return httpx.Response(200, json=response_for("gpt", calls[-1]))
+        return httpx.Response(503)
+
+    directory, partial = compare.prepare_gpt_baseline(manifest, root, paid=True, transport=httpx.MockTransport(handler))
+    assert len(calls) == 4 and len(partial["classifications"]) == 799
+    assert not partial["complete"] and not (directory / "baseline.json").exists()
+    old_logs = {path: path.read_bytes() for path in (directory / "repairs").glob("*.jsonl")}
+    resumed = []
+
+    def succeed(request):
+        payload = json.loads(request.content)
+        resumed.append(payload)
+        return httpx.Response(200, json=response_for("gpt", payload))
+
+    _, state = compare.prepare_gpt_baseline(manifest, root, paid=True, transport=httpx.MockTransport(succeed))
+    assert state["complete"] and len(resumed) == 1 and resumed[0] == calls[-1]
+    assert state["accounting"]["repair"]["http_attempts"] == 5
+    assert all(path.read_bytes() == value for path, value in old_logs.items())
+    assert compare.load_completed_baseline(manifest, root) == state
+
+
+def test_baseline_lock_prevents_concurrent_paid_preparation(prepared, tmp_path, monkeypatch):
+    manifest, _ = prepared
+    root = tmp_path / "baselines"
+    directory, _ = compare.prepare_gpt_baseline(manifest, root)
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Locked preparation must not send requests"))
+    with (directory / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match="Another process"):
+            compare.prepare_gpt_baseline(manifest, root, paid=True)
+
+
+def test_baseline_cli_import_needs_no_credentials(baseline_seed, tmp_path, monkeypatch, capsys):
+    manifest, source, _ = baseline_seed
+    monkeypatch.setattr(compare, "build_manifest", lambda *args: manifest)
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Offline CLI import made HTTP call"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr("sys.argv", ["compare.py", "--prepare-baseline", "--import-run", str(source),
+                                    "--manifest", str(tmp_path / "frozen.json"), "--baseline-root", str(tmp_path / "baselines")])
+    compare.main()
+    output = capsys.readouterr().out
+    assert "Retained 795 labels; 5 missing" in output and "No API requests made" in output
+
+
+def test_late_malformed_response_does_not_erase_accumulated_answers(prepared, monkeypatch):
+    _, jobs = prepared
+    batch, payload = jobs["gpt"]["furniture.co.uk"][0]
+    ids = [item["candidate_id"] for item in batch["candidates"]]
+    calls = []
+    monkeypatch.setattr(compare.time, "sleep", lambda delay: None)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 3:
+            return httpx.Response(200, text="malformed")
+        body = response_for("gpt", payload)
+        message = body["choices"][0]["message"]
+        judgments = json.loads(message["content"])["judgments"]
+        wanted = ids[:10] if len(calls) == 1 else ids[10:15]
+        message["content"] = json.dumps({"judgments": [row for row in judgments if row["id"] in wanted]})
+        return httpx.Response(200, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = compare.run_batch(client, "gpt", "furniture.co.uk", batch, payload, "dummy")
+    assert result["status"] == "partial" and len(result["answers"]) == 15
+    assert result["error"] == "invalid_response" and result["raw_response"] is None
+    assert result["served_model"] == payload["model"]
+    assert compare.reextract_record(result, batch)["answers"] == result["answers"]
+    assert [row["candidate_id"] for row in result["answers"]] == ids[:15]
+
+
+def test_baseline_recovers_checkpoint_before_interrupted_tail(baseline_seed, tmp_path, monkeypatch):
+    manifest, source, _ = baseline_seed
+    root = tmp_path / "baselines"
+    directory, state = compare.prepare_gpt_baseline(manifest, root, import_run=source)
+    spec = compare.baseline_spec(manifest)
+    missing = set(state["missing_pair_ids"])
+    job = next(job for job in spec["requests"] if any(item["pair_id"] in missing for item in job["batch"]["candidates"]))
+    original, _ = compare.read_request_log(source / "requests.jsonl")
+    record = copy.deepcopy(next(row for row in original if row["record_type"] == "batch"
+                                and row["provider"] == "gpt" and row["batch_id"] == job["batch"]["batch_id"]))
+    body = response_for("gpt", job["request"])
+    answers = compare.parse_answers("gpt", body, job["batch"])
+    record.update(status="ok", error=None, answers=answers, raw_response=body, baseline_attempt_id="checkpoint")
+    record["attempts"][-1].update(raw_response=body, answers=answers, error=None)
+    repairs = directory / "repairs"
+    repairs.mkdir()
+    interrupted = repairs / "000000-interrupted.jsonl"
+    write_blocks(interrupted, [{"record_type": "run_start", "baseline_fingerprint": state["fingerprint"]}, record])
+    with interrupted.open("a") as handle:
+        handle.write('{"record_type":')
+    snapshot = interrupted.read_bytes()
+    _, recovered = compare.prepare_gpt_baseline(manifest, root)
+    assert len(recovered["classifications"]) == 799 and len(recovered["missing_pair_ids"]) == 1
+    assert not recovered["accounting"]["repair"]["sessions_complete"]
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    calls = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        return httpx.Response(200, json=response_for("gpt", payload))
+
+    _, complete = compare.prepare_gpt_baseline(manifest, root, paid=True, transport=httpx.MockTransport(handler))
+    assert complete["complete"] and len(calls) == 1
+    assert interrupted.read_bytes() == snapshot
+    assert complete["accounting"]["repair"]["cost_estimate_usd"] is None
+    assert compare.load_completed_baseline(manifest, root) == complete

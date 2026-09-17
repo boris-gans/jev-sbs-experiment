@@ -18,6 +18,7 @@ Run from the repository root after the README setup.
 - Lint: n/a — no linter configured; `git diff --check` checks whitespace.
 - Offline preflight: `.venv/bin/python compare.py`
 - Offline reports: `.venv/bin/python compare.py --report-only`
+- Offline GPT baseline import: `.venv/bin/python compare.py --prepare-baseline --import-run results/run`
 
 ## Public interfaces other repos depend on
 None known. This local experiment does not change embedding-service contracts.
@@ -27,7 +28,10 @@ None known. This local experiment does not change embedding-service contracts.
 - Credentials come from OPENAI_API_KEY and TYPESAFE_API_KEY in the process
   environment. Never open .env files or log credentials.
 - data/, results/, and .claude/plans/ are ignored; never commit their contents.
-- Preparation refuses to replace a different manifest. Execution refuses to
-  overwrite a request log; there is no automatic resume.
+- Preparation refuses to replace a different manifest. Original combined runs
+  refuse to overwrite a request log. GPT baseline completion reuses persisted
+  first-valid answers; paid retries still require Boris's explicit `--execute`.
+- Baseline preparation uses macOS/Linux file locks. Completed baselines and their
+  input/history files are immutable; changing Jev criteria does not invalidate GPT.
 - Failures are not skip labels, missing usage is not zero, and agreement with
   GPT is not ground truth. Read README.md before interpreting results.
