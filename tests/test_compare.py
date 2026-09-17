@@ -25,7 +25,8 @@ def refresh_context(root, shop):
     stage2 = root / shop / "stage2"
     context_path = stage2 / "classification_context.json"
     context = json.loads(context_path.read_text())
-    stem = compare.PROMPTS[compare.SHOPS[shop]]
+    objective = compare.parse_recommendation_objective((stage2 / "recommendation.yaml").read_bytes())
+    stem = compare.PROMPTS[objective]
     paths = {
         "products": root / shop / "stage1/products_processed.json",
         "subset": stage2 / "subset_products.json",
@@ -94,7 +95,7 @@ def catalogs(tmp_path):
                 "Category guidance must survive.\nReturn a JSON object with judgments.\n"
             ),
             "classification_examples.txt": "Synthetic example\n",
-            "recommendation.yaml": f"objective: {objective}\n",
+            "recommendation.yaml": f"version: 1\nobjective: {objective}\n",
         }.items():
             (stage2 / name).write_text(content, encoding="utf-8")
         write_json(stage2 / "classification_context.json", {
@@ -129,6 +130,37 @@ def test_deterministic_manifest_and_evidence(catalogs):
                     assert evidence["description"] == f"Evidence {candidate['candidate_id']}"
         assert len(seen) == 400
         assert data["policy"]["examples"] == "Synthetic example\n"
+
+
+def test_recommendation_config_selects_objective(catalogs):
+    shop = "furniture.co.uk"
+    stage2 = catalogs / shop / "stage2"
+    source = catalogs / "themeatboys.nl" / "stage2"
+    for suffix in ("system.txt", "user.txt"):
+        name = f"{compare.PROMPTS['complements']}.{suffix}"
+        (stage2 / name).write_bytes((source / name).read_bytes())
+    (stage2 / "recommendation.yaml").write_text("version: 1\nobjective: complements\n", encoding="utf-8")
+    context_path = stage2 / "classification_context.json"
+    context = json.loads(context_path.read_text())
+    context["recommendation_objective"] = "complements"
+    write_json(context_path, context)
+    refresh_context(catalogs, shop)
+
+    manifest = compare.build_manifest(catalogs)
+    assert manifest["shops"][shop]["objective"] == "complements"
+    _, payload = compare.prepare_requests(manifest)["jev"][shop][0]
+    assert "COMPLEMENTS" in payload["questions"]["candidate_0"]["instructions"]
+
+
+@pytest.mark.parametrize("config", [
+    b"objective: complements\n",
+    b"version: 2\nobjective: complements\n",
+    b"version: 1\nobjective: unsupported\n",
+    b"version: 1\nobjective: complements\nextra: value\n",
+])
+def test_invalid_recommendation_config_is_rejected(config):
+    with pytest.raises(ValueError):
+        compare.parse_recommendation_objective(config)
 
 
 def test_label_independent_sampling(catalogs):
@@ -303,6 +335,29 @@ def test_provider_payload_parity(prepared):
                 assert set(question["criteria"]) == set(compare.LABELS)
                 assert question["type"] == "choice"
     assert manifest == original
+
+
+def test_jev_payload_preserves_recommendation_direction(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["themeatboys.nl"]
+    source = data["batches"][0]
+    anchor_id = source["anchor_id"]
+    candidate_id = source["candidates"][0]["candidate_id"]
+    forward = {**source, "candidates": [source["candidates"][0]]}
+    reverse = {
+        "batch_id": "themeatboys.nl/reverse/direction-test", "direction": "reverse",
+        "anchor_id": candidate_id,
+        "candidates": [{"candidate_id": anchor_id, "pair_id": "direction-test"}],
+    }
+    settings = manifest["models"]["jev"]
+    forward_payload = compare.render_request("jev", settings, data, forward)
+    reverse_payload = compare.render_request("jev", settings, data, reverse)
+
+    assert forward_payload["state"]["base"]["id"] == anchor_id
+    assert forward_payload["state"]["candidates"][0]["id"] == candidate_id
+    assert reverse_payload["state"]["base"]["id"] == candidate_id
+    assert reverse_payload["state"]["candidates"][0]["id"] == anchor_id
+    assert "Do not reverse the recommendation direction" in forward_payload["questions"]["candidate_0"]["instructions"]
 
 
 @pytest.mark.parametrize("provider", ["gpt", "jev"])
@@ -522,17 +577,18 @@ def test_completed_batch_is_flushed_before_group_finishes(prepared, tmp_path):
     assert not thread.is_alive() and not errors
 
 
-def test_execute_flag_requires_credentials_before_network(catalogs, tmp_path, monkeypatch, capsys):
+def test_execute_flag_requires_completed_baseline_before_network(catalogs, tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     output = tmp_path / "run"
     monkeypatch.setattr("sys.argv", ["compare.py", "--data-dir", str(catalogs),
                                     "--manifest", str(tmp_path / "manifest.json"),
+                                    "--baseline-root", str(tmp_path / "no-baseline"),
                                     "--output-dir", str(output), "--execute"])
     with pytest.raises(SystemExit) as result:
         compare.main()
     assert result.value.code == 1
-    assert "Missing credential" in capsys.readouterr().err
+    assert "No completed matching GPT baseline" in capsys.readouterr().err
     assert not output.exists()
 
 
@@ -1192,3 +1248,195 @@ def test_baseline_recovers_checkpoint_before_interrupted_tail(baseline_seed, tmp
     assert interrupted.read_bytes() == snapshot
     assert complete["accounting"]["repair"]["cost_estimate_usd"] is None
     assert compare.load_completed_baseline(manifest, root) == complete
+
+
+@pytest.fixture
+def experiment_ready(completed_run, tmp_path, monkeypatch):
+    path, original_run = completed_run
+    manifest = json.loads(path.read_text())
+    root = tmp_path / "baselines"
+    compare.prepare_gpt_baseline(manifest, root, import_run=original_run)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "dummy-jev-key")
+    return manifest, root, original_run
+
+
+def jev_only_response(request):
+    assert request.url.host == "api.typesafe.ai", "A Jev experiment must never call GPT"
+    return httpx.Response(200, json=response_for("jev", json.loads(request.content)))
+
+
+@pytest.fixture
+def saved_experiment(experiment_ready, tmp_path):
+    manifest, root, _ = experiment_ready
+    directory, failures = compare.run_jev_experiment(
+        manifest, root, experiments_root=tmp_path / "experiments", transport=httpx.MockTransport(jev_only_response))
+    assert failures == 0
+    return directory
+
+
+def test_objective_specific_prompts_preserve_evidence_and_gpt(prepared, monkeypatch):
+    manifest, jobs = prepared
+    original_spec = compare.baseline_spec(manifest)
+    prompts = {}
+    for shop, data in manifest["shops"].items():
+        batch, payload = jobs["jev"][shop][0]
+        question = payload["questions"]["candidate_0"]
+        instructions, criteria = question["instructions"], question["criteria"]
+        assert instructions == compare.JEV_INSTRUCTIONS[data["objective"]].format(index=0)
+        assert criteria == compare.JEV_CRITERIA[data["objective"]]
+        assert set(criteria) == set(compare.LABELS)
+        assert instructions.index("(1)") < instructions.index("(2)") < instructions.index("(3)")
+        assert instructions.index("(3)") < instructions.index("(4)") < instructions.index("(5)")
+        assert instructions.index("(5)") < instructions.index("(6)")
+        assert "uncertainty" in criteria["hard_negative"].lower()
+        assert "variant" in criteria["skip"] and "override" in criteria["skip"]
+        if data["objective"] == "style_compatibility":
+            assert "STYLE-COMPATIBILITY" in instructions
+            assert "distinct models" in instructions and "construction" in instructions
+            assert "Same role alone is not negative" in instructions
+        else:
+            assert "COMPLEMENTS" in instructions
+            assert "same brand and same category" in instructions
+            assert "meal variety" in instructions and "direct complementary function" in instructions
+        prompts[data["objective"]] = (instructions, criteria)
+        changed = copy.deepcopy(compare.JEV_CRITERIA)
+        changed[data["objective"]]["positive"] = "Another experiment"
+        with monkeypatch.context() as patch:
+            patch.setattr(compare, "JEV_CRITERIA", changed)
+            rerendered = compare.render_request("jev", manifest["models"]["jev"], data, batch)
+            assert rerendered["state"] == payload["state"]
+            assert rerendered["questions"]["candidate_0"]["instructions"] == payload["questions"]["candidate_0"]["instructions"]
+            assert compare.baseline_spec(manifest) == original_spec
+    assert prompts["style_compatibility"] != prompts["complements"]
+
+
+def test_repeated_experiments_are_isolated_and_jev_only(experiment_ready, tmp_path):
+    manifest, baseline_root, original = experiment_ready
+    original_bytes = {path.name: path.read_bytes() for path in original.iterdir()}
+    baseline_bytes = {str(path.relative_to(baseline_root)): path.read_bytes()
+                      for path in baseline_root.rglob("*") if path.is_file()}
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.host)
+        return jev_only_response(request)
+
+    first, _ = compare.run_jev_experiment(manifest, baseline_root, experiments_root=tmp_path / "experiments",
+                                         transport=httpx.MockTransport(handler))
+    first_bytes = {path.name: path.read_bytes() for path in first.iterdir()}
+    second, _ = compare.run_jev_experiment(manifest, baseline_root, experiments_root=tmp_path / "experiments",
+                                          transport=httpx.MockTransport(handler))
+    assert first != second and first.parent == second.parent
+    assert len(calls) == 80 and set(calls) == {"api.typesafe.ai"}
+    assert {path.name: path.read_bytes() for path in first.iterdir()} == first_bytes
+    assert {path.name: path.read_bytes() for path in original.iterdir()} == original_bytes
+    assert {str(path.relative_to(baseline_root)): path.read_bytes()
+            for path in baseline_root.rglob("*") if path.is_file()} == baseline_bytes
+    assert {"manifest.json", "baseline.json", "experiment.json", "requests.jsonl"} <= set(first_bytes)
+    assert "imported.jsonl" not in first_bytes and not (first / "repairs").exists()
+    experiment = json.loads(first_bytes["experiment.json"])
+    assert experiment["jev_criteria"] == compare.JEV_CRITERIA
+    assert experiment["jev_instructions"] == compare.JEV_INSTRUCTIONS
+    assert experiment["jev_prompt_version"] == compare.JEV_PROMPT_VERSION
+    summary = json.loads(first_bytes["summary.json"])
+    assert set(summary["groups"]) == {f"jev/{shop}" for shop in compare.SHOPS}
+    assert summary["new_inference"]["gpt_http_attempts"] == 0 and summary["new_inference"]["gpt_cost_usd"] == 0
+    assert summary["new_inference"]["jev_http_attempts"] == 40
+    assert summary["new_inference"]["jev_cost_estimate_usd"] == pytest.approx(40 * 0.0000042)
+    assert summary["gpt_baseline"]["cached"] and summary["gpt_baseline"]["classifications"] == 800
+    assert summary["gpt_baseline"]["accounting"]["historical"]["http_attempts"] == 40
+    assert summary["all_pairs_classified"] and summary["run_complete"]
+    assert all(value["paired_success"] == 400 for value in summary["agreement"].values())
+    with pytest.raises(FileExistsError):
+        compare.run_jev_experiment(manifest, baseline_root, first, transport=httpx.MockTransport(handler))
+    assert len(calls) == 80
+
+
+def test_experiment_report_uses_snapshots_not_live_jev_definitions(saved_experiment, monkeypatch, capsys):
+    directory = saved_experiment
+    original = {path.name: path.read_bytes() for path in directory.iterdir()}
+    render = compare.render_request
+
+    def only_gpt(*args, **kwargs):
+        assert args[0] == "gpt", "Historical Jev reports must not rerender the current prompt"
+        return render(*args, **kwargs)
+
+    def deny(*args, **kwargs):
+        pytest.fail("Offline reporting must not access catalog, baseline history, or network")
+
+    monkeypatch.setattr(compare, "render_request", only_gpt)
+    monkeypatch.setattr(compare, "JEV_CRITERIA", {"changed": "prompt"})
+    monkeypatch.setattr(compare, "JEV_INSTRUCTIONS", "A future experiment")
+    monkeypatch.setattr(compare, "JEV_PROMPT_VERSION", "future-version")
+    monkeypatch.setattr(compare, "PRICING", {"changed": "rates"})
+    monkeypatch.setattr(compare, "build_manifest", deny)
+    monkeypatch.setattr(compare, "load_completed_baseline", deny)
+    monkeypatch.setattr(compare.httpx, "Client", deny)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr("sys.argv", ["compare.py", "--report-only", "--output-dir", str(directory)])
+    compare.main()
+    assert "Reports rebuilt offline" in capsys.readouterr().out
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == original
+
+
+@pytest.mark.parametrize("tamper", ["manifest", "baseline", "criteria", "pricing", "payload", "gpt_group"])
+def test_experiment_reports_reject_snapshot_mismatches(saved_experiment, tamper):
+    directory = saved_experiment
+    original_summary = (directory / "summary.json").read_bytes()
+    if tamper == "manifest":
+        path = directory / "manifest.json"
+        path.write_bytes(path.read_bytes() + b"\n")
+    elif tamper == "baseline":
+        path = directory / "baseline.json"
+        data = json.loads(path.read_text())
+        data["classifications"][0]["label"] = "skip"
+        write_json(path, data)
+    elif tamper in ("criteria", "pricing"):
+        path = directory / "experiment.json"
+        data = json.loads(path.read_text())
+        data["jev_criteria" if tamper == "criteria" else "pricing"] = {"tampered": True}
+        write_json(path, data)
+    else:
+        path = directory / "requests.jsonl"
+        records, _ = compare.read_request_log(path)
+        if tamper == "payload":
+            batch = next(record for record in records if record["record_type"] == "batch")
+            batch["request"]["questions"]["candidate_0"]["criteria"]["positive"] = "Not the snapshotted criterion"
+        else:
+            records.insert(1, {"record_type": "group_start", "provider": "gpt", "shop": "furniture.co.uk"})
+        write_blocks(path, records)
+    with pytest.raises(ValueError):
+        compare.write_reports(directory / "manifest.json", directory)
+    assert (directory / "summary.json").read_bytes() == original_summary
+
+
+def test_ready_experiment_requires_only_jev_credential_before_directory_creation(experiment_ready, tmp_path, monkeypatch):
+    manifest, root, _ = experiment_ready
+    monkeypatch.delenv("TYPESAFE_API_KEY")
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Missing credential must prevent HTTP"))
+    output = tmp_path / "experiment"
+    with pytest.raises(ValueError, match="TYPESAFE_API_KEY"):
+        compare.run_jev_experiment(manifest, root, output)
+    assert not output.exists()
+
+
+def test_default_execute_cli_calls_only_jev(experiment_ready, tmp_path, monkeypatch, capsys):
+    manifest, root, _ = experiment_ready
+    execute = compare.execute
+
+    def mocked_execute(*args, **kwargs):
+        assert set(args[1]) == {"jev"}
+        assert set(args[4]) == {"jev"}
+        kwargs["transport"] = httpx.MockTransport(jev_only_response)
+        return execute(*args, **kwargs)
+
+    monkeypatch.setattr(compare, "execute", mocked_execute)
+    monkeypatch.setattr(compare, "build_manifest", lambda *a: manifest)
+    output = tmp_path / "cli-experiment"
+    monkeypatch.setattr("sys.argv", ["compare.py", "--execute", "--baseline-root", str(root),
+                                    "--manifest", str(tmp_path / "frozen.json"), "--output-dir", str(output)])
+    compare.main()
+    assert "No GPT requests will be made" in capsys.readouterr().out
+    assert (output / "summary.json").exists()

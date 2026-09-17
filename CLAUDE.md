@@ -1,9 +1,9 @@
 # jev-sbs-experiment
 
 ## What this repo does
-One-off comparison of Jev and GPT nano on frozen SBS product pairs from
-furniture.co.uk and themeatboys.nl. This is a standalone research script,
-not a production pipeline integration.
+Local comparison of Jev prompt variants against a saved GPT nano baseline on
+frozen SBS pairs from furniture.co.uk and themeatboys.nl. This is a standalone
+research script, not a production pipeline integration.
 
 ## Stack
 Python 3.11+, httpx 0.28.1, pytest 8.x. One script: compare.py.
@@ -18,6 +18,7 @@ Run from the repository root after the README setup.
 - Lint: n/a — no linter configured; `git diff --check` checks whitespace.
 - Offline preflight: `.venv/bin/python compare.py`
 - Offline reports: `.venv/bin/python compare.py --report-only`
+- For a newer experiment, add `--output-dir` with its printed directory path.
 - Offline GPT baseline import: `.venv/bin/python compare.py --prepare-baseline --import-run results/run`
 
 ## Public interfaces other repos depend on
@@ -28,10 +29,14 @@ None known. This local experiment does not change embedding-service contracts.
 - Credentials come from OPENAI_API_KEY and TYPESAFE_API_KEY in the process
   environment. Never open .env files or log credentials.
 - data/, results/, and .claude/plans/ are ignored; never commit their contents.
-- Preparation refuses to replace a different manifest. Original combined runs
-  refuse to overwrite a request log. GPT baseline completion reuses persisted
-  first-valid answers; paid retries still require Boris's explicit `--execute`.
+- Plain `--execute` runs only Jev, requires a completed matching GPT baseline, and
+  creates a fresh experiment directory. It never starts GPT inference implicitly.
+- Preparation refuses to replace a different manifest. GPT baseline completion
+  reuses first-valid answers; paid completion needs `--prepare-baseline --execute`.
+- Keep each experiment's snapshots and raw log immutable. Report-only processing
+  uses those snapshots and separates cached GPT measurements from new Jev inference.
 - Baseline preparation uses macOS/Linux file locks. Completed baselines and their
-  input/history files are immutable; changing Jev criteria does not invalidate GPT.
+  input/history files are immutable; changing objective-specific Jev prompts does
+  not invalidate GPT.
 - Failures are not skip labels, missing usage is not zero, and agreement with
   GPT is not ground truth. Read README.md before interpreting results.

@@ -1,9 +1,10 @@
 # Jev / GPT nano SBS comparison
 
-A one-off experiment for FERODEV-8257. Compare **400 directed rows per shop**
+A small local experiment for FERODEV-8257. Compare **400 directed rows per shop**
 (200 forward, 200 reverse) for furniture.co.uk's style-compatibility objective
 and themeatboys.nl's complements objective. Both providers receive the same
-frozen product evidence, shop policies, examples, and candidate batches.
+frozen product evidence, shop policies, examples, and candidate batches. Prepare
+GPT once, then compare successive Jev prompt variants against that saved baseline.
 
 This is not a production pipeline integration. Nothing imports or changes
 `embedding-service`; no retrieval, summarization, training, or embedding job runs.
@@ -49,9 +50,9 @@ The manifest contains selected evidence, policy, provenance, batching, and model
 - Jev: `jev-1.13.0`, one three-label Choice question per candidate.
 - At most 20 candidates per request; concurrency defaults to 8 (`--concurrency`).
 
-The supplied snapshots produce **62 batches per provider**, 124 initial HTTP
-requests total, and 1,600 pair evaluations across the two providers. Reverse
-batches are often smaller than 20. Preflight prints the actual counts.
+The supplied snapshots produce **62 batches per provider**. Each new experiment
+sends only the 62 Jev batches (800 pairs) and reuses GPT's labels. Reverse batches
+are often smaller than 20. Preflight prints the actual counts.
 
 ## Reusable GPT baseline — Boris operates paid completion
 
@@ -97,29 +98,33 @@ and wall times remain separate from repair usage and wall times in the baseline.
 File locking prevents concurrent baseline preparation on macOS/Linux. Completed
 baseline loading is offline-only and rejects absent, incomplete, or changed history.
 
-The separate Jev experiment command/directories are added in Step 6. Until then,
-`--execute` without `--prepare-baseline` still means the original two-provider run.
+## Repeatable Jev experiments — Boris operates paid execution
 
-## Original combined paid run — Boris operates this
+Once the GPT baseline is complete, set only `TYPESAFE_API_KEY` for experiments.
+`OPENAI_API_KEY` is not required and GPT is never called by this command. An absent,
+incomplete, or mismatched baseline is an error, not permission to rebuild it online.
 
-Keep credentials out of source, shell history, chat, and logs. Supply
-`OPENAI_API_KEY` and `TYPESAFE_API_KEY` in the process environment using your local
-secret-management method. `.env.sample` lists the names; **the script does not
-load `.env` files**.
+Keep credentials out of source, shell history, chat, and logs. Use your local
+secret-management method. `.env.sample` lists the names; **the script does not load
+`.env` files**.
 
 Before execution, check account limits, current prices, and your intended spend
 limit in the provider consoles. There is **no hard dollar-budget limiter**; usage
 is reported after requests, and GPT has no output-token override.
 
-After reviewing the offline preflight, run once:
+After reviewing the offline preflight, run a Jev experiment:
 
 ```sh
 .venv/bin/python compare.py --execute
 ```
 
-The four provider/shop groups run separately; batches within each group run
-concurrently. Each HTTP attempt has a 120-second I/O timeout. Transient transport
-errors, 408, 429, and 5xx get at most two retries (up to 372 attempts for this
+Every invocation creates a fresh `results/experiments/<UTC-timestamp>-<unique-id>/`
+directory and prints its path. You may choose a directory with `--output-dir`, but
+it must not exist. `results/run/` (the original combined run) remains intact.
+
+The two Jev shop groups run separately; batches within each group run concurrently.
+Each HTTP attempt has a 120-second I/O timeout. Transient transport errors, 408,
+429, and 5xx get at most two retries (up to 186 Jev attempts for this
 workload). `Retry-After` is honored up to 60 seconds; longer waits stop that batch
 rather than retrying early. Retries, including requests that timed out after being
 processed remotely, can incur additional cost. Authentication/validation failures
@@ -133,23 +138,46 @@ validation. Jev's three probabilities may sum within 0.015 of one to accommodate
 two-decimal rounding. Their reported values and selected label are preserved, not
 renormalized; classification JSONL and summary counts flag rounding discrepancies.
 
-Credentials are required before requests begin. The run refuses to overwrite an
-existing `results/run/requests.jsonl`, preventing an accidental paid rerun into the
-same directory. There is no automatic resume. If a retry of the whole experiment
-is necessary, inspect failures first, then explicitly choose a new `--output-dir`;
-that resends the entire workload and incurs new charges.
+Each new experiment resends the complete Jev workload and incurs new charges;
+there is no automatic Jev resume. Use `--report-only` to inspect/regenerate existing
+results without new inference. Never rerun `--execute` merely to obtain reports.
+
+## Jev prompt variants
+
+`compare.py` contains separate `JEV_INSTRUCTIONS` and `JEV_CRITERIA` entries for
+`style_compatibility` and `complements`, plus the descriptive `JEV_PROMPT_VERSION`.
+The original shop policy/examples remain in shared state; each candidate receives
+its own Choice with the applicable objective's complete ordered decision procedure.
+The prompts explicitly define:
+
+- Furniture: variants and redundancy first, conventional complements next, then
+  distinct-model compatibility requiring both a compatible context and concrete
+  material, finish, construction, shape, or design-era evidence.
+- Complements: variants (including same-brand/same-category line extensions) and
+  redundancy first, then a direct functional add-on—not merely another related
+  product, extra unit, broad shared activity, or meal variety.
+- Hard negative: only after earlier checks, for confident substitution or explicit
+  incompatibility/wrong context. Uncertainty defaults to `skip`.
+
+For a prompt-only experiment, change the applicable objective's Jev definitions and
+run again. Do not edit the frozen GPT templates, input data, or candidate batches.
+Prompt changes are snapshotted per experiment and do not invalidate the saved GPT
+baseline.
 
 ## Results
 
-All outputs are ignored by Git and written under `results/run/`:
+All outputs are ignored by Git. Each experiment directory contains:
 
 | File | Contents |
 |---|---|
-| `requests.jsonl` | Incrementally flushed batch requests, structured responses, per-attempt usage/latency/status, retries, model IDs, and group wall times; no authorization headers |
+| `manifest.json` | Frozen workload snapshot |
+| `baseline.json` | Completed GPT labels, provenance, and historical accounting; no copy of raw GPT logs |
+| `experiment.json` | Exact Jev criteria/instructions/version, dated pricing, baseline and manifest digests, and intended payload hashes |
+| `requests.jsonl` | Only this experiment's Jev requests/responses, attempt usage/latency/status, retries, model IDs, and group wall times; no authorization headers |
 | `gpt_classifications.jsonl`, `jev_classifications.jsonl` | One record per expected pair/provider; statuses `ok`, `error`, or `missing`; errors/missing rows have null labels |
 | `paired_results.csv` | All 800 directed rows with evidence, labels, GPT reasons, Jev probabilities, statuses, and agreement |
 | `disagreements.csv` | Only pairs where both providers succeeded but chose different labels |
-| `summary.json` | Per-shop agreement matrices and per-provider/shop timing, counts, usage coverage, and cost estimates |
+| `summary.json` | Agreement matrices, new Jev timing/cost/usage, and separately identified historical GPT baseline measurements |
 
 The CSV writer prefixes formula-like text with an apostrophe for spreadsheet
 safety. JSON retains original text. Usage belongs to requests, not individual
@@ -158,11 +186,18 @@ pairs; it is not duplicated or arbitrarily apportioned across classification row
 Reports can be regenerated without inputs, credentials, or network access:
 
 ```sh
-.venv/bin/python compare.py --report-only
+.venv/bin/python compare.py --report-only --output-dir results/experiments/YOUR-RUN-ID
 ```
 
-Use the original `--manifest` and `--output-dir` if you chose custom paths.
-Reports verify the manifest's digest against the run log. Only derived reports
+Replace `YOUR-RUN-ID` with the printed directory name. Reports use that directory's
+snapshots: no original catalog, baseline directory, credentials, or current Jev
+criteria are needed. They verify manifest/baseline/experiment digests and logged
+payload hashes, so changing the code's criteria or pricing cannot rewrite history.
+An explicit `--manifest` must match the snapshot.
+
+For the original combined run, use `--report-only --output-dir results/run`;
+omitting `--output-dir` in report-only mode also selects that legacy run. Its
+original report format is retained. Only derived reports
 are overwritten; the request log and manifest are never overwritten. Interrupted
 runs retain completed batches; an unterminated, malformed final log line is
 flagged and omitted. Malformed interior lines or conflicting identities fail
@@ -181,6 +216,10 @@ Cost, token usage, request timing, and wall time remain the original measurement
 - **Agreement is not correctness.** Its denominator includes only paired valid
   results; failed/missing responses are excluded and separately counted. A valid
   `skip` is a real label, not an operational failure.
+- **New versus historical:** experiment summaries contain only fresh Jev inference
+  under `groups` and `new_inference`. GPT has zero new calls/cost; its original and
+  repair measurements live under `gpt_baseline.accounting`. Cached lookup time is
+  not GPT inference latency, and historical GPT cost is not charged to each run.
 - **Wall time** covers each provider/shop group including retries and persistence,
   excluding offline preparation. Throughput is successful pairs divided by that
   time. Incomplete groups have null wall time/throughput.
@@ -208,5 +247,5 @@ sampling of the full catalog. Historical GPT labels do not select sample rows,
 but the **saved reverse population was originally chosen from GPT non-skip forward
 judgments**. Forward/reverse direction is part of record identity; the same ordered
 product IDs may appear in both populations and are not independent observations.
-Batch context and different API interfaces can affect answers. This one run is a
-prompt/extraction diagnostic, not a calibrated accuracy or capacity benchmark.
+Batch context and different API interfaces can affect answers. These experiments
+are prompt/extraction diagnostics, not calibrated accuracy or capacity benchmarks.

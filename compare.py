@@ -51,6 +51,73 @@ TIMEOUT_SECONDS = 120.0
 MAX_RETRY_DELAY = 60.0
 PROBABILITY_SUM_TOLERANCE = 0.015  # Three probabilities rounded to two decimal places.
 EXTRACTION_VERSION = "partial-answers-v2"
+JEV_PROMPT_VERSION = "objective-prompts-v2"
+JEV_INSTRUCTIONS = {
+    "style_compatibility": (
+        "Judge candidates[{index}] as a STYLE-COMPATIBILITY recommendation for base in this direction. "
+        "Apply these checks in order and stop at the first match: "
+        "(1) same named model or product family differing only by size, colour, material, finish, shape, or another "
+        "variant axis -> skip; a shared collection with distinct model names is not by itself a variant; "
+        "(2) duplicate, or already included or integrated in base -> skip; "
+        "(3) clear accessory, refill, compatible replacement part, or setup component used with base -> positive; "
+        "(4) distinct models in the same primary use context, or credibly coordinating in one setting, with concrete "
+        "material, finish, construction, shape, or design-era evidence -> positive; "
+        "(5) explicit wrong functional role, wrong use context, incompatibility, or contradictory design evidence "
+        "that makes the candidate confidently unsuitable -> hard_negative; (6) otherwise -> skip. "
+        "Same role alone is not negative. Collection, category, brand, colour, or generic material alone is not "
+        "positive. Do not reverse the recommendation direction."
+    ),
+    "complements": (
+        "Judge candidates[{index}] as a COMPLEMENTS recommendation for base in this direction. "
+        "Apply these checks in order and stop at the first match: "
+        "(1) same kind of product differing only by size, colour, volume, scent, flavour, material, origin, finish, "
+        "or another variant axis, or same brand and same category product-line extension or successor -> skip; "
+        "(2) duplicate, or a non-consumable already included or integrated in base -> skip; "
+        "(3) clear accessory, setup component, attachment, refill, cover, case, compatible part, or product with a "
+        "direct complementary function used with base -> positive; "
+        "(4) confident same-role substitute bought instead of base -> hard_negative; "
+        "(5) strongly related but explicitly incompatible, unusable, or wrong-context candidate -> hard_negative; "
+        "(6) otherwise -> skip. A consumable refill is not redundant. Merely another related product, additional "
+        "meal variety, another unit, or something used in the same broad activity without a direct complementary "
+        "function is not positive. Do not reverse the recommendation direction."
+    ),
+}
+JEV_CRITERIA = {
+    "style_compatibility": {
+        "positive": (
+            "Checks 1-2 do not apply. Check 3 or 4 applies: the candidate is a clear functional complement, or it "
+            "is a distinct model with compatible use context and concrete style/material evidence. Distinct models "
+            "may serve the same role. Weak similarity alone is insufficient."
+        ),
+        "hard_negative": (
+            "Checks 1-4 do not apply and check 5 applies: supplied text explicitly establishes incompatibility, a "
+            "wrong functional role or use context, or contradictory design evidence that makes the candidate "
+            "unsuitable. A merely different or shared role alone is not enough. Uncertainty is skip."
+        ),
+        "skip": (
+            "Check 1, 2, or 6 applies: exact-model/family variant, duplicate, redundancy, unresolved relationship, "
+            "or only weak collection/category/brand/colour/generic-material similarity. Variant and redundancy "
+            "checks override every later check."
+        ),
+    },
+    "complements": {
+        "positive": (
+            "Checks 1-2 do not apply and check 3 applies: the candidate has a clear direct complementary function "
+            "with base as an accessory, setup component, attachment, refill, cover, case, or compatible part. "
+            "Relatedness, meal variety, another unit, or broad shared activity alone is insufficient."
+        ),
+        "hard_negative": (
+            "Checks 1-3 do not apply and check 4 or 5 applies: the candidate is confidently a same-role substitute "
+            "bought instead of base, or supplied text explicitly makes a strongly related candidate incompatible, "
+            "unusable, or wrong-context. Variants and uncertainty are never hard negatives."
+        ),
+        "skip": (
+            "Check 1, 2, or 6 applies: variant or same-brand/same-category line extension, duplicate, redundancy, "
+            "unrelated or merely related product, meal variety without a direct complementary function, or an "
+            "unclear relationship. Variant and redundancy checks override every later check."
+        ),
+    },
+}
 PRICING = {
     "as_of": "2026-09-17", "currency": "USD", "unit": "per million tokens",
     "gpt": {"input": 0.05, "cached_input": 0.005, "output": 0.40,
@@ -83,9 +150,28 @@ def index_records(records: list, key: str) -> dict:
     return result
 
 
+def parse_recommendation_objective(raw: bytes) -> str:
+    values = {}
+    for line in raw.decode("utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, marker, value = stripped.partition(":")
+        require(bool(marker) and bool(key.strip()) and bool(value.strip()), "Invalid recommendation config line")
+        key, value = key.strip(), value.strip()
+        require(key not in values, f"Duplicate recommendation config key: {key}")
+        values[key] = value
+    require(set(values) == {"version", "objective"}, "Recommendation config requires only version and objective")
+    require(values["version"] == "1", "Unsupported recommendation config version")
+    require(values["objective"] in PROMPTS, "Unsupported recommendation objective")
+    return values["objective"]
+
+
 def load_shop(data_dir: Path, shop: str) -> dict:
-    objective = SHOPS[shop]
     stage2 = Path(shop) / "stage2"
+    recommendation_path = stage2 / "recommendation.yaml"
+    recommendation = (data_dir / recommendation_path).read_bytes()
+    objective = parse_recommendation_objective(recommendation)
     paths = {
         "products": Path(shop) / "stage1/products_processed.json",
         "subset": stage2 / "subset_products.json",
@@ -96,9 +182,10 @@ def load_shop(data_dir: Path, shop: str) -> dict:
         "examples": stage2 / "classification_examples.txt",
         "system_prompt": stage2 / f"{PROMPTS[objective]}.system.txt",
         "user_prompt": stage2 / f"{PROMPTS[objective]}.user.txt",
-        "recommendation": stage2 / "recommendation.yaml",
+        "recommendation": recommendation_path,
     }
     raw = {key: (data_dir / path).read_bytes() for key, path in paths.items()}
+    require(raw["recommendation"] == recommendation, f"{shop}: recommendation changed while loading")
     context = json.loads(raw["context"])
     version = context["context_version"]
     payload = {key: value for key, value in context.items() if key != "context_version"}
@@ -177,6 +264,7 @@ def load_shop(data_dir: Path, shop: str) -> dict:
         duplicates[direction] = duplicate_count
 
     return {
+        "objective": objective,
         "context": context,
         "sources": {key: {"path": str(paths[key]), "sha256": sha256(value)} for key, value in raw.items()},
         "policy": {key: raw[key].decode("utf-8") for key in ("system_prompt", "user_prompt", "examples")},
@@ -234,8 +322,9 @@ def build_manifest(data_dir: Path, concurrency: int = 8) -> dict:
         ],
         "shops": {},
     }
-    for shop, objective in SHOPS.items():
+    for shop in SHOPS:
         loaded = load_shop(data_dir, shop)
+        objective = loaded["objective"]
         version = loaded["context"]["context_version"]
         batches = []
         for direction in ("forward", "reverse"):
@@ -318,13 +407,8 @@ def render_request(provider: str, settings: dict, data: dict, batch: dict) -> di
         },
         "questions": {f"candidate_{i}": {
             "type": "choice",
-            "instructions": (
-                f"Classify candidates[{i}] as a recommendation for base. "
-                "Apply label_policy, including its examples and ordered rules. "
-                "Stop at the first applicable check; judge this direction independently."
-            ),
-            "criteria": {label: f"The {label} outcome defined by label_policy after applying its ordered checks."
-                         for label in LABELS},
+            "instructions": JEV_INSTRUCTIONS[data["objective"]].format(index=i),
+            "criteria": {label: JEV_CRITERIA[data["objective"]][label] for label in LABELS},
         } for i in range(len(candidates))},
     }
 
@@ -519,8 +603,9 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
 
 
 def execute(manifest: dict, jobs: dict, output_dir: Path, manifest_digest: str, credentials: dict,
-            *, transport: httpx.BaseTransport | None = None) -> int:
-    for provider in ENDPOINTS:
+            *, transport: httpx.BaseTransport | None = None, run_metadata: dict | None = None) -> int:
+    for provider in jobs:
+        require(provider in ENDPOINTS, "Unknown execution provider")
         require(bool(credentials.get(provider)), f"Missing credential for {provider}")
     output_dir.mkdir(parents=True, exist_ok=True)
     failures = 0
@@ -533,7 +618,7 @@ def execute(manifest: dict, jobs: dict, output_dir: Path, manifest_digest: str, 
         emit({"record_type": "run_start", "started_at": datetime.now(timezone.utc).isoformat(),
               "manifest_sha256": manifest_digest, "script_sha256": sha256(Path(__file__).read_bytes()),
               "concurrency": manifest["concurrency"], "timeout_seconds": TIMEOUT_SECONDS,
-              "max_retries": MAX_RETRIES, "max_retry_delay_seconds": MAX_RETRY_DELAY})
+              "max_retries": MAX_RETRIES, "max_retry_delay_seconds": MAX_RETRY_DELAY, **(run_metadata or {})})
         for provider, shops in jobs.items():
             for shop, work in shops.items():
                 emit({"record_type": "group_start", "provider": provider, "shop": shop,
@@ -806,7 +891,70 @@ def prepare_gpt_baseline(manifest: dict, root: Path, *, import_run: Path | None 
         return directory, state
 
 
-def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int) -> dict:
+def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | None = None,
+                       *, experiments_root: Path = Path("results/experiments"),
+                       transport: httpx.BaseTransport | None = None) -> tuple[Path, int]:
+    baseline = load_completed_baseline(manifest, baseline_root)
+    key = os.environ.get("TYPESAFE_API_KEY")
+    require(bool(key), "Missing credential: TYPESAFE_API_KEY; no requests started")
+    jobs = {"jev": {shop: [(batch, render_request("jev", manifest["models"]["jev"], data, batch))
+                          for batch in data["batches"]] for shop, data in manifest["shops"].items()}}
+    identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:12]
+    directory = output_dir if output_dir is not None else experiments_root / identifier
+    directory.mkdir(parents=True, exist_ok=False)
+    manifest_digest = write_manifest(directory / "manifest.json", manifest)
+    baseline_bytes = canonical_json(baseline)
+    immutable_bytes(directory / "baseline.json", baseline_bytes)
+    experiment = {
+        "schema_version": "jev-experiment-v1", "id": directory.name,
+        "manifest_sha256": manifest_digest, "baseline_fingerprint": baseline["fingerprint"],
+        "baseline_sha256": sha256(baseline_bytes), "jev_prompt_version": JEV_PROMPT_VERSION,
+        "jev_criteria": JEV_CRITERIA, "jev_instructions": JEV_INSTRUCTIONS, "pricing": PRICING,
+        "jev_request_hashes": {batch["batch_id"]: sha256(canonical_json(payload))
+                               for work in jobs["jev"].values() for batch, payload in work},
+    }
+    experiment_bytes = canonical_json(experiment)
+    immutable_bytes(directory / "experiment.json", experiment_bytes)
+    print(f"Jev experiment: {directory}; reusing {len(baseline['classifications'])} GPT labels. "
+          "No GPT requests will be made.", flush=True)
+    failures = execute(manifest, jobs, directory, manifest_digest, {"jev": key}, transport=transport,
+                       run_metadata={"experiment_sha256": sha256(experiment_bytes),
+                                     "baseline_fingerprint": baseline["fingerprint"]})
+    write_reports(directory / "manifest.json", directory)
+    return directory, failures
+
+
+def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, start: dict) -> tuple[dict, dict]:
+    raw_experiment = (directory / "experiment.json").read_bytes()
+    raw_baseline = (directory / "baseline.json").read_bytes()
+    require(start.get("experiment_sha256") == sha256(raw_experiment), "Experiment snapshot digest mismatch")
+    experiment = strict_json(raw_experiment.decode("utf-8"))
+    baseline = strict_json(raw_baseline.decode("utf-8"))
+    require(experiment["schema_version"] == "jev-experiment-v1", "Unsupported experiment schema")
+    require(experiment["manifest_sha256"] == sha256(raw_manifest), "Experiment manifest mismatch")
+    require((directory / "manifest.json").read_bytes() == raw_manifest, "Experiment must use its saved manifest")
+    require(experiment["baseline_sha256"] == sha256(raw_baseline), "Baseline snapshot digest mismatch")
+    fingerprint = sha256(canonical_json(baseline_spec(manifest)))
+    require(baseline["schema_version"] == "gpt-baseline-v1" and baseline["complete"], "Incomplete GPT snapshot")
+    require(start["baseline_fingerprint"] == experiment["baseline_fingerprint"] == baseline["fingerprint"] == fingerprint,
+            "Experiment baseline fingerprint mismatch")
+    expected = {item["pair_id"]: (shop, batch, item) for shop, data in manifest["shops"].items()
+                for batch in data["batches"] for item in batch["candidates"]}
+    answers = index_records(baseline["classifications"], "pair_id")
+    require(set(answers) == set(expected), "Baseline snapshot answer coverage mismatch")
+    for identity, answer in answers.items():
+        shop, batch, item = expected[identity]
+        require(answer["shop"] == shop and answer["candidate_id"] == item["candidate_id"]
+                and answer["anchor_id"] == batch["anchor_id"] and answer["direction"] == batch["direction"],
+                "Baseline snapshot pair mismatch")
+        require(answer["status"] == "ok" and answer["label"] in LABELS, "Invalid cached classification")
+    require(set(experiment["jev_request_hashes"]) == {batch["batch_id"] for data in manifest["shops"].values()
+                                                    for batch in data["batches"]}, "Experiment request coverage mismatch")
+    return experiment, baseline
+
+
+def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int,
+                    pricing: dict | None = None) -> dict:
     attempts = [attempt for record in records for attempt in record["attempts"]]
     complete = end is not None and len(records) == len(expected)
     wall = end["wall_seconds"] if complete else None
@@ -825,7 +973,7 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
             "total": subtotal if complete and len(reported) == len(attempts) else None,
             "reported_attempts": len(reported), "missing_attempts": len(attempts) - len(reported),
         }
-    costs = [attempt_cost(provider, attempt["usage"]) for attempt in attempts]
+    costs = [attempt_cost(provider, attempt["usage"], pricing) for attempt in attempts]
     priced = [cost for cost in costs if cost is not None]
     subtotal = math.fsum(priced) if priced else None
     cost_complete = complete and bool(attempts) and len(priced) == len(attempts)
@@ -885,7 +1033,12 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
     start = records[0]
     require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
     require(start["concurrency"] == manifest["concurrency"], "Run/manifest concurrency mismatch")
-    expected = {(provider, shop, batch["batch_id"]): batch for provider in manifest["models"]
+    experiment, baseline = None, None
+    if "experiment_sha256" in start or (output_dir / "experiment.json").exists():
+        experiment, baseline = experiment_snapshot(output_dir, raw_manifest, manifest, start)
+    providers = ("jev",) if experiment else manifest["models"]
+    pricing = experiment["pricing"] if experiment else PRICING
+    expected = {(provider, shop, batch["batch_id"]): batch for provider in providers
                 for shop, data in manifest["shops"].items() for batch in data["batches"]}
     groups = {(provider, shop) for provider, shop, _ in expected}
     observed, starts, ends = {}, {}, {}
@@ -912,6 +1065,9 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
             batch = expected[key]
             settings = manifest["models"][group[0]]
             require(record["requested_model"] == record["request"]["model"] == settings["model"], "Batch model mismatch")
+            if experiment:
+                require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][record["batch_id"]],
+                        "Jev request differs from experiment snapshot")
             if group[0] == "gpt":
                 require(record["request"]["reasoning_effort"] == settings["reasoning_effort"], "Reasoning setting mismatch")
                 require("temperature" not in record["request"] and "max_completion_tokens" not in record["request"],
@@ -930,21 +1086,34 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
 
     classifications = {provider: {} for provider in manifest["models"]}
     summary = {
-        "schema_version": "jev-sbs-report-v1", "manifest_sha256": sha256(raw_manifest),
+        "schema_version": "jev-sbs-report-v2" if experiment else "jev-sbs-report-v1", "manifest_sha256": sha256(raw_manifest),
         "extraction": {"version": EXTRACTION_VERSION, "probability_sum_tolerance": PROBABILITY_SUM_TOLERANCE,
                        "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes())},
-        "models": manifest["models"], "pricing": PRICING, "run_settings": start, "truncated_final_line": truncated,
+        "models": manifest["models"], "pricing": pricing, "run_settings": start, "truncated_final_line": truncated,
         "limitations": [*manifest["limitations"],
                         "Interrupted runs can omit in-flight attempts; usage subtotals cover recorded attempts only."],
         "groups": {}, "agreement": {},
     }
+    if baseline is not None:
+        classifications["gpt"] = {answer["pair_id"]: {**answer, "cached": True, "error": None,
+                                                     "baseline_fingerprint": baseline["fingerprint"]}
+                                  for answer in baseline["classifications"]}
+        summary["experiment"] = experiment
+        summary["gpt_baseline"] = {
+            "fingerprint": baseline["fingerprint"], "cached": True, "classifications": len(classifications["gpt"]),
+            "accounting": baseline["accounting"], "pricing": baseline["pricing"],
+            "label_counts": {shop: {label: sum(answer["shop"] == shop and answer["label"] == label
+                                              for answer in baseline["classifications"]) for label in LABELS}
+                             for shop in manifest["shops"]},
+            "note": "Historical measurements, not inference performed during this Jev experiment.",
+        }
     for provider, shop in sorted(groups):
         data = manifest["shops"][shop]
         group_records = [observed[provider, shop, batch["batch_id"]] for batch in data["batches"]
                          if (provider, shop, batch["batch_id"]) in observed]
         end = ends.get((provider, shop)) if (provider, shop) in starts else None
         summary["groups"][f"{provider}/{shop}"] = summarize_group(
-            provider, group_records, data["batches"], end, manifest["concurrency"])
+            provider, group_records, data["batches"], end, manifest["concurrency"], pricing)
         for batch in data["batches"]:
             record = observed.get((provider, shop, batch["batch_id"]))
             answers = {answer["pair_id"]: answer for answer in record["answers"]} if record else {}
@@ -991,6 +1160,13 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
         }
     summary["run_complete"] = finished and not truncated and all(group["complete"] for group in summary["groups"].values())
     summary["all_pairs_classified"] = all(row["paired_success"] for row in paired)
+    if experiment:
+        costs = [group["cost_estimate"]["total_usd"] for group in summary["groups"].values()]
+        summary["new_inference"] = {
+            "gpt_http_attempts": 0, "gpt_cost_usd": 0.0,
+            "jev_http_attempts": sum(group["http_attempts"] for group in summary["groups"].values()),
+            "jev_cost_estimate_usd": math.fsum(costs) if all(cost is not None for cost in costs) else None,
+        }
     for provider, rows in classifications.items():
         (output_dir / f"{provider}_classifications.jsonl").write_text(
             "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows.values()), encoding="utf-8")
@@ -1005,12 +1181,12 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--manifest", type=Path, default=Path("results/manifest.json"))
+    parser.add_argument("--manifest", type=Path, help="Frozen workload path; defaults to results/manifest.json or the experiment snapshot")
     parser.add_argument("--concurrency", type=int, default=8)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true", help="Make paid API requests (Boris runs this explicitly)")
     mode.add_argument("--report-only", action="store_true", help="Rebuild reports from the saved manifest and request log, offline")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/run"))
+    parser.add_argument("--output-dir", type=Path, help="New experiment directory for execution, or existing directory for --report-only")
     parser.add_argument("--prepare-baseline", action="store_true", help="Import/prepare the GPT baseline; add --execute for paid completion")
     parser.add_argument("--import-run", type=Path, help="Existing comparison run directory to seed the GPT baseline")
     parser.add_argument("--baseline-root", type=Path, default=Path("results/baselines"))
@@ -1020,16 +1196,20 @@ def main() -> None:
     if args.prepare_baseline and args.report_only:
         parser.error("--prepare-baseline cannot be combined with --report-only")
     if args.report_only:
+        directory = args.output_dir or Path("results/run")
+        manifest_path = args.manifest or (directory / "manifest.json" if (directory / "experiment.json").exists()
+                                          else Path("results/manifest.json"))
         try:
-            summary = write_reports(args.manifest, args.output_dir)
+            summary = write_reports(manifest_path, directory)
         except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as error:
             parser.exit(1, f"Reporting failed: {error}\n")
-        print(f"Reports rebuilt offline in {args.output_dir}; run_complete={summary['run_complete']}, "
+        print(f"Reports rebuilt offline in {directory}; run_complete={summary['run_complete']}, "
               f"all_pairs_classified={summary['all_pairs_classified']}")
         return
     try:
         manifest = build_manifest(args.data_dir, args.concurrency)
-        digest = write_manifest(args.manifest, manifest)
+        manifest_path = args.manifest or Path("results/manifest.json")
+        digest = write_manifest(manifest_path, manifest)
         if args.prepare_baseline:
             directory, baseline = prepare_gpt_baseline(
                 manifest, args.baseline_root, import_run=args.import_run, paid=args.execute)
@@ -1041,31 +1221,28 @@ def main() -> None:
             elif not baseline["complete"]:
                 parser.exit(1, "GPT baseline remains incomplete after bounded attempts; saved progress is reusable.\n")
             return
-        jobs = prepare_requests(manifest)
+        prepare_requests(manifest)  # Validate payload rendering during offline preflight.
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(1, f"Preparation failed: {error}\n")
-    print(f"Offline manifest: {args.manifest} (SHA256 {digest})")
+    print(f"Offline manifest: {manifest_path} (SHA256 {digest})")
     print(f"Models: {GPT_SETTINGS['model']} / jev-1.13.0; concurrency: {args.concurrency}")
     for shop, data in manifest["shops"].items():
         for direction in ("forward", "reverse"):
             batches = [batch for batch in data["batches"] if batch["direction"] == direction]
             sizes = [len(batch["candidates"]) for batch in batches]
-            print(f"{shop} {direction}: {sum(sizes)} rows, {len(batches)} requests/provider, batch sizes {sizes}")
+            print(f"{shop} {direction}: {sum(sizes)} rows, {len(batches)} Jev requests, batch sizes {sizes}")
         print(f"  Source checks: {json.dumps(data['diagnostics'], sort_keys=True)}")
-    print(f"Request log: {args.output_dir / 'requests.jsonl'}; groups run separately: GPT then Jev, shop by shop.")
+    print(f"Jev prompt: {JEV_PROMPT_VERSION}. GPT labels must come from a completed saved baseline.")
     if not args.execute:
         print("No API requests made. Use --execute only when ready for the paid run.")
         return
-    print("Executing paid requests; retries may incur additional cost.", flush=True)
     try:
-        credentials = {"gpt": os.environ.get("OPENAI_API_KEY"), "jev": os.environ.get("TYPESAFE_API_KEY")}
-        failures = execute(manifest, jobs, args.output_dir, digest, credentials)
-        write_reports(args.manifest, args.output_dir)
-    except (OSError, ValueError) as error:
+        directory, failures = run_jev_experiment(manifest, args.baseline_root, args.output_dir)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(1, f"Execution failed: {error}\n")
     if failures:
         parser.exit(1, f"Run finished with {failures} incomplete batches; inspect requests.jsonl before any rerun.\n")
-    print(f"All batches completed. Inspect {args.output_dir / 'summary.json'} and disagreements.csv.")
+    print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
 
 
 if __name__ == "__main__":
