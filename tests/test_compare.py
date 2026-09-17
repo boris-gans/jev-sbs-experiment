@@ -2,6 +2,9 @@ import copy
 import hashlib
 import json
 import socket
+import threading
+
+import httpx
 
 import pytest
 
@@ -82,8 +85,12 @@ def catalogs(tmp_path):
         write_blocks(stage2 / "reverse_judgments.json", reverse)
         stem = compare.PROMPTS[objective]
         for name, content in {
-            f"{stem}.system.txt": "Exact policy with {examples}\n",
-            f"{stem}.user.txt": "Base: {anchor_id} {anchor_text}\n{candidates_json}\n",
+            f"{stem}.system.txt": "Exact policy with {examples}\nOUTPUT\nGPT-only output instructions\n",
+            f"{stem}.user.txt": (
+                "Base: {anchor_id} {anchor_text}\n{candidates_json}\n"
+                "For each candidate, apply the ordered rules.\n"
+                "Category guidance must survive.\nReturn a JSON object with judgments.\n"
+            ),
             "classification_examples.txt": "Synthetic example\n",
             "recommendation.yaml": f"objective: {objective}\n",
         }.items():
@@ -235,3 +242,342 @@ def test_offline_cli(catalogs, tmp_path, monkeypatch, capsys):
 def test_invalid_concurrency(catalogs):
     with pytest.raises(ValueError, match="Concurrency must be positive"):
         compare.build_manifest(catalogs, concurrency=0)
+
+
+@pytest.fixture
+def prepared(catalogs):
+    manifest = compare.build_manifest(catalogs)
+    return manifest, compare.prepare_requests(manifest)
+
+
+def response_for(provider, payload):
+    if provider == "gpt":
+        # The fixture's user message has a standalone JSON candidate array.
+        text = payload["messages"][1]["content"]
+        candidates = json.loads(text[text.index("["):text.index("\nFor each candidate,")])
+        return {
+            "model": payload["model"],
+            "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"judgments": [
+                {"id": item["id"], "label": "positive", "reason": "Synthetic evidence"}
+                for item in reversed(candidates)
+            ]})}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20,
+                      "prompt_tokens_details": {"cached_tokens": 0},
+                      "completion_tokens_details": {"reasoning_tokens": 5}},
+        }
+    return {
+        "model": payload["model"],
+        "answers": {key: {"type": "choice", "choice": "positive", "confidence": 0.7,
+                          "probabilities": {"positive": 0.8, "skip": 0.15, "hard_negative": 0.05}}
+                    for key in reversed(payload["questions"])},
+        "usage": {"input_tokens": 100, "output_tokens": 0},
+    }
+
+
+def test_provider_payload_parity(prepared):
+    manifest, jobs = prepared
+    original = copy.deepcopy(manifest)
+    for shop, data in manifest["shops"].items():
+        for (batch, gpt), (jev_batch, jev) in zip(jobs["gpt"][shop], jobs["jev"][shop], strict=True):
+            assert batch == jev_batch
+            anchor = data["products"][batch["anchor_id"]]
+            candidates = [{key: data["products"][item["candidate_id"]][key]
+                           for key in ("id", "name", "category", "description")}
+                          for item in batch["candidates"]]
+            assert jev["state"]["base"] == {"id": anchor["id"], "text": anchor["text"]}
+            assert jev["state"]["candidates"] == candidates
+            assert gpt["messages"][0]["content"] == data["policy"]["system_prompt"].replace(
+                "{examples}", data["policy"]["examples"].strip())
+            assert gpt["messages"][1]["content"] == data["policy"]["user_prompt"].format(
+                anchor_id=anchor["id"], anchor_text=anchor["text"], candidates_json=json.dumps(candidates, indent=2))
+            assert gpt["reasoning_effort"] == "medium"
+            assert "temperature" not in gpt and "max_completion_tokens" not in gpt
+            assert gpt["response_format"]["json_schema"]["strict"] is True
+            assert "GPT-only output instructions" not in json.dumps(jev)
+            assert "Category guidance must survive." in jev["state"]["label_policy"]["ordered_rules"]
+            assert "Synthetic example" in jev["state"]["label_policy"]["system"]
+            for i, question in enumerate(jev["questions"].values()):
+                assert f"candidates[{i}]" in question["instructions"]
+                assert set(question["criteria"]) == set(compare.LABELS)
+                assert question["type"] == "choice"
+    assert manifest == original
+
+
+@pytest.mark.parametrize("provider", ["gpt", "jev"])
+def test_answer_mapping_and_usage(prepared, provider):
+    _, jobs = prepared
+    batch, payload = jobs[provider]["furniture.co.uk"][0]
+    body = response_for(provider, payload)
+    answers = compare.parse_answers(provider, body, batch)
+    assert [answer["pair_id"] for answer in answers] == [item["pair_id"] for item in batch["candidates"]]
+    assert all(answer["label"] == "positive" for answer in answers)
+    usage = compare.normalize_usage(provider, body["usage"])
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == (20 if provider == "gpt" else 0)
+    assert compare.normalize_usage(provider, None)["input_tokens"] is None
+    assert compare.normalize_usage(provider, {})["output_tokens"] is None
+    if provider == "gpt":
+        assert usage["cached_input_tokens"] == 0 and usage["reasoning_tokens"] == 5
+    else:
+        assert all(answer["reason"] is None for answer in answers)
+
+
+@pytest.mark.parametrize("failure", ["missing", "extra", "duplicate", "label", "reason", "refusal", "truncated"])
+def test_gpt_rejects_invalid_answers(prepared, failure):
+    _, jobs = prepared
+    batch, payload = jobs["gpt"]["furniture.co.uk"][0]
+    body = response_for("gpt", payload)
+    message = body["choices"][0]["message"]
+    judgments = json.loads(message["content"])["judgments"]
+    if failure == "missing":
+        judgments.pop()
+    elif failure == "extra":
+        judgments.append({"id": "unknown", "label": "skip", "reason": ""})
+    elif failure == "duplicate":
+        judgments.append(judgments[0])
+    elif failure == "label":
+        judgments[0]["label"] = "negative"
+    elif failure == "reason":
+        judgments[0]["reason"] = "x" * 81
+    elif failure == "refusal":
+        message["refusal"] = "Synthetic refusal"
+    else:
+        body["choices"][0]["finish_reason"] = "length"
+    message["content"] = json.dumps({"judgments": judgments})
+    with pytest.raises(ValueError):
+        compare.parse_answers("gpt", body, batch)
+
+
+@pytest.mark.parametrize("failure", ["missing", "extra", "label", "probabilities", "sum", "confidence", "maximal"])
+def test_jev_rejects_invalid_answers(prepared, failure):
+    _, jobs = prepared
+    batch, payload = jobs["jev"]["furniture.co.uk"][0]
+    body = response_for("jev", payload)
+    answer = body["answers"]["candidate_0"]
+    if failure == "missing":
+        del body["answers"]["candidate_0"]
+    elif failure == "extra":
+        body["answers"]["extra"] = answer
+    elif failure == "label":
+        answer["choice"] = "negative"
+    elif failure == "probabilities":
+        answer["probabilities"]["skip"] = float("nan")
+    elif failure == "sum":
+        answer["probabilities"]["positive"] = 0.9
+    elif failure == "confidence":
+        answer["confidence"] = True
+    else:
+        answer["choice"] = "skip"
+    with pytest.raises(ValueError):
+        compare.parse_answers("jev", body, batch)
+
+
+@pytest.mark.parametrize("response_text", ['{"answers":{},"answers":{}}', '{"usage":NaN}'])
+def test_strict_json_rejects_duplicate_keys_and_nonfinite(response_text):
+    with pytest.raises(ValueError):
+        compare.strict_json(response_text)
+
+
+@pytest.mark.parametrize("provider", ["gpt", "jev"])
+@pytest.mark.parametrize("first_status", [429, 500, 529, "timeout"])
+def test_retry_accounting(prepared, provider, first_status, monkeypatch):
+    _, jobs = prepared
+    batch, payload = jobs[provider]["furniture.co.uk"][0]
+    calls, sleeps = [], []
+    monkeypatch.setattr(compare.time, "sleep", sleeps.append)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            if first_status == "timeout":
+                raise httpx.ReadTimeout("Sensitive request detail must not be logged", request=request)
+            return httpx.Response(first_status, json={"error": "Synthetic transient error"}, headers={"retry-after": "0.25"})
+        return httpx.Response(200, json=response_for(provider, payload),
+                              headers={"x-request-id": "gpt-trace", "x-typesafe-request-id": "jev-trace"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = compare.run_batch(client, provider, "furniture.co.uk", batch, payload, "dummy-test-key")
+    assert result["status"] == "ok" and result["error"] is None
+    assert len(calls) == 2 and result["retries"] == 1
+    assert sleeps == ([1] if first_status == "timeout" else [0.25])
+    assert result["attempts"][1]["request_id"] == f"{provider}-trace"
+    assert result["attempts"][0]["usage"]["input_tokens"] is None
+    assert result["raw_response"] == response_for(provider, payload)
+    assert all(attempt["latency_seconds"] >= 0 for attempt in result["attempts"])
+    assert "Sensitive request detail" not in json.dumps(result)
+    assert "dummy-test-key" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("status", [401, 403, 422, 200])
+def test_nonretryable_failures_never_become_skip(prepared, status):
+    _, jobs = prepared
+    batch, payload = jobs["jev"]["furniture.co.uk"][0]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, json={"model": "jev-1.13.0", "answers": {}, "usage": {"input_tokens": 0}})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = compare.run_batch(client, "jev", "furniture.co.uk", batch, payload, "dummy")
+    assert len(calls) == 1 and result["retries"] == 0
+    assert result["status"] == "error" and result["answers"] == []
+    assert result["attempts"][0]["usage"]["input_tokens"] == 0
+    assert result["error"] == ("invalid_response" if status == 200 else f"http_{status}")
+
+
+def test_retry_exhaustion_and_long_retry_after(prepared, monkeypatch):
+    _, jobs = prepared
+    batch, payload = jobs["jev"]["furniture.co.uk"][0]
+    sleeps = []
+    monkeypatch.setattr(compare.time, "sleep", sleeps.append)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(503))) as client:
+        result = compare.run_batch(client, "jev", "furniture.co.uk", batch, payload, "dummy")
+    assert result["status"] == "error" and len(result["attempts"]) == 3
+    assert sleeps == [1, 2] and result["retries"] == 2
+    assert compare.retry_delay("120", 0) is None
+    assert compare.retry_delay("not-a-date", 0) == 1
+    assert compare.retry_delay("nan", 0) is None
+
+
+def test_execute_groups_are_sequential_and_outputs_exclusive(prepared, tmp_path):
+    manifest, jobs = prepared
+    # Two batches per group suffice to exercise concurrency and persistence.
+    jobs = {provider: {shop: work[:2] for shop, work in shops.items()} for provider, shops in jobs.items()}
+    calls = []
+
+    def handler(request):
+        provider = "gpt" if request.url.host == "api.openai.com" else "jev"
+        calls.append(provider)
+        return httpx.Response(200, json=response_for(provider, json.loads(request.content)))
+
+    directory = tmp_path / "run"
+    keys = {"gpt": "dummy-gpt-key", "jev": "dummy-jev-key"}
+    failures = compare.execute(manifest, jobs, directory, "manifest-digest", keys, transport=httpx.MockTransport(handler))
+    assert failures == 0 and len(calls) == 8
+    records = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
+    assert records[0]["record_type"] == "run_start" and records[0]["concurrency"] == 8
+    assert records[-1] == {"record_type": "run_end", "failed_batches": 0}
+    active = None
+    for record in records[1:-1]:
+        group = (record["provider"], record["shop"])
+        if record["record_type"] == "group_start":
+            assert active is None
+            active = group
+        elif record["record_type"] == "group_end":
+            assert active == group and record["wall_seconds"] >= 0
+            active = None
+        else:
+            assert active == group and record["answers"]
+    assert active is None
+    assert "dummy-gpt-key" not in json.dumps(records) and "dummy-jev-key" not in json.dumps(records)
+    with pytest.raises(FileExistsError):
+        compare.execute(manifest, jobs, directory, "manifest-digest", keys, transport=httpx.MockTransport(handler))
+    assert len(calls) == 8
+
+
+def test_completed_batch_is_flushed_before_group_finishes(prepared, tmp_path):
+    manifest, jobs = prepared
+    manifest["concurrency"] = 2
+    work = jobs["jev"]["furniture.co.uk"][:2]
+    log = tmp_path / "run/requests.jsonl"
+    second_started = threading.Event()
+    allow_second = threading.Event()
+    first_id = work[0][1]["state"]["base"]["id"]
+
+    def handler(request):
+        payload = json.loads(request.content)
+        if payload["state"]["base"]["id"] == first_id:
+            assert second_started.wait(5)
+        else:
+            second_started.set()
+            assert allow_second.wait(5)
+        return httpx.Response(200, json=response_for("jev", payload))
+
+    errors = []
+
+    def run():
+        try:
+            compare.execute(manifest, {"jev": {"furniture.co.uk": work}}, log.parent, "digest",
+                            {"gpt": "dummy", "jev": "dummy"}, transport=httpx.MockTransport(handler))
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert second_started.wait(5)
+        deadline = compare.time.monotonic() + 5
+        while compare.time.monotonic() < deadline:
+            text = log.read_text()
+            if '"record_type": "batch"' in text:
+                assert '"record_type": "group_end"' not in text
+                break
+            compare.time.sleep(0.01)
+        else:
+            pytest.fail("Completed batch was not flushed")
+    finally:
+        allow_second.set()
+        thread.join(5)
+    assert not thread.is_alive() and not errors
+
+
+def test_execute_flag_requires_credentials_before_network(catalogs, tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    output = tmp_path / "run"
+    monkeypatch.setattr("sys.argv", ["compare.py", "--data-dir", str(catalogs),
+                                    "--manifest", str(tmp_path / "manifest.json"),
+                                    "--output-dir", str(output), "--execute"])
+    with pytest.raises(SystemExit) as result:
+        compare.main()
+    assert result.value.code == 1
+    assert "Missing credential" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_malformed_json_response_is_not_retried(prepared):
+    _, jobs = prepared
+    batch, payload = jobs["gpt"]["furniture.co.uk"][0]
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, text="not JSON"))) as client:
+        result = compare.run_batch(client, "gpt", "furniture.co.uk", batch, payload, "dummy")
+    assert result["status"] == "error" and result["error"] == "invalid_response"
+    assert result["answers"] == [] and result["raw_response"] is None
+    assert len(result["attempts"]) == 1 and result["retries"] == 0
+
+
+def test_long_retry_after_stops_without_early_retry(prepared, monkeypatch):
+    _, jobs = prepared
+    batch, payload = jobs["jev"]["furniture.co.uk"][0]
+    sleeps = []
+    monkeypatch.setattr(compare.time, "sleep", sleeps.append)
+    transport = httpx.MockTransport(lambda request: httpx.Response(429, headers={"retry-after": "120"}))
+    with httpx.Client(transport=transport) as client:
+        result = compare.run_batch(client, "jev", "furniture.co.uk", batch, payload, "dummy")
+    assert result["status"] == "error" and result["error"] == "http_429"
+    assert len(result["attempts"]) == 1 and result["retries"] == 0 and sleeps == []
+    assert result["attempts"][0]["retry_not_scheduled"] == "retry_after_exceeds_budget"
+
+
+def test_execute_persists_partial_failure_and_finishes_groups(prepared, tmp_path):
+    manifest, jobs = prepared
+    jobs = {provider: {shop: work[:1] for shop, work in shops.items()} for provider, shops in jobs.items()}
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(422, json={"error": "Synthetic schema error"})
+        provider = "gpt" if request.url.host == "api.openai.com" else "jev"
+        return httpx.Response(200, json=response_for(provider, json.loads(request.content)))
+
+    directory = tmp_path / "partial-run"
+    failures = compare.execute(manifest, jobs, directory, "digest", {"gpt": "dummy", "jev": "dummy"},
+                               transport=httpx.MockTransport(handler))
+    assert failures == 1 and len(calls) == 4
+    records = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
+    batches = [record for record in records if record["record_type"] == "batch"]
+    assert batches[0]["status"] == "error" and batches[0]["answers"] == []
+    assert all(record["status"] == "ok" for record in batches[1:])
+    assert sum(record["record_type"] == "group_end" for record in records) == 4
+    assert records[-1] == {"record_type": "run_end", "failed_batches": 1}
