@@ -158,6 +158,11 @@ The prompts explicitly define:
   product, extra unit, broad shared activity, or meal variety.
 - Hard negative: only after earlier checks, for confident substitution or explicit
   incompatibility/wrong context. Uncertainty defaults to `skip`.
+- Each Choice criterion also contains short catalog-grounded boundary examples.
+  Furniture distinguishes named family variants, matching room furniture, and
+  explicit wrong-size/wrong-context products. Complements distinguishes same-cut
+  variants, alternative main proteins, meal variety, and model-matched accessories.
+  These teach shared rules and never identify product IDs as exceptions.
 
 For a prompt-only experiment, change the applicable objective's Jev definitions and
 run again. Do not edit the frozen GPT templates, input data, or candidate batches.

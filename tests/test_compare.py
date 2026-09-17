@@ -1295,10 +1295,16 @@ def test_objective_specific_prompts_preserve_evidence_and_gpt(prepared, monkeypa
             assert "STYLE-COMPATIBILITY" in instructions
             assert "distinct models" in instructions and "construction" in instructions
             assert "Same role alone is not negative" in instructions
+            assert "matching chair" in criteria["positive"]
+            assert "6ft mattress" in criteria["hard_negative"] and "pet bed" in criteria["hard_negative"]
+            assert "Juliette bed" in criteria["skip"] and "Tetbury 2-basket bench" in criteria["skip"]
         else:
             assert "COMPLEMENTS" in instructions
             assert "same brand and same category" in instructions
             assert "meal variety" in instructions and "direct complementary function" in instructions
+            assert "Kamado MEDIUM" in criteria["positive"] and "Do not reverse" in criteria["positive"]
+            assert "distinct steak cut or burger" in criteria["hard_negative"]
+            assert "same ribeye or tenderloin" in criteria["skip"] and "mixed protein box" in criteria["skip"]
         prompts[data["objective"]] = (instructions, criteria)
         changed = copy.deepcopy(compare.JEV_CRITERIA)
         changed[data["objective"]]["positive"] = "Another experiment"

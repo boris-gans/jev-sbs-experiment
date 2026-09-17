@@ -51,7 +51,7 @@ TIMEOUT_SECONDS = 120.0
 MAX_RETRY_DELAY = 60.0
 PROBABILITY_SUM_TOLERANCE = 0.015  # Three probabilities rounded to two decimal places.
 EXTRACTION_VERSION = "partial-answers-v2"
-JEV_PROMPT_VERSION = "objective-prompts-v2"
+JEV_PROMPT_VERSION = "objective-boundaries-v3"
 JEV_INSTRUCTIONS = {
     "style_compatibility": (
         "Judge candidates[{index}] as a STYLE-COMPATIBILITY recommendation for base in this direction. "
@@ -87,34 +87,46 @@ JEV_CRITERIA = {
         "positive": (
             "Checks 1-2 do not apply. Check 3 or 4 applies: the candidate is a clear functional complement, or it "
             "is a distinct model with compatible use context and concrete style/material evidence. Distinct models "
-            "may serve the same role. Weak similarity alone is insufficient."
+            "may serve the same role. Weak similarity alone is insufficient. Boundary examples: a dining table "
+            "with its matching chair is positive; a side table and a distinct console with stated matching "
+            "construction, finish, and room context can be positive."
         ),
         "hard_negative": (
             "Checks 1-4 do not apply and check 5 applies: supplied text explicitly establishes incompatibility, a "
             "wrong functional role or use context, or contradictory design evidence that makes the candidate "
-            "unsuitable. A merely different or shared role alone is not enough. Uncertainty is skip."
+            "unsuitable. A merely different or shared role alone is not enough. Uncertainty is skip. Boundary "
+            "examples: a distinct 6ft mattress for a 4ft6 use context is hard_negative; a storage bench and a pet "
+            "bed are hard_negative despite a shared collection or finish."
         ),
         "skip": (
             "Check 1, 2, or 6 applies: exact-model/family variant, duplicate, redundancy, unresolved relationship, "
             "or only weak collection/category/brand/colour/generic-material similarity. Variant and redundancy "
-            "checks override every later check."
+            "checks override every later check. Boundary examples: the same named Juliette bed at 4ft6 versus 5ft "
+            "is skip; the same named Tetbury 2-basket bench in White versus Truffle is skip."
         ),
     },
     "complements": {
         "positive": (
             "Checks 1-2 do not apply and check 3 applies: the candidate has a clear direct complementary function "
             "with base as an accessory, setup component, attachment, refill, cover, case, or compatible part. "
-            "Relatedness, meal variety, another unit, or broad shared activity alone is insufficient."
+            "Relatedness, meal variety, another unit, or broad shared activity alone is insufficient. Boundary "
+            "examples: from a Kamado MEDIUM base, a model-matched MEDIUM case or grate is positive; from a product "
+            "that consumes a stated refill, that compatible refill is positive. Do not reverse these relationships."
         ),
         "hard_negative": (
             "Checks 1-3 do not apply and check 4 or 5 applies: the candidate is confidently a same-role substitute "
             "bought instead of base, or supplied text explicitly makes a strongly related candidate incompatible, "
-            "unusable, or wrong-context. Variants and uncertainty are never hard negatives."
+            "unusable, or wrong-context. Variants and uncertainty are never hard negatives. Boundary examples: a "
+            "distinct steak cut or burger offered instead of the base steak fills the same purchase role and is "
+            "hard_negative; a MEDIUM accessory paired with an explicitly LARGE-only appliance or part is "
+            "hard_negative."
         ),
         "skip": (
             "Check 1, 2, or 6 applies: variant or same-brand/same-category line extension, duplicate, redundancy, "
             "unrelated or merely related product, meal variety without a direct complementary function, or an "
-            "unclear relationship. Variant and redundancy checks override every later check."
+            "unclear relationship. Variant and redundancy checks override every later check. Boundary examples: "
+            "the same ribeye or tenderloin with another origin, grade, or pack size is skip; ham versus pulled pork, "
+            "chorizo, or a mixed protein box is skip when the text supports only additional meal variety."
         ),
     },
 }
