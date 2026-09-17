@@ -1,7 +1,9 @@
 """Freeze and compare SBS pairs; network access requires an explicit --execute."""
 
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -9,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import statistics
 import time
 
 import httpx
@@ -41,6 +44,13 @@ ENDPOINTS = {
 MAX_RETRIES = 2
 TIMEOUT_SECONDS = 120.0
 MAX_RETRY_DELAY = 60.0
+PRICING = {
+    "as_of": "2026-09-17", "currency": "USD", "unit": "per million tokens",
+    "gpt": {"input": 0.05, "cached_input": 0.005, "output": 0.40,
+            "source": "https://platform.openai.com/docs/pricing"},
+    "jev": {"input": 0.042, "output": 0.0, "source": "https://docs.typesafe.ai/models"},
+    "note": "Estimates only; provider consoles are authoritative. Missing usage is not zero cost.",
+}
 
 
 def sha256(data: bytes) -> str:
@@ -330,7 +340,12 @@ def strict_json(text: str) -> object:
     def invalid_constant(value):
         raise ValueError("Non-finite JSON value")
 
-    return json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_constant)
+    def finite_float(value):
+        number = float(value)
+        require(math.isfinite(number), "Non-finite JSON value")
+        return number
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_constant, parse_float=finite_float)
 
 
 def parse_answers(provider: str, body: dict, batch: dict) -> list:
@@ -498,14 +513,241 @@ def execute(manifest: dict, jobs: dict, output_dir: Path, manifest_digest: str, 
     return failures
 
 
+def read_request_log(path: Path) -> tuple[list, bool]:
+    lines = path.read_bytes().splitlines(keepends=True)
+    records = []
+    truncated = False
+    for i, line in enumerate(lines):
+        try:
+            record = strict_json(line.decode("utf-8"))
+        except ValueError:
+            if i == len(lines) - 1 and not line.endswith(b"\n"):
+                truncated = True
+                break
+            raise ValueError(f"Invalid request log at line {i + 1}") from None
+        require(isinstance(record, dict), "Invalid log record")
+        records.append(record)
+    require(bool(records) and records[0].get("record_type") == "run_start", "Missing run_start record")
+    return records, truncated
+
+
+def attempt_cost(provider: str, usage: dict) -> float | None:
+    inputs = usage["input_tokens"]
+    if inputs is None:
+        return None
+    rates = PRICING[provider]
+    if provider == "jev":
+        return inputs * rates["input"] / 1_000_000
+    cached, outputs = usage["cached_input_tokens"], usage["output_tokens"]
+    if cached is None or outputs is None:
+        return None
+    require(cached <= inputs, "Cached token count exceeds input count")
+    # Completion tokens already include reasoning tokens; never charge them twice.
+    return ((inputs - cached) * rates["input"] + cached * rates["cached_input"] + outputs * rates["output"]) / 1_000_000
+
+
+def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int) -> dict:
+    attempts = [attempt for record in records for attempt in record["attempts"]]
+    complete = end is not None and len(records) == len(expected)
+    wall = end["wall_seconds"] if complete else None
+    if wall is not None:
+        require(type(wall) in (int, float) and math.isfinite(wall) and wall >= 0, "Invalid group duration")
+    latencies = sorted(attempt["latency_seconds"] for attempt in attempts)
+    require(all(type(value) in (int, float) and math.isfinite(value) and value >= 0
+                for value in latencies), "Invalid request latency")
+    usage = {}
+    for field in ("input_tokens", "output_tokens", "cached_input_tokens", "reasoning_tokens"):
+        reported = [attempt["usage"][field] for attempt in attempts if attempt["usage"][field] is not None]
+        require(all(type(value) is int and value >= 0 for value in reported), "Invalid recorded usage")
+        subtotal = sum(reported) if reported else None
+        usage[field] = {
+            "reported_subtotal": subtotal,
+            "total": subtotal if complete and len(reported) == len(attempts) else None,
+            "reported_attempts": len(reported), "missing_attempts": len(attempts) - len(reported),
+        }
+    costs = [attempt_cost(provider, attempt["usage"]) for attempt in attempts]
+    priced = [cost for cost in costs if cost is not None]
+    subtotal = math.fsum(priced) if priced else None
+    cost_complete = complete and bool(attempts) and len(priced) == len(attempts)
+    successes = [answer for record in records if record["status"] == "ok" for answer in record["answers"]]
+    expected_pairs = sum(len(batch["candidates"]) for batch in expected)
+    recorded_pairs = sum(record["batch_size"] for record in records)
+    return {
+        "complete": complete, "wall_seconds": wall, "concurrency": concurrency,
+        "expected_batches": len(expected), "batch_requests": len(records), "http_attempts": len(attempts),
+        "retries": sum(len(record["attempts"]) - 1 for record in records),
+        "failed_attempts": sum(attempt["error"] is not None for attempt in attempts),
+        "failed_batches": sum(record["status"] == "error" for record in records),
+        "successful_pairs": len(successes), "failed_pairs": recorded_pairs - len(successes),
+        "missing_pairs": expected_pairs - recorded_pairs,
+        "pairs_per_second": len(successes) / wall if wall else None,
+        "served_models": sorted({attempt["served_model"] for attempt in attempts
+                                 if isinstance(attempt["served_model"], str)}),
+        "batch_sizes": dict(sorted(Counter(str(record["batch_size"]) for record in records).items())),
+        "label_counts": {label: sum(answer["label"] == label for answer in successes) for label in LABELS},
+        "request_latency_seconds": {
+            "count": len(latencies), "min": min(latencies) if latencies else None,
+            "max": max(latencies) if latencies else None,
+            "mean": statistics.fmean(latencies) if latencies else None,
+            "p50": statistics.median(latencies) if latencies else None,
+            "p95": latencies[math.ceil(0.95 * len(latencies)) - 1] if latencies else None,
+        },
+        "usage": usage,
+        "cost_estimate": {
+            "total_usd": subtotal if cost_complete else None, "priced_attempts_subtotal_usd": subtotal,
+            "priced_attempts": len(priced), "unpriced_attempts": len(costs) - len(priced),
+            "complete_usage_coverage": cost_complete,
+        },
+    }
+
+
+def write_csv(path: Path, rows: list, columns: list) -> None:
+    def cell(value):
+        # Keep catalog text from becoming executable spreadsheet formulas.
+        if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows({key: cell(value) for key, value in row.items()} for row in rows)
+
+
+def write_reports(manifest_path: Path, output_dir: Path) -> dict:
+    raw_manifest = manifest_path.read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    records, truncated = read_request_log(output_dir / "requests.jsonl")
+    start = records[0]
+    require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
+    require(start["concurrency"] == manifest["concurrency"], "Run/manifest concurrency mismatch")
+    expected = {(provider, shop, batch["batch_id"]): batch for provider in manifest["models"]
+                for shop, data in manifest["shops"].items() for batch in data["batches"]}
+    groups = {(provider, shop) for provider, shop, _ in expected}
+    observed, starts, ends = {}, {}, {}
+    finished = False
+    for record in records[1:]:
+        require(not finished, "Unexpected records after run_end")
+        kind = record["record_type"]
+        if kind == "run_end":
+            finished = True
+            continue
+        group = (record["provider"], record["shop"])
+        require(group in groups, "Unknown provider/shop in request log")
+        if kind in ("group_start", "group_end"):
+            if kind == "group_start":
+                require(record["requested_model"] == manifest["models"][group[0]]["model"], "Group model mismatch")
+                require(record["batches"] == len(manifest["shops"][group[1]]["batches"]), "Group batch-count mismatch")
+            target = starts if kind == "group_start" else ends
+            require(group not in target, "Duplicate group record")
+            target[group] = record
+        else:
+            require(kind == "batch", "Unknown request-log record type")
+            key = (*group, record["batch_id"])
+            require(key in expected and key not in observed, "Unknown or duplicate batch record")
+            batch = expected[key]
+            settings = manifest["models"][group[0]]
+            require(record["requested_model"] == record["request"]["model"] == settings["model"], "Batch model mismatch")
+            if group[0] == "gpt":
+                require(record["request"]["reasoning_effort"] == settings["reasoning_effort"], "Reasoning setting mismatch")
+                require("temperature" not in record["request"] and "max_completion_tokens" not in record["request"],
+                        "Unexpected generation override")
+            require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]], "Batch pair mismatch")
+            require(record["batch_size"] == len(batch["candidates"]), "Batch size mismatch")
+            require(record["status"] in ("ok", "error") and bool(record["attempts"]), "Invalid batch status/attempts")
+            answers = index_records(record["answers"], "pair_id")
+            required_ids = set(record["pair_ids"]) if record["status"] == "ok" else set()
+            require(set(answers) == required_ids, "Invalid batch answer coverage")
+            require(all(answer["label"] in LABELS for answer in answers.values()), "Invalid recorded label")
+            observed[key] = record
+
+    classifications = {provider: {} for provider in manifest["models"]}
+    summary = {
+        "schema_version": "jev-sbs-report-v1", "manifest_sha256": sha256(raw_manifest),
+        "models": manifest["models"], "pricing": PRICING, "run_settings": start, "truncated_final_line": truncated,
+        "limitations": [*manifest["limitations"],
+                        "Interrupted runs can omit in-flight attempts; usage subtotals cover recorded attempts only."],
+        "groups": {}, "agreement": {},
+    }
+    for provider, shop in sorted(groups):
+        data = manifest["shops"][shop]
+        group_records = [observed[provider, shop, batch["batch_id"]] for batch in data["batches"]
+                         if (provider, shop, batch["batch_id"]) in observed]
+        end = ends.get((provider, shop)) if (provider, shop) in starts else None
+        summary["groups"][f"{provider}/{shop}"] = summarize_group(
+            provider, group_records, data["batches"], end, manifest["concurrency"])
+        for batch in data["batches"]:
+            record = observed.get((provider, shop, batch["batch_id"]))
+            answers = {answer["pair_id"]: answer for answer in record["answers"]} if record else {}
+            for item in batch["candidates"]:
+                answer = answers.get(item["pair_id"], {})
+                classifications[provider][item["pair_id"]] = {
+                    "provider": provider, "shop": shop, "direction": batch["direction"],
+                    "pair_id": item["pair_id"], "batch_id": batch["batch_id"],
+                    "anchor_id": batch["anchor_id"], "candidate_id": item["candidate_id"],
+                    "status": record["status"] if record else "missing",
+                    "error": record["error"] if record else "batch_not_recorded",
+                    "served_model": record["served_model"] if record else None,
+                    **{key: answer.get(key) for key in ("label", "reason", "probabilities", "confidence")},
+                }
+
+    paired = []
+    for identity, gpt in classifications["gpt"].items():
+        jev = classifications["jev"][identity]
+        data = manifest["shops"][gpt["shop"]]
+        anchor, candidate = data["products"][gpt["anchor_id"]], data["products"][gpt["candidate_id"]]
+        success = gpt["status"] == jev["status"] == "ok"
+        paired.append({
+            **{key: gpt[key] for key in ("pair_id", "shop", "direction", "anchor_id", "candidate_id")},
+            "anchor_name": anchor["name"], "anchor_text": anchor["text"],
+            "candidate_name": candidate["name"], "candidate_category": candidate["category"],
+            "candidate_description": candidate["description"],
+            "gpt_status": gpt["status"], "gpt_label": gpt["label"], "gpt_reason": gpt["reason"],
+            "jev_status": jev["status"], "jev_label": jev["label"], "jev_confidence": jev["confidence"],
+            "jev_probabilities": json.dumps(jev["probabilities"], sort_keys=True) if jev["probabilities"] else None,
+            "paired_success": success, "agreement": gpt["label"] == jev["label"] if success else None,
+        })
+    for shop in manifest["shops"]:
+        eligible = [row for row in paired if row["shop"] == shop and row["paired_success"]]
+        agrees = sum(row["agreement"] for row in eligible)
+        summary["agreement"][shop] = {
+            "paired_success": len(eligible), "agreements": agrees, "disagreements": len(eligible) - agrees,
+            "unpaired": sum(row["shop"] == shop and not row["paired_success"] for row in paired),
+            "agreement_rate": agrees / len(eligible) if eligible else None,
+            "matrix_gpt_rows_jev_columns": {left: {right: sum(row["gpt_label"] == left and row["jev_label"] == right
+                                                            for row in eligible) for right in LABELS} for left in LABELS},
+        }
+    summary["run_complete"] = finished and not truncated and all(group["complete"] for group in summary["groups"].values())
+    summary["all_pairs_classified"] = all(row["paired_success"] for row in paired)
+    for provider, rows in classifications.items():
+        (output_dir / f"{provider}_classifications.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows.values()), encoding="utf-8")
+    columns = list(paired[0])
+    write_csv(output_dir / "paired_results.csv", paired, columns)
+    write_csv(output_dir / "disagreements.csv", [row for row in paired if row["agreement"] is False], columns)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--manifest", type=Path, default=Path("results/manifest.json"))
     parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--execute", action="store_true", help="Make paid API requests (Boris runs this explicitly)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--execute", action="store_true", help="Make paid API requests (Boris runs this explicitly)")
+    mode.add_argument("--report-only", action="store_true", help="Rebuild reports from the saved manifest and request log, offline")
     parser.add_argument("--output-dir", type=Path, default=Path("results/run"))
     args = parser.parse_args()
+    if args.report_only:
+        try:
+            summary = write_reports(args.manifest, args.output_dir)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as error:
+            parser.exit(1, f"Reporting failed: {error}\n")
+        print(f"Reports rebuilt offline in {args.output_dir}; run_complete={summary['run_complete']}, "
+              f"all_pairs_classified={summary['all_pairs_classified']}")
+        return
     try:
         manifest = build_manifest(args.data_dir, args.concurrency)
         jobs = prepare_requests(manifest)
@@ -528,11 +770,12 @@ def main() -> None:
     try:
         credentials = {"gpt": os.environ.get("OPENAI_API_KEY"), "jev": os.environ.get("TYPESAFE_API_KEY")}
         failures = execute(manifest, jobs, args.output_dir, digest, credentials)
+        write_reports(args.manifest, args.output_dir)
     except (OSError, ValueError) as error:
         parser.exit(1, f"Execution failed: {error}\n")
     if failures:
         parser.exit(1, f"Run finished with {failures} failed batches; inspect requests.jsonl before any rerun.\n")
-    print("All batches completed. Request data saved; comparison reports are added in Step 3.")
+    print(f"All batches completed. Inspect {args.output_dir / 'summary.json'} and disagreements.csv.")
 
 
 if __name__ == "__main__":

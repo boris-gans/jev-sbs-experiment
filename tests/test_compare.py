@@ -1,4 +1,5 @@
 import copy
+import csv
 import hashlib
 import json
 import socket
@@ -372,7 +373,7 @@ def test_jev_rejects_invalid_answers(prepared, failure):
         compare.parse_answers("jev", body, batch)
 
 
-@pytest.mark.parametrize("response_text", ['{"answers":{},"answers":{}}', '{"usage":NaN}'])
+@pytest.mark.parametrize("response_text", ['{"answers":{},"answers":{}}', '{"usage":NaN}', '{"usage":1e999}'])
 def test_strict_json_rejects_duplicate_keys_and_nonfinite(response_text):
     with pytest.raises(ValueError):
         compare.strict_json(response_text)
@@ -581,3 +582,216 @@ def test_execute_persists_partial_failure_and_finishes_groups(prepared, tmp_path
     assert all(record["status"] == "ok" for record in batches[1:])
     assert sum(record["record_type"] == "group_end" for record in records) == 4
     assert records[-1] == {"record_type": "run_end", "failed_batches": 1}
+
+
+@pytest.fixture
+def completed_run(prepared, tmp_path):
+    manifest, jobs = prepared
+    path, directory = tmp_path / "manifest.json", tmp_path / "run"
+    digest = compare.write_manifest(path, manifest)
+
+    def handler(request):
+        provider = "gpt" if request.url.host == "api.openai.com" else "jev"
+        return httpx.Response(200, json=response_for(provider, json.loads(request.content)))
+
+    assert compare.execute(manifest, jobs, directory, digest, {"gpt": "dummy", "jev": "dummy"},
+                           transport=httpx.MockTransport(handler)) == 0
+    return path, directory
+
+
+def test_complete_reports_and_deterministic_regeneration(completed_run):
+    path, directory = completed_run
+    summary = compare.write_reports(path, directory)
+    assert summary["run_complete"] and summary["all_pairs_classified"]
+    for shop in compare.SHOPS:
+        agreement = summary["agreement"][shop]
+        assert agreement["paired_success"] == agreement["agreements"] == 400
+        assert agreement["agreement_rate"] == 1 and agreement["unpaired"] == 0
+        for provider in ("gpt", "jev"):
+            group = summary["groups"][f"{provider}/{shop}"]
+            assert group["http_attempts"] == group["batch_requests"] == 20
+            assert group["retries"] == group["failed_attempts"] == group["failed_pairs"] == 0
+            assert group["successful_pairs"] == group["label_counts"]["positive"] == 400
+            assert group["pairs_per_second"] == pytest.approx(400 / group["wall_seconds"])
+            assert group["batch_sizes"] == {"20": 20}
+            assert group["request_latency_seconds"]["count"] == 20
+            assert group["usage"]["input_tokens"]["total"] == 2000
+            unit_cost = 0.000013 if provider == "gpt" else 0.0000042
+            assert group["cost_estimate"]["total_usd"] == pytest.approx(20 * unit_cost)
+    with (directory / "paired_results.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 800 and len({row["pair_id"] for row in rows}) == 800
+    with (directory / "disagreements.csv").open(newline="") as handle:
+        assert list(csv.DictReader(handle)) == []
+    for provider in ("gpt", "jev"):
+        records = [json.loads(line) for line in (directory / f"{provider}_classifications.jsonl").read_text().splitlines()]
+        assert len(records) == 800 and all(row["status"] == "ok" for row in records)
+    before = {file.name: file.read_bytes() for file in directory.iterdir()}
+    assert compare.write_reports(path, directory) == summary
+    assert {file.name: file.read_bytes() for file in directory.iterdir()} == before
+
+
+def test_disagreement_including_semantic_skip(completed_run):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    records, _ = compare.read_request_log(log_path)
+    batch = next(record for record in records if record["record_type"] == "batch" and record["provider"] == "jev")
+    answer = batch["answers"][0]
+    answer["label"] = "skip"
+    answer["probabilities"] = {"positive": 0.1, "hard_negative": 0.1, "skip": 0.8}
+    write_blocks(log_path, records)
+    summary = compare.write_reports(path, directory)
+    agreement = summary["agreement"][batch["shop"]]
+    assert agreement["paired_success"] == 400 and agreement["agreements"] == 399
+    assert agreement["matrix_gpt_rows_jev_columns"]["positive"]["skip"] == 1
+    with (directory / "disagreements.csv").open(newline="") as handle:
+        disagreements = list(csv.DictReader(handle))
+    assert len(disagreements) == 1 and disagreements[0]["pair_id"] == answer["pair_id"]
+    assert disagreements[0]["jev_label"] == "skip" and disagreements[0]["jev_status"] == "ok"
+
+
+def test_failed_and_missing_pairs_do_not_enter_agreement(completed_run):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    records, _ = compare.read_request_log(log_path)
+    failed = next(record for record in records if record["record_type"] == "batch")
+    failed.update(status="error", error="invalid_response", answers=[])
+    failed["attempts"][0]["error"] = "invalid_response"
+    missing = next(record for record in reversed(records) if record["record_type"] == "batch")
+    records = [record for record in records if record is not missing and record["record_type"] != "run_end"
+               and not (record["record_type"] == "group_end" and record["provider"] == missing["provider"]
+                        and record["shop"] == missing["shop"])]
+    write_blocks(log_path, records)
+    summary = compare.write_reports(path, directory)
+    assert not summary["run_complete"] and not summary["all_pairs_classified"]
+    for shop in compare.SHOPS:
+        assert summary["agreement"][shop]["paired_success"] == 380
+        assert summary["agreement"][shop]["unpaired"] == 20
+        assert summary["agreement"][shop]["disagreements"] == 0
+    missing_group = summary["groups"][f"{missing['provider']}/{missing['shop']}"]
+    assert missing_group["missing_pairs"] == 20
+    assert missing_group["wall_seconds"] is None and missing_group["pairs_per_second"] is None
+    assert missing_group["usage"]["input_tokens"]["total"] is None
+    assert missing_group["cost_estimate"]["total_usd"] is None
+    error_group = summary["groups"][f"{failed['provider']}/{failed['shop']}"]
+    assert error_group["failed_pairs"] == 20 and error_group["failed_batches"] == 1
+    with (directory / "paired_results.csv").open(newline="") as handle:
+        unpaired = [row for row in csv.DictReader(handle) if row["paired_success"] == "False"]
+    assert len(unpaired) == 40 and all(row["agreement"] == "" for row in unpaired)
+    assert all(row["gpt_label"] == "" or row["jev_label"] == "" for row in unpaired)
+
+
+def test_retry_usage_and_unknown_cost_coverage(completed_run):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    records, _ = compare.read_request_log(log_path)
+    batch = next(record for record in records if record["record_type"] == "batch")
+    retry = copy.deepcopy(batch["attempts"][0])
+    retry.update(error="http_429", http_status=429, usage=compare.normalize_usage("gpt", None))
+    batch["attempts"].insert(0, retry)
+    # An explicitly reported zero is still a known count, unlike the failed attempt.
+    batch["attempts"][1]["usage"] = {key: 0 for key in batch["attempts"][1]["usage"]}
+    write_blocks(log_path, records)
+    summary = compare.write_reports(path, directory)
+    group = summary["groups"][f"{batch['provider']}/{batch['shop']}"]
+    assert group["http_attempts"] == 21 and group["retries"] == group["failed_attempts"] == 1
+    assert group["request_latency_seconds"]["count"] == 21
+    assert group["usage"]["input_tokens"] == {
+        "reported_subtotal": 1900, "total": None, "reported_attempts": 20, "missing_attempts": 1,
+    }
+    assert group["cost_estimate"]["priced_attempts"] == 20
+    assert group["cost_estimate"]["unpriced_attempts"] == 1
+    assert group["cost_estimate"]["total_usd"] is None
+    assert group["cost_estimate"]["priced_attempts_subtotal_usd"] == pytest.approx(19 * 0.000013)
+
+
+def test_cached_cost_and_reasoning_not_double_counted():
+    usage = {"input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 20, "reasoning_tokens": 5}
+    assert compare.attempt_cost("gpt", usage) == pytest.approx(0.0000112)
+    assert compare.attempt_cost("gpt", {**usage, "cached_input_tokens": None}) is None
+    assert compare.attempt_cost("jev", {**usage, "output_tokens": None}) == pytest.approx(0.0000042)
+    assert compare.attempt_cost("jev", {**usage, "input_tokens": None}) is None
+    assert compare.attempt_cost("gpt", {key: 0 for key in usage}) == 0
+
+
+@pytest.mark.parametrize("failure", [
+    "manifest_digest", "duplicate_batch", "duplicate_answer", "interior_line",
+    "group_model", "batch_model", "payload_model", "batch_count", "reasoning",
+])
+def test_report_rejects_conflicting_logs(completed_run, failure):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    records, _ = compare.read_request_log(log_path)
+    batch = next(record for record in records if record["record_type"] == "batch")
+    if failure == "manifest_digest":
+        records[0]["manifest_sha256"] = "wrong-digest"
+    elif failure == "duplicate_batch":
+        records.insert(-1, batch)
+    elif failure == "duplicate_answer":
+        batch["answers"].append(batch["answers"][0])
+    elif failure in ("group_model", "batch_count"):
+        group = next(record for record in records if record["record_type"] == "group_start")
+        group["requested_model" if failure == "group_model" else "batches"] = "wrong"
+    elif failure == "batch_model":
+        batch["requested_model"] = "different-model"
+    elif failure == "payload_model":
+        batch["request"]["model"] = "different-model"
+    elif failure == "reasoning":
+        batch["request"]["reasoning_effort"] = "low"
+    write_blocks(log_path, records)
+    if failure == "interior_line":
+        log_path.write_text(log_path.read_text().replace("\n", "\ninvalid json\n", 1))
+    with pytest.raises(ValueError):
+        compare.write_reports(path, directory)
+    assert not (directory / "summary.json").exists()
+
+
+def test_truncated_log_tail_is_flagged(completed_run):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    records, _ = compare.read_request_log(log_path)
+    write_blocks(log_path, records[:-1])
+    with log_path.open("a") as handle:
+        handle.write('{"record_type": "run_')
+    summary = compare.write_reports(path, directory)
+    assert summary["truncated_final_line"] and not summary["run_complete"]
+    assert summary["all_pairs_classified"]
+
+
+def test_report_only_bypasses_preparation_and_execution(completed_run, monkeypatch, capsys):
+    path, directory = completed_run
+
+    def deny(*args, **kwargs):
+        pytest.fail("Report-only must not prepare new work or execute requests")
+
+    monkeypatch.setattr(compare, "build_manifest", deny)
+    monkeypatch.setattr(compare, "execute", deny)
+    monkeypatch.setattr(compare.httpx, "Client", deny)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr("sys.argv", ["compare.py", "--report-only", "--manifest", str(path), "--output-dir", str(directory)])
+    compare.main()
+    assert "Reports rebuilt offline" in capsys.readouterr().out
+
+
+def test_csv_catalog_text_is_not_a_formula(tmp_path):
+    path = tmp_path / "safe.csv"
+    compare.write_csv(path, [{"name": "  =1+1", "label": "skip", "confidence": 0.9}], ["name", "label", "confidence"])
+    with path.open(newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row == {"name": "'  =1+1", "label": "skip", "confidence": "0.9"}
+
+
+def test_no_completed_batches_reports_unknown_not_zero(completed_run):
+    path, directory = completed_run
+    log_path = directory / "requests.jsonl"
+    records, _ = compare.read_request_log(log_path)
+    write_blocks(log_path, records[:1])
+    summary = compare.write_reports(path, directory)
+    for group in summary["groups"].values():
+        assert group["http_attempts"] == 0 and group["missing_pairs"] == 400
+        assert group["request_latency_seconds"]["mean"] is None
+        assert group["usage"]["input_tokens"]["reported_subtotal"] is None
+        assert group["cost_estimate"]["priced_attempts_subtotal_usd"] is None
+    assert all(value["agreement_rate"] is None for value in summary["agreement"].values())
+    assert not summary["all_pairs_classified"] and not summary["run_complete"]
