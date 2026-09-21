@@ -48,6 +48,14 @@ RELATION_HEADS = ("co_purchase", "alternative", "incompatible")
 BASKET_LABELS = ("positive", "hard_negative", "skip", "conflict")
 RELATION_CONTRACT_VERSION = "universal-relations-v1"
 RESOLVER_VERSION = "basket-projection-v1"
+MANIFEST_V1 = "jev-sbs-manifest-v1"
+MANIFEST_V2 = "jev-sbs-manifest-v2"
+GPT_INPUT_V1 = "gpt-input-v1"
+GPT_INPUT_V2 = "gpt-input-v2"
+GPT_BASELINE_V1 = "gpt-baseline-v1"
+GPT_BASELINE_V2 = "gpt-baseline-v2"
+JEV_EXPERIMENT_V1 = "jev-experiment-v1"
+JEV_EXPERIMENT_V2 = "jev-experiment-v2"
 ENDPOINTS = {
     "gpt": "https://api.openai.com/v1/chat/completions",
     "jev": "https://api.typesafe.ai/v1/systemone",
@@ -231,6 +239,12 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def manifest_schema(manifest: dict) -> str:
+    schema = manifest.get("schema_version")
+    require(schema in {MANIFEST_V1, MANIFEST_V2}, "Unsupported manifest schema")
+    return schema
+
+
 def index_records(records: list, key: str) -> dict:
     result = {}
     for record in records:
@@ -394,7 +408,7 @@ def select_batches(shop: str, version: str, direction: str, anchors: dict, count
 def build_manifest(data_dir: Path, concurrency: int = 8) -> dict:
     require(concurrency > 0, "Concurrency must be positive")
     manifest = {
-        "schema_version": "jev-sbs-manifest-v1",
+        "schema_version": MANIFEST_V1,
         "selection": {
             "algorithm": "sha256-anchor-blocks-v1",
             "rows_per_direction": ROWS_PER_DIRECTION,
@@ -432,6 +446,29 @@ def build_manifest(data_dir: Path, concurrency: int = 8) -> dict:
             "diagnostics": loaded["diagnostics"],
         }
     return manifest
+
+
+def build_relation_manifest(data_dir: Path, concurrency: int = 8) -> dict:
+    manifest = build_manifest(data_dir, concurrency)
+    manifest["schema_version"] = MANIFEST_V2
+    manifest["contract"] = relation_contract_snapshot()
+    return manifest
+
+
+def relation_contract_snapshot() -> dict:
+    return {
+        "type": "universal-relations",
+        "version": RELATION_CONTRACT_VERSION,
+        "identity_labels": list(IDENTITY_LABELS),
+        "relation_heads": list(RELATION_HEADS),
+        "relation_labels": list(RELATION_LABELS),
+        "basket_labels": list(BASKET_LABELS),
+        "resolver_version": RESOLVER_VERSION,
+        "gpt_system_prompt": GPT_RELATION_SYSTEM_PROMPT,
+        "identity_criteria": copy.deepcopy(IDENTITY_CRITERIA),
+        "relation_criteria": copy.deepcopy(RELATION_CRITERIA),
+        "relation_instructions": copy.deepcopy(RELATION_INSTRUCTIONS),
+    }
 
 
 def write_manifest(path: Path, manifest: dict) -> str:
@@ -526,7 +563,16 @@ def relation_result_schema(labels: tuple[str, ...]) -> dict:
     }
 
 
-def render_relation_request(provider: str, settings: dict, data: dict, batch: dict) -> dict:
+def render_relation_request(provider: str, settings: dict, data: dict, batch: dict,
+                            contract: dict | None = None) -> dict:
+    contract = relation_contract_snapshot() if contract is None else contract
+    require(contract.get("type") == "universal-relations" and isinstance(contract.get("version"), str),
+            "Invalid relation contract")
+    identity_labels = tuple(contract["identity_labels"])
+    relation_heads = tuple(contract["relation_heads"])
+    relation_labels = tuple(contract["relation_labels"])
+    require(identity_labels == IDENTITY_LABELS and relation_heads == RELATION_HEADS
+            and relation_labels == RELATION_LABELS, "Unsupported relation labels")
     base, candidates = relation_products(data, batch)
     if provider == "gpt":
         schema = {
@@ -542,13 +588,13 @@ def render_relation_request(provider: str, settings: dict, data: dict, batch: di
                         "required": ["id", "identity", "relations"],
                         "properties": {
                             "id": {"type": "string"},
-                            "identity": relation_result_schema(IDENTITY_LABELS),
+                            "identity": relation_result_schema(identity_labels),
                             "relations": {
                                 "type": "object",
                                 "additionalProperties": False,
-                                "required": list(RELATION_HEADS),
+                                "required": list(relation_heads),
                                 "properties": {
-                                    head: relation_result_schema(RELATION_LABELS) for head in RELATION_HEADS
+                                    head: relation_result_schema(relation_labels) for head in relation_heads
                                 },
                             },
                         },
@@ -568,7 +614,7 @@ def render_relation_request(provider: str, settings: dict, data: dict, batch: di
             "model": settings["model"],
             "reasoning_effort": settings["reasoning_effort"],
             "messages": [
-                {"role": "system", "content": GPT_RELATION_SYSTEM_PROMPT},
+                {"role": "system", "content": contract["gpt_system_prompt"]},
                 {"role": "user", "content": user_prompt},
             ],
             "response_format": {
@@ -586,13 +632,13 @@ def render_relation_request(provider: str, settings: dict, data: dict, batch: di
                 f"Classify the IDENTITY of candidates[{index}] relative to base in this direction. Identity is "
                 "separate from whether the products complement, replace, or conflict with each other."
             ),
-            "criteria": IDENTITY_CRITERIA,
+            "criteria": contract["identity_criteria"],
         }
-        for head in RELATION_HEADS:
+        for head in relation_heads:
             questions[f"candidate_{index}_{head}"] = {
                 "type": "choice",
-                "instructions": RELATION_INSTRUCTIONS[head].format(index=index),
-                "criteria": RELATION_CRITERIA[head],
+                "instructions": contract["relation_instructions"][head].format(index=index),
+                "criteria": contract["relation_criteria"][head],
             }
     return {
         "model": settings["model"],
@@ -605,9 +651,19 @@ def render_relation_request(provider: str, settings: dict, data: dict, batch: di
     }
 
 
+def render_provider_request(schema: str, provider: str, settings: dict, data: dict, batch: dict,
+                            contract: dict | None = None) -> dict:
+    if schema == MANIFEST_V1:
+        return render_request(provider, settings, data, batch)
+    require(schema == MANIFEST_V2, "Unsupported manifest schema")
+    return render_relation_request(provider, settings, data, batch, contract)
+
+
 def prepare_requests(manifest: dict) -> dict:
+    schema = manifest_schema(manifest)
     return {provider: {
-        shop: [(batch, render_request(provider, settings, data, batch)) for batch in data["batches"]]
+        shop: [(batch, render_provider_request(schema, provider, settings, data, batch, manifest.get("contract")))
+               for batch in data["batches"]]
         for shop, data in manifest["shops"].items()
     } for provider, settings in manifest["models"].items()}
 
@@ -762,6 +818,13 @@ def parse_relation_answers(provider: str, body: dict, batch: dict) -> list:
     ]
 
 
+def parse_provider_answers(schema: str, provider: str, body: dict, batch: dict) -> list:
+    if schema == MANIFEST_V1:
+        return parse_answers(provider, body, batch)
+    require(schema == MANIFEST_V2, "Unsupported manifest schema")
+    return parse_relation_answers(provider, body, batch)
+
+
 def resolve_basket_judgment(answer: dict) -> dict:
     identity = answer["identity"]["label"]
     require(identity in IDENTITY_LABELS, "Invalid identity label")
@@ -846,7 +909,8 @@ def retry_delay(header: str | None, attempt: int) -> float | None:
 
 
 def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, payload: dict, key: str,
-              *, initial_answers: list | None = None, on_attempt=None) -> dict:
+              *, initial_answers: list | None = None, on_attempt=None, schema_version: str = MANIFEST_V1) -> dict:
+    require(schema_version in {MANIFEST_V1, MANIFEST_V2}, "Unsupported manifest schema")
     started = time.perf_counter()
     record = {
         "record_type": "batch", "provider": provider, "shop": shop,
@@ -890,7 +954,7 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
                 attempt["raw_usage"] = body.get("usage")
                 attempt["usage"] = normalize_usage(provider, attempt["raw_usage"])
                 if status == 200:
-                    attempt["answers"] = parse_answers(provider, body, batch)
+                    attempt["answers"] = parse_provider_answers(schema_version, provider, body, batch)
                     _, attempt["error"] = extraction_status(attempt["answers"], record["batch_size"])
                     for answer in attempt["answers"]:
                         collected.setdefault(answer["pair_id"], answer)
@@ -949,8 +1013,10 @@ def execute(manifest: dict, jobs: dict, output_dir: Path, manifest_digest: str, 
                 started = time.perf_counter()
                 with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, transport=transport) as client:
                     with ThreadPoolExecutor(max_workers=manifest["concurrency"]) as pool:
-                        futures = [pool.submit(run_batch, client, provider, shop, batch, payload, credentials[provider])
-                                   for batch, payload in work]
+                        futures = [pool.submit(
+                            run_batch, client, provider, shop, batch, payload, credentials[provider],
+                            schema_version=manifest_schema(manifest),
+                        ) for batch, payload in work]
                         for future in as_completed(futures):
                             record = future.result()
                             emit(record)
@@ -994,13 +1060,13 @@ def attempt_cost(provider: str, usage: dict, pricing: dict | None = None) -> flo
     return ((inputs - cached) * rates["input"] + cached * rates["cached_input"] + outputs * rates["output"]) / 1_000_000
 
 
-def reextract_record(record: dict, batch: dict) -> dict:
+def reextract_record(record: dict, batch: dict, schema_version: str = MANIFEST_V1) -> dict:
     if (record["status"] != "error" or record["answers"] or record["error"] != "invalid_response" or record["raw_response"] is None
             or record["attempts"][-1]["http_status"] != 200):
         return record
     try:
         normalize_usage(record["provider"], record["raw_response"].get("usage"))
-        answers = parse_answers(record["provider"], record["raw_response"], batch)
+        answers = parse_provider_answers(schema_version, record["provider"], record["raw_response"], batch)
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         return record
     result = copy.deepcopy(record)
@@ -1013,15 +1079,25 @@ def reextract_record(record: dict, batch: dict) -> dict:
 
 
 def baseline_spec(manifest: dict) -> dict:
+    schema = manifest_schema(manifest)
     requests = []
     for shop, data in sorted(manifest["shops"].items()):
         for batch in sorted(data["batches"], key=lambda item: item["batch_id"]):
             identity = {key: batch[key] for key in ("batch_id", "direction", "anchor_id")}
             identity["candidates"] = [{key: item[key] for key in ("pair_id", "candidate_id")}
                                       for item in batch["candidates"]]
-            requests.append({"shop": shop, "batch": identity,
-                             "request": render_request("gpt", manifest["models"]["gpt"], data, batch)})
-    return {"schema_version": "gpt-input-v1", "requests": requests}
+            requests.append({
+                "shop": shop,
+                "batch": identity,
+                "request": render_provider_request(
+                    schema, "gpt", manifest["models"]["gpt"], data, batch, manifest.get("contract")
+                ),
+            })
+    spec = {"schema_version": GPT_INPUT_V1 if schema == MANIFEST_V1 else GPT_INPUT_V2, "requests": requests}
+    if schema == MANIFEST_V2:
+        spec["manifest_schema_version"] = MANIFEST_V2
+        spec["relation_contract_version"] = manifest["contract"]["version"]
+    return spec
 
 
 def immutable_bytes(path: Path, content: bytes) -> None:
@@ -1053,7 +1129,19 @@ def check_baseline_record(record: dict, expected: dict) -> dict:
     return job
 
 
+def baseline_manifest_schema(spec: dict) -> str:
+    if spec.get("schema_version") == GPT_INPUT_V1:
+        require("manifest_schema_version" not in spec, "Invalid v1 GPT input spec")
+        return MANIFEST_V1
+    require(spec.get("schema_version") == GPT_INPUT_V2, "Unsupported GPT input schema")
+    require(spec.get("manifest_schema_version") == MANIFEST_V2, "GPT input manifest schema mismatch")
+    require(isinstance(spec.get("relation_contract_version"), str) and bool(spec["relation_contract_version"]),
+            "Missing GPT input relation contract")
+    return MANIFEST_V2
+
+
 def baseline_state(directory: Path, spec: dict, pricing: dict | None = None) -> dict:
+    schema = baseline_manifest_schema(spec)
     fingerprint = sha256(canonical_json(spec))
     pricing = copy.deepcopy({key: PRICING[key] for key in ("as_of", "currency", "unit", "gpt")}) if pricing is None else pricing
     expected = {(job["shop"], job["batch"]["batch_id"]): job for job in spec["requests"]}
@@ -1092,7 +1180,7 @@ def baseline_state(directory: Path, spec: dict, pricing: dict | None = None) -> 
                     continue
                 try:
                     normalize_usage("gpt", body.get("usage"))
-                    parsed = parse_answers("gpt", body, job["batch"])
+                    parsed = parse_provider_answers(schema, "gpt", body, job["batch"])
                 except (ValueError, KeyError, TypeError, AttributeError, IndexError):
                     continue
                 for answer in parsed:
@@ -1120,9 +1208,19 @@ def baseline_state(directory: Path, spec: dict, pricing: dict | None = None) -> 
             "cost_estimate_usd": subtotal if finished[kind] and len(priced) == len(calls) else None,
         }
     missing = [identity for identity in all_ids if identity not in answers]
-    return {"schema_version": "gpt-baseline-v1", "fingerprint": fingerprint, "complete": not missing,
-            "classifications": [answers[identity] for identity in all_ids if identity in answers],
-            "missing_pair_ids": missing, "sources": sources, "accounting": accounting, "pricing": pricing}
+    state = {
+        "schema_version": GPT_BASELINE_V1 if schema == MANIFEST_V1 else GPT_BASELINE_V2,
+        "fingerprint": fingerprint,
+        "complete": not missing,
+        "classifications": [answers[identity] for identity in all_ids if identity in answers],
+        "missing_pair_ids": missing,
+        "sources": sources,
+        "accounting": accounting,
+        "pricing": pricing,
+    }
+    if schema == MANIFEST_V2:
+        state["input_spec"] = copy.deepcopy(spec)
+    return state
 
 
 def load_completed_baseline(manifest: dict, root: Path) -> dict:
@@ -1202,6 +1300,7 @@ def prepare_gpt_baseline(manifest: dict, root: Path, *, import_run: Path | None 
                                 run_batch, client, "gpt", shop, job["batch"], job["request"], key,
                                 initial_answers=[seed[item["pair_id"]] for item in job["batch"]["candidates"]
                                                  if item["pair_id"] in seed], on_attempt=checkpoint,
+                                schema_version=baseline_manifest_schema(spec),
                             ) for job in work]
                             for future in as_completed(futures):
                                 future.result()
@@ -1220,8 +1319,11 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
     baseline = load_completed_baseline(manifest, baseline_root)
     key = os.environ.get("TYPESAFE_API_KEY")
     require(bool(key), "Missing credential: TYPESAFE_API_KEY; no requests started")
-    jobs = {"jev": {shop: [(batch, render_request("jev", manifest["models"]["jev"], data, batch))
-                          for batch in data["batches"]] for shop, data in manifest["shops"].items()}}
+    schema = manifest_schema(manifest)
+    jobs = {"jev": {shop: [(batch, render_provider_request(
+        schema, "jev", manifest["models"]["jev"], data, batch, manifest.get("contract")
+    ))
+                           for batch in data["batches"]] for shop, data in manifest["shops"].items()}}
     identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:12]
     directory = output_dir if output_dir is not None else experiments_root / identifier
     directory.mkdir(parents=True, exist_ok=False)
@@ -1229,13 +1331,29 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
     baseline_bytes = canonical_json(baseline)
     immutable_bytes(directory / "baseline.json", baseline_bytes)
     experiment = {
-        "schema_version": "jev-experiment-v1", "id": directory.name,
+        "schema_version": JEV_EXPERIMENT_V1 if schema == MANIFEST_V1 else JEV_EXPERIMENT_V2,
+        "id": directory.name,
         "manifest_sha256": manifest_digest, "baseline_fingerprint": baseline["fingerprint"],
-        "baseline_sha256": sha256(baseline_bytes), "jev_prompt_version": JEV_PROMPT_VERSION,
-        "jev_criteria": JEV_CRITERIA, "jev_instructions": JEV_INSTRUCTIONS, "pricing": PRICING,
+        "baseline_sha256": sha256(baseline_bytes), "pricing": PRICING,
         "jev_request_hashes": {batch["batch_id"]: sha256(canonical_json(payload))
-                               for work in jobs["jev"].values() for batch, payload in work},
+                                for work in jobs["jev"].values() for batch, payload in work},
     }
+    if schema == MANIFEST_V1:
+        experiment.update(
+            jev_prompt_version=JEV_PROMPT_VERSION,
+            jev_criteria=JEV_CRITERIA,
+            jev_instructions=JEV_INSTRUCTIONS,
+        )
+    else:
+        contract = manifest["contract"]
+        experiment.update(
+            manifest_schema_version=MANIFEST_V2,
+            relation_contract_version=contract["version"],
+            resolver_version=contract["resolver_version"],
+            jev_identity_criteria=contract["identity_criteria"],
+            jev_relation_criteria=contract["relation_criteria"],
+            jev_relation_instructions=contract["relation_instructions"],
+        )
     experiment_bytes = canonical_json(experiment)
     immutable_bytes(directory / "experiment.json", experiment_bytes)
     print(f"Jev experiment: {directory}; reusing {len(baseline['classifications'])} GPT labels. "
@@ -1243,7 +1361,10 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
     failures = execute(manifest, jobs, directory, manifest_digest, {"jev": key}, transport=transport,
                        run_metadata={"experiment_sha256": sha256(experiment_bytes),
                                      "baseline_fingerprint": baseline["fingerprint"]})
-    write_reports(directory / "manifest.json", directory)
+    if schema == MANIFEST_V1:
+        write_reports(directory / "manifest.json", directory)
+    else:
+        validate_v2_experiment_log(directory)
     return directory, failures
 
 
@@ -1253,14 +1374,39 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
     require(start.get("experiment_sha256") == sha256(raw_experiment), "Experiment snapshot digest mismatch")
     experiment = strict_json(raw_experiment.decode("utf-8"))
     baseline = strict_json(raw_baseline.decode("utf-8"))
-    require(experiment["schema_version"] == "jev-experiment-v1", "Unsupported experiment schema")
+    schema = manifest_schema(manifest)
+    expected_experiment_schema = JEV_EXPERIMENT_V1 if schema == MANIFEST_V1 else JEV_EXPERIMENT_V2
+    expected_baseline_schema = GPT_BASELINE_V1 if schema == MANIFEST_V1 else GPT_BASELINE_V2
+    require(experiment["schema_version"] == expected_experiment_schema, "Experiment schema mismatch")
     require(experiment["manifest_sha256"] == sha256(raw_manifest), "Experiment manifest mismatch")
     require((directory / "manifest.json").read_bytes() == raw_manifest, "Experiment must use its saved manifest")
     require(experiment["baseline_sha256"] == sha256(raw_baseline), "Baseline snapshot digest mismatch")
-    fingerprint = sha256(canonical_json(baseline_spec(manifest)))
-    require(baseline["schema_version"] == "gpt-baseline-v1" and baseline["complete"], "Incomplete GPT snapshot")
+    if schema == MANIFEST_V1:
+        fingerprint = sha256(canonical_json(baseline_spec(manifest)))
+    else:
+        saved_spec = baseline.get("input_spec")
+        require(isinstance(saved_spec, dict) and baseline_manifest_schema(saved_spec) == MANIFEST_V2,
+                "Missing GPT input snapshot")
+        require(saved_spec["relation_contract_version"] == manifest["contract"]["version"],
+                "GPT input relation contract mismatch")
+        fingerprint = sha256(canonical_json(saved_spec))
+    require(baseline["schema_version"] == expected_baseline_schema and baseline["complete"],
+            "Incomplete GPT snapshot")
     require(start["baseline_fingerprint"] == experiment["baseline_fingerprint"] == baseline["fingerprint"] == fingerprint,
             "Experiment baseline fingerprint mismatch")
+    if schema == MANIFEST_V2:
+        contract = manifest["contract"]
+        require(experiment.get("manifest_schema_version") == MANIFEST_V2, "Experiment manifest schema mismatch")
+        require(experiment.get("relation_contract_version") == contract["version"],
+                "Experiment relation contract mismatch")
+        require(experiment.get("resolver_version") == contract["resolver_version"],
+                "Experiment resolver mismatch")
+        require(experiment.get("jev_identity_criteria") == contract["identity_criteria"],
+                "Experiment identity criteria mismatch")
+        require(experiment.get("jev_relation_criteria") == contract["relation_criteria"],
+                "Experiment relation criteria mismatch")
+        require(experiment.get("jev_relation_instructions") == contract["relation_instructions"],
+                "Experiment relation instructions mismatch")
     expected = {item["pair_id"]: (shop, batch, item) for shop, data in manifest["shops"].items()
                 for batch in data["batches"] for item in batch["candidates"]}
     answers = index_records(baseline["classifications"], "pair_id")
@@ -1270,9 +1416,43 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
         require(answer["shop"] == shop and answer["candidate_id"] == item["candidate_id"]
                 and answer["anchor_id"] == batch["anchor_id"] and answer["direction"] == batch["direction"],
                 "Baseline snapshot pair mismatch")
-        require(answer["status"] == "ok" and answer["label"] in LABELS, "Invalid cached classification")
+        require(answer["status"] == "ok", "Invalid cached classification")
+        if schema == MANIFEST_V1:
+            require(answer["label"] in LABELS, "Invalid cached classification")
+        else:
+            require(answer["identity"]["label"] in IDENTITY_LABELS, "Invalid cached identity")
+            require(set(answer["relations"]) == set(RELATION_HEADS), "Invalid cached relation heads")
+            require(all(answer["relations"][head]["label"] in RELATION_LABELS for head in RELATION_HEADS),
+                    "Invalid cached relation label")
     require(set(experiment["jev_request_hashes"]) == {batch["batch_id"] for data in manifest["shops"].values()
-                                                    for batch in data["batches"]}, "Experiment request coverage mismatch")
+                                                     for batch in data["batches"]}, "Experiment request coverage mismatch")
+    return experiment, baseline
+
+
+def validate_v2_experiment_log(directory: Path) -> tuple[dict, dict]:
+    raw_manifest = (directory / "manifest.json").read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V2, "Expected v2 experiment manifest")
+    records, truncated = read_request_log(directory / "requests.jsonl")
+    require(not truncated and records[-1].get("record_type") == "run_end", "Incomplete experiment log")
+    experiment, baseline = experiment_snapshot(directory, raw_manifest, manifest, records[0])
+    expected = {batch["batch_id"]: batch for data in manifest["shops"].values() for batch in data["batches"]}
+    observed = set()
+    for record in records[1:]:
+        if record["record_type"] in {"run_end", "group_start", "group_end"}:
+            if "provider" in record:
+                require(record["provider"] == "jev", "Unexpected provider in Jev experiment")
+            continue
+        require(record["record_type"] == "batch" and record["provider"] == "jev", "Invalid experiment record")
+        require(record["batch_id"] in expected and record["batch_id"] not in observed,
+                "Unknown or duplicate experiment batch")
+        observed.add(record["batch_id"])
+        batch = expected[record["batch_id"]]
+        require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]],
+                "Experiment pair mismatch")
+        require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][record["batch_id"]],
+                "Jev request differs from experiment snapshot")
+    require(observed == set(expected), "Experiment batch coverage mismatch")
     return experiment, baseline
 
 
@@ -1352,6 +1532,7 @@ def write_csv(path: Path, rows: list, columns: list) -> None:
 def write_reports(manifest_path: Path, output_dir: Path) -> dict:
     raw_manifest = manifest_path.read_bytes()
     manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V1, "V2 reporting is not available yet")
     records, truncated = read_request_log(output_dir / "requests.jsonl")
     start = records[0]
     require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
@@ -1405,7 +1586,7 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
                 required_ids = set(record["pair_ids"]) if record["status"] == "ok" else set()
                 require(set(answers) == required_ids, "Invalid batch answer coverage")
             require(all(answer["label"] in LABELS for answer in answers.values()), "Invalid recorded label")
-            observed[key] = reextract_record(record, batch)
+            observed[key] = reextract_record(record, batch, MANIFEST_V1)
 
     classifications = {provider: {} for provider in manifest["models"]}
     summary = {
@@ -1504,7 +1685,8 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--manifest", type=Path, help="Frozen workload path; defaults to results/manifest.json or the experiment snapshot")
+    parser.add_argument("--manifest", type=Path,
+                        help="Frozen workload path; defaults to results/relation-manifest.json outside report-only mode")
     parser.add_argument("--concurrency", type=int, default=8)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true", help="Make paid API requests (Boris runs this explicitly)")
@@ -1530,8 +1712,8 @@ def main() -> None:
               f"all_pairs_classified={summary['all_pairs_classified']}")
         return
     try:
-        manifest = build_manifest(args.data_dir, args.concurrency)
-        manifest_path = args.manifest or Path("results/manifest.json")
+        manifest = build_relation_manifest(args.data_dir, args.concurrency)
+        manifest_path = args.manifest or Path("results/relation-manifest.json")
         digest = write_manifest(manifest_path, manifest)
         if args.prepare_baseline:
             directory, baseline = prepare_gpt_baseline(
@@ -1555,7 +1737,11 @@ def main() -> None:
             sizes = [len(batch["candidates"]) for batch in batches]
             print(f"{shop} {direction}: {sum(sizes)} rows, {len(batches)} Jev requests, batch sizes {sizes}")
         print(f"  Source checks: {json.dumps(data['diagnostics'], sort_keys=True)}")
-    print(f"Jev prompt: {JEV_PROMPT_VERSION}. GPT labels must come from a completed saved baseline.")
+    if manifest_schema(manifest) == MANIFEST_V1:
+        print(f"Jev prompt: {JEV_PROMPT_VERSION}. GPT labels must come from a completed saved baseline.")
+    else:
+        print(f"Relation contract: {manifest['contract']['version']}. "
+              "GPT judgments must come from a completed saved baseline.")
     if not args.execute:
         print("No API requests made. Use --execute only when ready for the paid run.")
         return
@@ -1565,7 +1751,10 @@ def main() -> None:
         parser.exit(1, f"Execution failed: {error}\n")
     if failures:
         parser.exit(1, f"Run finished with {failures} incomplete batches; inspect requests.jsonl before any rerun.\n")
-    print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
+    if manifest_schema(manifest) == MANIFEST_V1:
+        print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
+    else:
+        print(f"All batches completed and snapshots validated in {directory}.")
 
 
 if __name__ == "__main__":

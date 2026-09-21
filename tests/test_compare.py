@@ -284,6 +284,12 @@ def prepared(catalogs):
     return manifest, compare.prepare_requests(manifest)
 
 
+@pytest.fixture
+def relation_prepared(catalogs):
+    manifest = compare.build_relation_manifest(catalogs)
+    return manifest, compare.prepare_requests(manifest)
+
+
 def response_for(provider, payload):
     if provider == "gpt":
         # The fixture's user message has a standalone JSON candidate array.
@@ -397,6 +403,23 @@ def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
     assert "temperature" not in gpt and "max_completion_tokens" not in gpt
 
 
+def test_v2_manifest_preserves_v1_frozen_workload(catalogs, relation_prepared):
+    legacy = compare.build_manifest(catalogs)
+    manifest, jobs = relation_prepared
+    comparable = copy.deepcopy(manifest)
+    assert comparable.pop("contract")["resolver_version"] == compare.RESOLVER_VERSION
+    comparable["schema_version"] = compare.MANIFEST_V1
+    assert comparable == legacy
+    assert manifest["schema_version"] == compare.MANIFEST_V2
+    assert manifest["contract"] == compare.relation_contract_snapshot()
+    assert manifest["limitations"] == legacy["limitations"]
+    for shop, data in manifest["shops"].items():
+        assert len({item["pair_id"] for batch in data["batches"] for item in batch["candidates"]}) == 400
+        for provider in ("gpt", "jev"):
+            assert jobs[provider][shop][0][0] == data["batches"][0]
+        assert len(jobs["jev"][shop][0][1]["questions"]) == len(data["batches"][0]["candidates"]) * 4
+
+
 @pytest.mark.parametrize("provider", ["gpt", "jev"])
 def test_combined_relation_answers_are_normalized_in_pair_order(prepared, provider):
     manifest, _ = prepared
@@ -432,6 +455,33 @@ def test_combined_relation_answers_reject_missing_heads(prepared, provider):
         del body["answers"]["candidate_0_alternative"]
     with pytest.raises(ValueError):
         compare.parse_relation_answers(provider, body, batch)
+
+
+def test_v2_run_batch_retains_partial_gpt_judgments(relation_prepared, monkeypatch):
+    manifest, jobs = relation_prepared
+    batch, payload = jobs["gpt"]["furniture.co.uk"][0]
+    body = relation_response_for("gpt", payload, batch)
+    parsed = json.loads(body["choices"][0]["message"]["content"])
+    parsed["judgments"] = parsed["judgments"][:-2]
+    body["choices"][0]["message"]["content"] = json.dumps(parsed)
+    calls = []
+    monkeypatch.setattr(compare.time, "sleep", lambda delay: None)
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = compare.run_batch(
+            client, "gpt", "furniture.co.uk", batch, payload, "dummy",
+            schema_version=compare.MANIFEST_V2,
+        )
+    assert result["status"] == "partial" and result["error"] == "missing_candidate_answers"
+    assert len(result["answers"]) == len(batch["candidates"]) - 2
+    assert result["retries"] == compare.MAX_RETRIES
+    assert calls == [payload] * (compare.MAX_RETRIES + 1)
+    assert all("identity" in answer and set(answer["relations"]) == set(compare.RELATION_HEADS)
+               for answer in result["answers"])
 
 
 @pytest.mark.parametrize(("identity", "relations", "basket", "status", "resolution"), [
@@ -1124,6 +1174,71 @@ def test_baseline_offline_import_and_incomplete_loader(baseline_seed, tmp_path, 
         compare.load_completed_baseline(manifest, root)
 
 
+def test_v2_baseline_starts_fresh_and_rejects_v1_import(relation_prepared, completed_run, tmp_path, monkeypatch):
+    manifest, _ = relation_prepared
+    legacy_manifest_path, legacy_run = completed_run
+    legacy_manifest = json.loads(legacy_manifest_path.read_text())
+    root = tmp_path / "relation-baselines"
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Offline preparation made HTTP call"))
+
+    directory, state = compare.prepare_gpt_baseline(manifest, root)
+    spec = compare.baseline_spec(manifest)
+    assert spec["schema_version"] == compare.GPT_INPUT_V2
+    assert spec["manifest_schema_version"] == compare.MANIFEST_V2
+    assert state["schema_version"] == compare.GPT_BASELINE_V2
+    assert not state["complete"] and state["classifications"] == []
+    assert len(state["missing_pair_ids"]) == 800
+    assert json.loads((directory / "spec.json").read_text()) == spec
+    assert compare.baseline_spec(legacy_manifest)["schema_version"] == compare.GPT_INPUT_V1
+    assert compare.baseline_spec(legacy_manifest) != spec
+    with pytest.raises(ValueError, match="request mismatch"):
+        compare.prepare_gpt_baseline(manifest, root, import_run=legacy_run)
+    assert not (directory / "imported.jsonl").exists()
+
+
+def test_v2_gpt_fingerprint_tracks_only_gpt_relation_inputs(relation_prepared):
+    manifest, _ = relation_prepared
+    original = compare.baseline_spec(manifest)
+    changed = copy.deepcopy(manifest)
+    changed["contract"]["gpt_system_prompt"] += " Changed."
+    assert compare.baseline_spec(changed) != original
+    changed = copy.deepcopy(manifest)
+    changed["contract"]["relation_criteria"]["co_purchase"]["yes"] += " Jev-only change."
+    assert compare.baseline_spec(changed) == original
+    changed = copy.deepcopy(manifest)
+    changed["shops"]["furniture.co.uk"]["batches"][0]["candidates"].reverse()
+    assert compare.baseline_spec(changed) != original
+
+
+@pytest.fixture
+def relation_baseline_ready(relation_prepared, tmp_path, monkeypatch):
+    manifest, jobs = relation_prepared
+    root = tmp_path / "relation-baselines"
+    lookup = {
+        compare.canonical_json(payload): (batch, payload)
+        for batch, payload in [job for work in jobs["gpt"].values() for job in work]
+    }
+    calls = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        batch, expected_payload = lookup[compare.canonical_json(payload)]
+        return httpx.Response(200, json=relation_response_for("gpt", expected_payload, batch))
+
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy-relation-baseline-key")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    directory, state = compare.prepare_gpt_baseline(
+        manifest, root, paid=True, transport=httpx.MockTransport(handler)
+    )
+    assert state["complete"] and state["schema_version"] == compare.GPT_BASELINE_V2
+    assert len(calls) == 40 and len(state["classifications"]) == 800
+    assert all(row["identity"]["label"] == "distinct" for row in state["classifications"])
+    assert all(row["relations"]["co_purchase"]["label"] == "yes" for row in state["classifications"])
+    assert compare.load_completed_baseline(manifest, root) == state
+    return manifest, root, directory, state
+
+
 def test_baseline_completes_only_missing_batches_and_reuses_without_keys(baseline_seed, tmp_path, monkeypatch):
     manifest, source, missing = baseline_seed
     root = tmp_path / "baselines"
@@ -1301,7 +1416,7 @@ def test_baseline_lock_prevents_concurrent_paid_preparation(prepared, tmp_path, 
 
 def test_baseline_cli_import_needs_no_credentials(baseline_seed, tmp_path, monkeypatch, capsys):
     manifest, source, _ = baseline_seed
-    monkeypatch.setattr(compare, "build_manifest", lambda *args: manifest)
+    monkeypatch.setattr(compare, "build_relation_manifest", lambda *args: manifest)
     monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Offline CLI import made HTTP call"))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
@@ -1376,6 +1491,50 @@ def test_baseline_recovers_checkpoint_before_interrupted_tail(baseline_seed, tmp
     assert interrupted.read_bytes() == snapshot
     assert complete["accounting"]["repair"]["cost_estimate_usd"] is None
     assert compare.load_completed_baseline(manifest, root) == complete
+
+
+def test_v2_jev_experiment_uses_immutable_relation_snapshots(relation_baseline_ready, tmp_path, monkeypatch):
+    manifest, root, baseline_directory, baseline = relation_baseline_ready
+    baseline_files = {str(path.relative_to(baseline_directory)): path.read_bytes()
+                      for path in baseline_directory.rglob("*") if path.is_file()}
+    calls = []
+
+    def handler(request):
+        assert request.url.host == "api.typesafe.ai"
+        payload = json.loads(request.content)
+        calls.append(payload)
+        return httpx.Response(200, json=relation_response_for("jev", payload, None))
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "dummy-relation-jev-key")
+    directory, failures = compare.run_jev_experiment(
+        manifest, root, experiments_root=tmp_path / "relation-experiments",
+        transport=httpx.MockTransport(handler),
+    )
+    assert failures == 0 and len(calls) == 40
+    assert not (directory / "summary.json").exists()
+    experiment = json.loads((directory / "experiment.json").read_text())
+    assert experiment["schema_version"] == compare.JEV_EXPERIMENT_V2
+    assert experiment["manifest_schema_version"] == compare.MANIFEST_V2
+    assert experiment["relation_contract_version"] == manifest["contract"]["version"]
+    assert experiment["resolver_version"] == compare.RESOLVER_VERSION
+    assert experiment["jev_identity_criteria"] == manifest["contract"]["identity_criteria"]
+    assert json.loads((directory / "baseline.json").read_text()) == baseline
+    validated_experiment, validated_baseline = compare.validate_v2_experiment_log(directory)
+    assert validated_experiment == experiment and validated_baseline == baseline
+    assert {str(path.relative_to(baseline_directory)): path.read_bytes()
+            for path in baseline_directory.rglob("*") if path.is_file()} == baseline_files
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "GPT_RELATION_SYSTEM_PROMPT", "future GPT prompt")
+        patch.setattr(compare, "RELATION_CRITERIA", {"future": "Jev criteria"})
+        assert compare.validate_v2_experiment_log(directory) == (experiment, baseline)
+
+    records, _ = compare.read_request_log(directory / "requests.jsonl")
+    batch = next(record for record in records if record["record_type"] == "batch")
+    batch["request"]["questions"]["candidate_0_identity"]["criteria"]["distinct"] = "tampered"
+    write_blocks(directory / "requests.jsonl", records)
+    with pytest.raises(ValueError, match="differs from experiment snapshot"):
+        compare.validate_v2_experiment_log(directory)
 
 
 @pytest.fixture
@@ -1567,7 +1726,7 @@ def test_default_execute_cli_calls_only_jev(experiment_ready, tmp_path, monkeypa
         return execute(*args, **kwargs)
 
     monkeypatch.setattr(compare, "execute", mocked_execute)
-    monkeypatch.setattr(compare, "build_manifest", lambda *a: manifest)
+    monkeypatch.setattr(compare, "build_relation_manifest", lambda *a: manifest)
     output = tmp_path / "cli-experiment"
     monkeypatch.setattr("sys.argv", ["compare.py", "--execute", "--baseline-root", str(root),
                                     "--manifest", str(tmp_path / "frozen.json"), "--output-dir", str(output)])
