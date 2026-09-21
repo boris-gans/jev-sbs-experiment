@@ -1493,7 +1493,8 @@ def test_baseline_recovers_checkpoint_before_interrupted_tail(baseline_seed, tmp
     assert compare.load_completed_baseline(manifest, root) == complete
 
 
-def test_v2_jev_experiment_uses_immutable_relation_snapshots(relation_baseline_ready, tmp_path, monkeypatch):
+def test_v2_jev_experiment_uses_immutable_relation_snapshots(
+        relation_baseline_ready, tmp_path, monkeypatch, capsys):
     manifest, root, baseline_directory, baseline = relation_baseline_ready
     baseline_files = {str(path.relative_to(baseline_directory)): path.read_bytes()
                       for path in baseline_directory.rglob("*") if path.is_file()}
@@ -1512,7 +1513,27 @@ def test_v2_jev_experiment_uses_immutable_relation_snapshots(relation_baseline_r
         transport=httpx.MockTransport(handler),
     )
     assert failures == 0 and len(calls) == 40
-    assert not (directory / "summary.json").exists()
+    summary = json.loads((directory / "summary.json").read_text())
+    assert summary["schema_version"] == "jev-sbs-relation-report-v1"
+    assert summary["run_complete"] and summary["all_pairs_classified"]
+    assert summary["new_inference"]["gpt_http_attempts"] == 0
+    assert summary["new_inference"]["jev_http_attempts"] == 40
+    assert summary["gpt_baseline"]["classifications"] == 800
+    for shop in compare.SHOPS:
+        agreement = summary["agreement"][shop]
+        assert agreement["paired_success"] == 400 and agreement["pairs_with_any_disagreement"] == 0
+        assert all(head["agreements"] == 400 and head["agreement_rate"] == 1
+                   for head in agreement["heads"].values())
+        for provider in ("gpt", "jev"):
+            distribution = summary["classifications"][provider][shop]
+            assert distribution["identity_counts"]["distinct"] == 400
+            assert distribution["relation_counts"]["co_purchase"]["yes"] == 400
+            assert distribution["basket_label_counts"]["positive"] == 400
+    paired = list(csv.DictReader((directory / "paired_results.csv").open()))
+    assert len(paired) == 800
+    assert {"gpt_identity", "jev_identity", "gpt_co_purchase", "jev_co_purchase",
+            "gpt_basket_label", "jev_basket_label", "any_disagreement"} <= set(paired[0])
+    assert (directory / "disagreements.csv").read_text().count("\n") == 1
     experiment = json.loads((directory / "experiment.json").read_text())
     assert experiment["schema_version"] == compare.JEV_EXPERIMENT_V2
     assert experiment["manifest_schema_version"] == compare.MANIFEST_V2
@@ -1524,17 +1545,48 @@ def test_v2_jev_experiment_uses_immutable_relation_snapshots(relation_baseline_r
     assert validated_experiment == experiment and validated_baseline == baseline
     assert {str(path.relative_to(baseline_directory)): path.read_bytes()
             for path in baseline_directory.rglob("*") if path.is_file()} == baseline_files
+    report_files = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+    assert compare.write_reports(directory / "manifest.json", directory) == summary
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == report_files
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "build_relation_manifest", lambda *a, **k: pytest.fail("Report-only prepared data"))
+        patch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Report-only used network"))
+        patch.setattr("sys.argv", ["compare.py", "--report-only", "--output-dir", str(directory)])
+        compare.main()
+    assert "Reports rebuilt offline" in capsys.readouterr().out
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == report_files
     with monkeypatch.context() as patch:
         patch.setattr(compare, "GPT_RELATION_SYSTEM_PROMPT", "future GPT prompt")
         patch.setattr(compare, "RELATION_CRITERIA", {"future": "Jev criteria"})
         assert compare.validate_v2_experiment_log(directory) == (experiment, baseline)
+        assert compare.write_reports(directory / "manifest.json", directory) == summary
 
-    records, _ = compare.read_request_log(directory / "requests.jsonl")
+    log_path = directory / "requests.jsonl"
+    original_log = log_path.read_bytes()
+    records, _ = compare.read_request_log(log_path)
+    failed = next(record for record in records if record["record_type"] == "batch")
+    failed.update(status="error", error="http_422", answers=[], raw_response=None)
+    failed["attempts"][-1].update(error="http_422", answers=[], raw_response=None, http_status=422)
+    write_blocks(log_path, records)
+    partial = compare.write_reports(directory / "manifest.json", directory)
+    shop = failed["shop"]
+    assert not partial["all_pairs_classified"] and partial["agreement"][shop]["unpaired"] == failed["batch_size"]
+    failed_rows = [json.loads(line) for line in (directory / "jev_classifications.jsonl").read_text().splitlines()
+                   if json.loads(line)["status"] != "ok"]
+    assert len(failed_rows) == failed["batch_size"]
+    assert all(row["error"] == "http_422" and row["identity"] is None and row["resolution"] is None
+               for row in failed_rows)
+    log_path.write_bytes(original_log)
+    assert compare.write_reports(directory / "manifest.json", directory) == summary
+
+    records, _ = compare.read_request_log(log_path)
     batch = next(record for record in records if record["record_type"] == "batch")
     batch["request"]["questions"]["candidate_0_identity"]["criteria"]["distinct"] = "tampered"
-    write_blocks(directory / "requests.jsonl", records)
+    write_blocks(log_path, records)
     with pytest.raises(ValueError, match="differs from experiment snapshot"):
         compare.validate_v2_experiment_log(directory)
+    with pytest.raises(ValueError, match="differs from experiment snapshot"):
+        compare.write_reports(directory / "manifest.json", directory)
 
 
 @pytest.fixture

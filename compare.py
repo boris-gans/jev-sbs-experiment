@@ -65,6 +65,7 @@ TIMEOUT_SECONDS = 120.0
 MAX_RETRY_DELAY = 60.0
 PROBABILITY_SUM_TOLERANCE = 0.015  # Three probabilities rounded to two decimal places.
 EXTRACTION_VERSION = "partial-answers-v2"
+RELATION_EXTRACTION_VERSION = "relation-heads-v1"
 JEV_PROMPT_VERSION = "objective-boundaries-v3"
 JEV_INSTRUCTIONS = {
     "style_compatibility": (
@@ -1364,7 +1365,7 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
     if schema == MANIFEST_V1:
         write_reports(directory / "manifest.json", directory)
     else:
-        validate_v2_experiment_log(directory)
+        write_reports(directory / "manifest.json", directory)
     return directory, failures
 
 
@@ -1456,8 +1457,35 @@ def validate_v2_experiment_log(directory: Path) -> tuple[dict, dict]:
     return experiment, baseline
 
 
+def relation_distribution(answers: list) -> dict:
+    resolutions = [resolve_basket_judgment(answer) for answer in answers]
+    return {
+        "identity_counts": {
+            label: sum(answer["identity"]["label"] == label for answer in answers) for label in IDENTITY_LABELS
+        },
+        "relation_counts": {
+            head: {
+                label: sum(answer["relations"][head]["label"] == label for answer in answers)
+                for label in RELATION_LABELS
+            }
+            for head in RELATION_HEADS
+        },
+        "basket_label_counts": {
+            label: sum(resolution["basket_label"] == label for resolution in resolutions) for label in BASKET_LABELS
+        },
+        "resolution_status_counts": dict(sorted(Counter(
+            resolution["resolution_status"] for resolution in resolutions
+        ).items())),
+    }
+
+
+def relation_probability_warnings(answer: dict) -> int:
+    judgments = [answer["identity"], *(answer["relations"][head] for head in RELATION_HEADS)]
+    return sum(judgment.get("probability_rounding_warning", False) for judgment in judgments)
+
+
 def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int,
-                    pricing: dict | None = None) -> dict:
+                    pricing: dict | None = None, schema_version: str = MANIFEST_V1) -> dict:
     attempts = [attempt for record in records for attempt in record["attempts"]]
     complete = end is not None and len(records) == len(expected)
     wall = end["wall_seconds"] if complete else None
@@ -1483,7 +1511,7 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
     successes = [answer for record in records if record["status"] in ("ok", "partial") for answer in record["answers"]]
     expected_pairs = sum(len(batch["candidates"]) for batch in expected)
     recorded_pairs = sum(record["batch_size"] for record in records)
-    return {
+    result = {
         "complete": complete, "wall_seconds": wall, "concurrency": concurrency,
         "expected_batches": len(expected), "batch_requests": len(records), "http_attempts": len(attempts),
         "retries": sum(len(record["attempts"]) - 1 for record in records),
@@ -1492,14 +1520,17 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
         "failed_batches": sum(record["status"] == "error" for record in records),
         "partial_batches": sum(record["status"] == "partial" for record in records),
         "reextracted_batches": sum("recorded_status" in record for record in records),
-        "probability_rounding_warnings": sum(answer.get("probability_rounding_warning", False) for answer in successes),
+        "probability_rounding_warnings": sum(
+            answer.get("probability_rounding_warning", False) if schema_version == MANIFEST_V1
+            else relation_probability_warnings(answer)
+            for answer in successes
+        ),
         "successful_pairs": len(successes), "failed_pairs": recorded_pairs - len(successes),
         "missing_pairs": expected_pairs - recorded_pairs,
         "pairs_per_second": len(successes) / wall if wall else None,
         "served_models": sorted({attempt["served_model"] for attempt in attempts
                                  if isinstance(attempt["served_model"], str)}),
         "batch_sizes": dict(sorted(Counter(str(record["batch_size"]) for record in records).items())),
-        "label_counts": {label: sum(answer["label"] == label for answer in successes) for label in LABELS},
         "request_latency_seconds": {
             "count": len(latencies), "min": min(latencies) if latencies else None,
             "max": max(latencies) if latencies else None,
@@ -1514,6 +1545,12 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
             "complete_usage_coverage": cost_complete,
         },
     }
+    if schema_version == MANIFEST_V1:
+        result["label_counts"] = {label: sum(answer["label"] == label for answer in successes) for label in LABELS}
+    else:
+        require(schema_version == MANIFEST_V2, "Unsupported manifest schema")
+        result.update(relation_distribution(successes))
+    return result
 
 
 def write_csv(path: Path, rows: list, columns: list) -> None:
@@ -1529,10 +1566,10 @@ def write_csv(path: Path, rows: list, columns: list) -> None:
         writer.writerows({key: cell(value) for key, value in row.items()} for row in rows)
 
 
-def write_reports(manifest_path: Path, output_dir: Path) -> dict:
+def write_legacy_reports(manifest_path: Path, output_dir: Path) -> dict:
     raw_manifest = manifest_path.read_bytes()
     manifest = strict_json(raw_manifest.decode("utf-8"))
-    require(manifest_schema(manifest) == MANIFEST_V1, "V2 reporting is not available yet")
+    require(manifest_schema(manifest) == MANIFEST_V1, "Expected v1 report manifest")
     records, truncated = read_request_log(output_dir / "requests.jsonl")
     start = records[0]
     require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
@@ -1682,6 +1719,288 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
     return summary
 
 
+def validate_normalized_relation_answer(answer: dict, expected_pair_ids: set[str]) -> None:
+    require(answer["pair_id"] in expected_pair_ids, "Unknown relation answer")
+    require(answer["identity"]["label"] in IDENTITY_LABELS, "Invalid relation identity")
+    require(set(answer["relations"]) == set(RELATION_HEADS), "Invalid relation answer heads")
+    require(all(answer["relations"][head]["label"] in RELATION_LABELS for head in RELATION_HEADS),
+            "Invalid relation answer label")
+
+
+def relation_agreement(rows: list, left_key: str, right_key: str, labels: tuple[str, ...]) -> dict:
+    agreements = sum(row[left_key] == row[right_key] for row in rows)
+    return {
+        "paired_success": len(rows),
+        "agreements": agreements,
+        "disagreements": len(rows) - agreements,
+        "agreement_rate": agreements / len(rows) if rows else None,
+        "matrix_gpt_rows_jev_columns": {
+            left: {right: sum(row[left_key] == left and row[right_key] == right for row in rows) for right in labels}
+            for left in labels
+        },
+    }
+
+
+def flatten_relation_judgment(row: dict, provider: str, name: str, judgment: dict | None) -> None:
+    row[f"{provider}_{name}"] = judgment["label"] if judgment else None
+    row[f"{provider}_{name}_reason"] = judgment.get("reason") if judgment else None
+    row[f"{provider}_{name}_confidence"] = judgment.get("confidence") if judgment else None
+    probabilities = judgment.get("probabilities") if judgment else None
+    row[f"{provider}_{name}_probabilities"] = (
+        json.dumps(probabilities, sort_keys=True) if probabilities is not None else None
+    )
+
+
+def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
+    raw_manifest = manifest_path.read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V2, "Expected v2 report manifest")
+    log_path = output_dir / "requests.jsonl"
+    records, truncated = read_request_log(log_path)
+    start = records[0]
+    require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
+    require(start["concurrency"] == manifest["concurrency"], "Run/manifest concurrency mismatch")
+    experiment, baseline = experiment_snapshot(output_dir, raw_manifest, manifest, start)
+    groups = {("jev", shop) for shop in manifest["shops"]}
+    expected = {
+        ("jev", shop, batch["batch_id"]): batch
+        for shop, data in manifest["shops"].items()
+        for batch in data["batches"]
+    }
+    observed, starts, ends = {}, {}, {}
+    finished = False
+    for record in records[1:]:
+        require(not finished, "Unexpected records after run_end")
+        kind = record["record_type"]
+        if kind == "run_end":
+            finished = True
+            continue
+        group = (record["provider"], record["shop"])
+        require(group in groups, "Unknown provider/shop in relation log")
+        if kind in ("group_start", "group_end"):
+            if kind == "group_start":
+                require(record["requested_model"] == manifest["models"]["jev"]["model"], "Group model mismatch")
+                require(record["batches"] == len(manifest["shops"][group[1]]["batches"]),
+                        "Group batch-count mismatch")
+            target = starts if kind == "group_start" else ends
+            require(group not in target, "Duplicate group record")
+            target[group] = record
+            continue
+        require(kind == "batch", "Unknown request-log record type")
+        key = (*group, record["batch_id"])
+        require(key in expected and key not in observed, "Unknown or duplicate batch record")
+        batch = expected[key]
+        require(record["requested_model"] == record["request"]["model"] == manifest["models"]["jev"]["model"],
+                "Batch model mismatch")
+        require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][record["batch_id"]],
+                "Jev request differs from experiment snapshot")
+        require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]], "Batch pair mismatch")
+        require(record["batch_size"] == len(batch["candidates"]), "Batch size mismatch")
+        require(record["status"] in ("ok", "partial", "error") and bool(record["attempts"]),
+                "Invalid batch status/attempts")
+        answers = index_records(record["answers"], "pair_id")
+        if record["status"] == "partial":
+            require(bool(answers) and set(answers) < set(record["pair_ids"]), "Invalid partial answer coverage")
+        else:
+            required_ids = set(record["pair_ids"]) if record["status"] == "ok" else set()
+            require(set(answers) == required_ids, "Invalid batch answer coverage")
+        for answer in answers.values():
+            validate_normalized_relation_answer(answer, set(record["pair_ids"]))
+        recovered = reextract_record(record, batch, MANIFEST_V2)
+        for answer in recovered["answers"]:
+            validate_normalized_relation_answer(answer, set(record["pair_ids"]))
+        observed[key] = recovered
+
+    classifications = {"gpt": {}, "jev": {}}
+    for answer in baseline["classifications"]:
+        resolution = resolve_basket_judgment(answer)
+        classifications["gpt"][answer["pair_id"]] = {
+            **answer,
+            "cached": True,
+            "error": None,
+            "baseline_fingerprint": baseline["fingerprint"],
+            "resolution": resolution,
+        }
+    summary = {
+        "schema_version": "jev-sbs-relation-report-v1",
+        "manifest_sha256": sha256(raw_manifest),
+        "extraction": {
+            "version": RELATION_EXTRACTION_VERSION,
+            "probability_sum_tolerance": PROBABILITY_SUM_TOLERANCE,
+            "request_log_sha256": sha256(log_path.read_bytes()),
+        },
+        "models": manifest["models"],
+        "pricing": experiment["pricing"],
+        "run_settings": start,
+        "truncated_final_line": truncated,
+        "limitations": [
+            *manifest["limitations"],
+            "Identity and all relation heads were requested together; this does not measure two-pass cost savings.",
+            "Interrupted runs can omit in-flight attempts; usage subtotals cover recorded attempts only.",
+        ],
+        "experiment": experiment,
+        "gpt_baseline": {
+            "fingerprint": baseline["fingerprint"],
+            "cached": True,
+            "classifications": len(classifications["gpt"]),
+            "accounting": baseline["accounting"],
+            "pricing": baseline["pricing"],
+            "distributions": {
+                shop: relation_distribution([answer for answer in baseline["classifications"] if answer["shop"] == shop])
+                for shop in manifest["shops"]
+            },
+            "note": "Historical measurements, not inference performed during this Jev experiment.",
+        },
+        "groups": {},
+        "agreement": {},
+        "classifications": {"gpt": {}, "jev": {}},
+        "resolution_review": {"gpt": {}, "jev": {}},
+    }
+    for _, shop in sorted(groups):
+        data = manifest["shops"][shop]
+        group_records = [observed["jev", shop, batch["batch_id"]] for batch in data["batches"]
+                         if ("jev", shop, batch["batch_id"]) in observed]
+        end = ends.get(("jev", shop)) if ("jev", shop) in starts else None
+        summary["groups"][f"jev/{shop}"] = summarize_group(
+            "jev", group_records, data["batches"], end, manifest["concurrency"], experiment["pricing"], MANIFEST_V2
+        )
+        for batch in data["batches"]:
+            record = observed.get(("jev", shop, batch["batch_id"]))
+            answers = {answer["pair_id"]: answer for answer in record["answers"]} if record else {}
+            for item in batch["candidates"]:
+                answer = answers.get(item["pair_id"])
+                classifications["jev"][item["pair_id"]] = {
+                    "provider": "jev",
+                    "shop": shop,
+                    "direction": batch["direction"],
+                    "pair_id": item["pair_id"],
+                    "batch_id": batch["batch_id"],
+                    "anchor_id": batch["anchor_id"],
+                    "candidate_id": item["candidate_id"],
+                    "status": "ok" if answer else ("error" if record else "missing"),
+                    "error": None if answer else (
+                        "missing_candidate_answer" if record and record["status"] == "partial"
+                        else record["error"] if record else "batch_not_recorded"
+                    ),
+                    "recorded_batch_status": record.get("recorded_status", record["status"]) if record else None,
+                    "served_model": record["served_model"] if record else None,
+                    "identity": answer["identity"] if answer else None,
+                    "relations": answer["relations"] if answer else None,
+                    "resolution": resolve_basket_judgment(answer) if answer else None,
+                }
+
+    paired = []
+    item_index = {
+        item["pair_id"]: item
+        for data in manifest["shops"].values()
+        for batch in data["batches"]
+        for item in batch["candidates"]
+    }
+    for identity, gpt in classifications["gpt"].items():
+        jev = classifications["jev"][identity]
+        data = manifest["shops"][gpt["shop"]]
+        anchor, candidate = data["products"][gpt["anchor_id"]], data["products"][gpt["candidate_id"]]
+        item = item_index[identity]
+        success = gpt["status"] == jev["status"] == "ok"
+        row = {
+            **{key: gpt[key] for key in ("pair_id", "shop", "direction", "anchor_id", "candidate_id")},
+            "retrieved_forward_rank": item["retrieved_forward_rank"],
+            "retrieval_source": item["retrieval_source"],
+            "anchor_name": anchor["name"],
+            "anchor_category": anchor["category"],
+            "anchor_description": anchor["description"],
+            "anchor_text": anchor["text"],
+            "candidate_name": candidate["name"],
+            "candidate_category": candidate["category"],
+            "candidate_description": candidate["description"],
+            "gpt_status": gpt["status"],
+            "gpt_error": gpt["error"],
+            "jev_status": jev["status"],
+            "jev_error": jev["error"],
+            "paired_success": success,
+        }
+        flatten_relation_judgment(row, "gpt", "identity", gpt["identity"])
+        flatten_relation_judgment(row, "jev", "identity", jev["identity"])
+        for head in RELATION_HEADS:
+            flatten_relation_judgment(row, "gpt", head, gpt["relations"][head])
+            flatten_relation_judgment(row, "jev", head, jev["relations"][head] if jev["relations"] else None)
+        for provider, classification in (("gpt", gpt), ("jev", jev)):
+            resolution = classification["resolution"]
+            for field in ("identity_action", "basket_label", "resolution_status", "resolution", "conflict"):
+                row[f"{provider}_{field}"] = resolution[field] if resolution else None
+        for name in ("identity", *RELATION_HEADS):
+            row[f"{name}_agreement"] = (
+                row[f"gpt_{name}"] == row[f"jev_{name}"] if success else None
+            )
+        row["basket_agreement"] = (
+            row["gpt_basket_label"] == row["jev_basket_label"] if success else None
+        )
+        row["any_disagreement"] = (
+            any(row[f"{name}_agreement"] is False for name in ("identity", *RELATION_HEADS, "basket"))
+            if success else None
+        )
+        paired.append(row)
+
+    for provider in ("gpt", "jev"):
+        for shop in manifest["shops"]:
+            successful = [row for row in classifications[provider].values()
+                          if row["shop"] == shop and row["status"] == "ok"]
+            summary["classifications"][provider][shop] = relation_distribution(successful)
+            resolutions = [row["resolution"] for row in successful]
+            summary["resolution_review"][provider][shop] = {
+                "conflicts": sum(resolution["conflict"] for resolution in resolutions),
+                "identity_filtered": sum(resolution["identity_action"] == "filter" for resolution in resolutions),
+                "identity_uncertain": sum(resolution["identity_action"] == "continue_uncertain"
+                                          for resolution in resolutions),
+            }
+    for shop in manifest["shops"]:
+        eligible = [row for row in paired if row["shop"] == shop and row["paired_success"]]
+        heads = {
+            "identity": relation_agreement(eligible, "gpt_identity", "jev_identity", IDENTITY_LABELS),
+            **{
+                head: relation_agreement(eligible, f"gpt_{head}", f"jev_{head}", RELATION_LABELS)
+                for head in RELATION_HEADS
+            },
+            "basket": relation_agreement(eligible, "gpt_basket_label", "jev_basket_label", BASKET_LABELS),
+        }
+        summary["agreement"][shop] = {
+            "paired_success": len(eligible),
+            "unpaired": sum(row["shop"] == shop and not row["paired_success"] for row in paired),
+            "pairs_with_any_disagreement": sum(row["any_disagreement"] for row in eligible),
+            "heads": heads,
+        }
+    summary["run_complete"] = finished and not truncated and all(
+        group["complete"] for group in summary["groups"].values()
+    )
+    summary["all_pairs_classified"] = all(row["paired_success"] for row in paired)
+    costs = [group["cost_estimate"]["total_usd"] for group in summary["groups"].values()]
+    summary["new_inference"] = {
+        "gpt_http_attempts": 0,
+        "gpt_cost_usd": 0.0,
+        "jev_http_attempts": sum(group["http_attempts"] for group in summary["groups"].values()),
+        "jev_cost_estimate_usd": math.fsum(costs) if all(cost is not None for cost in costs) else None,
+    }
+    for provider, rows in classifications.items():
+        (output_dir / f"{provider}_classifications.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows.values()),
+            encoding="utf-8",
+        )
+    columns = list(paired[0])
+    write_csv(output_dir / "paired_results.csv", paired, columns)
+    write_csv(output_dir / "disagreements.csv", [row for row in paired if row["any_disagreement"] is True], columns)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    return summary
+
+
+def write_reports(manifest_path: Path, output_dir: Path) -> dict:
+    manifest = strict_json(manifest_path.read_text(encoding="utf-8"))
+    if manifest_schema(manifest) == MANIFEST_V1:
+        return write_legacy_reports(manifest_path, output_dir)
+    return write_relation_reports(manifest_path, output_dir)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -1754,7 +2073,7 @@ def main() -> None:
     if manifest_schema(manifest) == MANIFEST_V1:
         print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
     else:
-        print(f"All batches completed and snapshots validated in {directory}.")
+        print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
 
 
 if __name__ == "__main__":
