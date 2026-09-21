@@ -337,6 +337,134 @@ def test_provider_payload_parity(prepared):
     assert manifest == original
 
 
+def relation_response_for(provider, payload, batch):
+    if provider == "gpt":
+        judgments = [{
+            "id": item["candidate_id"],
+            "identity": {"label": "distinct", "reason": "different products"},
+            "relations": {
+                "co_purchase": {"label": "yes", "reason": "used together"},
+                "alternative": {"label": "no", "reason": "different roles"},
+                "incompatible": {"label": "no", "reason": "compatible context"},
+            },
+        } for item in reversed(batch["candidates"])]
+        return {
+            "model": payload["model"],
+            "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"judgments": judgments})}}],
+        }
+    answers = {}
+    for key in payload["questions"]:
+        if key.endswith("_identity"):
+            labels, choice = compare.IDENTITY_LABELS, "distinct"
+            probabilities = {label: (0.8 if label == choice else 0.05) for label in labels}
+        else:
+            labels = compare.RELATION_LABELS
+            choice = "yes" if key.endswith("_co_purchase") else "no"
+            probabilities = {label: (0.8 if label == choice else 0.1) for label in labels}
+        answers[key] = {
+            "type": "choice", "choice": choice, "confidence": 0.7, "probabilities": probabilities,
+        }
+    return {"model": payload["model"], "answers": answers}
+
+
+def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    gpt = compare.render_relation_request("gpt", manifest["models"]["gpt"], data, batch)
+    jev = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch)
+
+    anchor = data["products"][batch["anchor_id"]]
+    candidates = [{key: data["products"][item["candidate_id"]][key]
+                   for key in ("id", "name", "category", "description")}
+                  for item in batch["candidates"]]
+    assert jev["state"]["base"] == {"id": anchor["id"], "text": anchor["text"]}
+    assert jev["state"]["candidates"] == candidates
+    assert jev["state"]["contract_version"] == compare.RELATION_CONTRACT_VERSION
+    assert len(jev["questions"]) == len(candidates) * 4
+    for index in range(len(candidates)):
+        assert set(jev["questions"][f"candidate_{index}_identity"]["criteria"]) == set(compare.IDENTITY_LABELS)
+        for head in compare.RELATION_HEADS:
+            question = jev["questions"][f"candidate_{index}_{head}"]
+            assert set(question["criteria"]) == set(compare.RELATION_LABELS)
+            assert f"candidates[{index}]" in question["instructions"]
+    schema = gpt["response_format"]["json_schema"]["schema"]
+    judgment = schema["properties"]["judgments"]["items"]
+    assert judgment["properties"]["identity"]["properties"]["label"]["enum"] == list(compare.IDENTITY_LABELS)
+    assert set(judgment["properties"]["relations"]["properties"]) == set(compare.RELATION_HEADS)
+    assert all(head in gpt["messages"][0]["content"] for head in compare.RELATION_HEADS)
+    assert all(candidate["id"] in gpt["messages"][1]["content"] for candidate in candidates)
+    assert "temperature" not in gpt and "max_completion_tokens" not in gpt
+
+
+@pytest.mark.parametrize("provider", ["gpt", "jev"])
+def test_combined_relation_answers_are_normalized_in_pair_order(prepared, provider):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request(provider, manifest["models"][provider], data, batch)
+    answers = compare.parse_relation_answers(provider, relation_response_for(provider, payload, batch), batch)
+
+    assert [answer["pair_id"] for answer in answers] == [item["pair_id"] for item in batch["candidates"]]
+    assert all(answer["identity"]["label"] == "distinct" for answer in answers)
+    assert all(answer["relations"]["co_purchase"]["label"] == "yes" for answer in answers)
+    assert all(answer["relations"]["alternative"]["label"] == "no" for answer in answers)
+    if provider == "gpt":
+        assert all(answer["identity"]["reason"] == "different products" for answer in answers)
+        assert all(answer["relations"]["co_purchase"]["probabilities"] is None for answer in answers)
+    else:
+        assert all(answer["identity"]["reason"] is None for answer in answers)
+        assert all(answer["identity"]["probability_sum"] == pytest.approx(1) for answer in answers)
+
+
+@pytest.mark.parametrize("provider", ["gpt", "jev"])
+def test_combined_relation_answers_reject_missing_heads(prepared, provider):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request(provider, manifest["models"][provider], data, batch)
+    body = relation_response_for(provider, payload, batch)
+    if provider == "gpt":
+        parsed = json.loads(body["choices"][0]["message"]["content"])
+        del parsed["judgments"][0]["relations"]["alternative"]
+        body["choices"][0]["message"]["content"] = json.dumps(parsed)
+    else:
+        del body["answers"]["candidate_0_alternative"]
+    with pytest.raises(ValueError):
+        compare.parse_relation_answers(provider, body, batch)
+
+
+@pytest.mark.parametrize(("identity", "relations", "basket", "status", "resolution"), [
+    ("duplicate", ("yes", "yes", "yes"), "skip", "filtered", "identity_filtered_duplicate"),
+    ("variant", ("no", "yes", "no"), "skip", "filtered", "identity_filtered_variant"),
+    ("redundant", ("yes", "no", "no"), "skip", "filtered", "identity_filtered_redundant"),
+    ("distinct", ("yes", "no", "no"), "positive", "resolved", "co_purchase_positive"),
+    ("distinct", ("no", "yes", "no"), "hard_negative", "resolved", "alternative_only"),
+    ("distinct", ("no", "no", "yes"), "hard_negative", "resolved", "incompatible_only"),
+    ("distinct", ("no", "no", "no"), "skip", "resolved", "unrelated_skip"),
+    ("uncertain", ("uncertain", "no", "no"), "skip", "uncertain", "uncertain_skip"),
+    ("distinct", ("yes", "yes", "no"), "conflict", "conflict", "conflicting_positive_relations"),
+    ("distinct", ("yes", "no", "yes"), "conflict", "conflict", "conflicting_positive_relations"),
+    ("distinct", ("no", "yes", "yes"), "conflict", "conflict", "conflicting_positive_relations"),
+])
+def test_basket_resolver(identity, relations, basket, status, resolution):
+    answer = {
+        "identity": {"label": identity},
+        "relations": {
+            head: {"label": label} for head, label in zip(compare.RELATION_HEADS, relations, strict=True)
+        },
+    }
+    result = compare.resolve_basket_judgment(answer)
+    assert result["basket_label"] == basket
+    assert result["resolution_status"] == status
+    assert result["resolution"] == resolution
+    assert result["resolver_version"] == compare.RESOLVER_VERSION
+    assert result["identity_action"] == (
+        "filter" if identity in {"duplicate", "variant", "redundant"}
+        else "continue_uncertain" if identity == "uncertain" else "continue"
+    )
+
+
 def test_jev_payload_preserves_recommendation_direction(prepared):
     manifest, _ = prepared
     data = manifest["shops"]["themeatboys.nl"]

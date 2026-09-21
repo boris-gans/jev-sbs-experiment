@@ -42,6 +42,12 @@ GPT_SETTINGS = {
     "max_completion_tokens": None,
 }
 LABELS = ("hard_negative", "positive", "skip")
+IDENTITY_LABELS = ("duplicate", "variant", "redundant", "distinct", "uncertain")
+RELATION_LABELS = ("yes", "no", "uncertain")
+RELATION_HEADS = ("co_purchase", "alternative", "incompatible")
+BASKET_LABELS = ("positive", "hard_negative", "skip", "conflict")
+RELATION_CONTRACT_VERSION = "universal-relations-v1"
+RESOLVER_VERSION = "basket-projection-v1"
 ENDPOINTS = {
     "gpt": "https://api.openai.com/v1/chat/completions",
     "jev": "https://api.typesafe.ai/v1/systemone",
@@ -130,6 +136,79 @@ JEV_CRITERIA = {
         ),
     },
 }
+IDENTITY_CRITERIA = {
+    "duplicate": "The two listings describe the same product, not merely similar products.",
+    "variant": (
+        "The same named model or product family differs only on a variant axis such as size, colour, finish, scent, "
+        "origin, grade, or pack size."
+    ),
+    "redundant": (
+        "In this direction the base already includes or integrates the candidate, so buying the candidate repeats "
+        "something supplied by the base."
+    ),
+    "distinct": "The candidate is a genuinely distinct product from the base.",
+    "uncertain": "The supplied product evidence cannot safely establish identity or directional redundancy.",
+}
+RELATION_CRITERIA = {
+    "co_purchase": {
+        "yes": (
+            "After selecting the base, the shopper would reasonably add the candidate to the same purchase. The "
+            "supplied text establishes a direct accessory, component, refill, setup, room, meal, outfit, activity, "
+            "or other concrete together-purchase relationship."
+        ),
+        "no": "The supplied text establishes that the candidate is not useful to buy with the selected base.",
+        "uncertain": "The supplied text is insufficient to establish or reject a together-purchase relationship.",
+    },
+    "alternative": {
+        "yes": (
+            "Before selecting the base, the shopper could reasonably buy the distinct candidate instead. It has a "
+            "compatible functional role and use context supported by the supplied text."
+        ),
+        "no": "The supplied text establishes that the candidate is not a credible instead-of choice for the base.",
+        "uncertain": "The supplied text is insufficient to establish or reject an alternative relationship.",
+    },
+    "incompatible": {
+        "yes": (
+            "The candidate is strongly related to the base but explicitly unusable, wrong-context, or incompatible "
+            "according to the supplied text."
+        ),
+        "no": "The supplied text establishes no explicit incompatibility or wrong-context relationship.",
+        "uncertain": "The supplied text is insufficient to establish or reject incompatibility.",
+    },
+}
+RELATION_INSTRUCTIONS = {
+    "co_purchase": (
+        "Judge candidates[{index}] independently for CO-PURCHASE in this direction: after selecting base, would the "
+        "shopper reasonably add the candidate to the same purchase? Concrete functional or coordinated-use evidence "
+        "is required; broad similarity alone is insufficient. Do not suppress this answer because of identity."
+    ),
+    "alternative": (
+        "Judge candidates[{index}] independently as an ALTERNATIVE in this direction: before selecting base, would "
+        "the shopper reasonably buy the candidate instead? Require a compatible functional role and use context. "
+        "Do not suppress this answer because of identity."
+    ),
+    "incompatible": (
+        "Judge candidates[{index}] independently for INCOMPATIBILITY in this direction: is the candidate strongly "
+        "related but explicitly unusable, wrong-context, or incompatible with base? Do not infer incompatibility "
+        "from missing evidence or suppress this answer because of identity."
+    ),
+}
+GPT_RELATION_SYSTEM_PROMPT = """You evaluate directed product pairs for four separate SBS decisions.
+
+IDENTITY
+- duplicate: the same product appears as two listings.
+- variant: the same named model or family differs only by size, colour, finish, scent, origin, grade, pack size, or another variant axis.
+- redundant: in this direction, the base already includes or integrates the candidate.
+- distinct: genuinely different products.
+- uncertain: the supplied evidence cannot safely establish identity.
+
+RELATIONS
+- co_purchase: after selecting the base, would the shopper reasonably add the candidate to the same purchase?
+- alternative: before selecting the base, would the shopper reasonably buy the candidate instead?
+- incompatible: is the candidate strongly related but explicitly unusable, wrong-context, or incompatible?
+
+Answer each relation independently with yes, no, or uncertain. Do not omit or change relation answers because of the identity answer. Require concrete evidence from the supplied name, category, and description. Broad category, brand, colour, or thematic similarity alone is insufficient. Missing evidence is uncertain, not no. Preserve direction and do not invent product facts.
+"""
 PRICING = {
     "as_of": "2026-09-17", "currency": "USD", "unit": "per million tokens",
     "gpt": {"input": 0.05, "cached_input": 0.005, "output": 0.40,
@@ -425,6 +504,107 @@ def render_request(provider: str, settings: dict, data: dict, batch: dict) -> di
     }
 
 
+def relation_products(data: dict, batch: dict) -> tuple[dict, list]:
+    product = data["products"][batch["anchor_id"]]
+    base = {"id": product["id"], "text": product["text"]}
+    candidates = [
+        {key: data["products"][item["candidate_id"]][key] for key in ("id", "name", "category", "description")}
+        for item in batch["candidates"]
+    ]
+    return base, candidates
+
+
+def relation_result_schema(labels: tuple[str, ...]) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["label", "reason"],
+        "properties": {
+            "label": {"type": "string", "enum": list(labels)},
+            "reason": {"type": "string", "maxLength": 80},
+        },
+    }
+
+
+def render_relation_request(provider: str, settings: dict, data: dict, batch: dict) -> dict:
+    base, candidates = relation_products(data, batch)
+    if provider == "gpt":
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["judgments"],
+            "properties": {
+                "judgments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["id", "identity", "relations"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "identity": relation_result_schema(IDENTITY_LABELS),
+                            "relations": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": list(RELATION_HEADS),
+                                "properties": {
+                                    head: relation_result_schema(RELATION_LABELS) for head in RELATION_HEADS
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        user_prompt = (
+            "Base product:\n"
+            f"{json.dumps(base, indent=2, ensure_ascii=False)}\n\n"
+            "Candidates, in request order:\n"
+            f"{json.dumps(candidates, indent=2, ensure_ascii=False)}\n\n"
+            "Return exactly one judgment per candidate ID. Give identity and all three independent relation heads. "
+            "Keep every reason to one short phrase of at most 80 characters."
+        )
+        return {
+            "model": settings["model"],
+            "reasoning_effort": settings["reasoning_effort"],
+            "messages": [
+                {"role": "system", "content": GPT_RELATION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "relation_classification", "strict": True, "schema": schema},
+            },
+        }
+
+    require(provider == "jev", "Unknown provider")
+    questions = {}
+    for index in range(len(candidates)):
+        questions[f"candidate_{index}_identity"] = {
+            "type": "choice",
+            "instructions": (
+                f"Classify the IDENTITY of candidates[{index}] relative to base in this direction. Identity is "
+                "separate from whether the products complement, replace, or conflict with each other."
+            ),
+            "criteria": IDENTITY_CRITERIA,
+        }
+        for head in RELATION_HEADS:
+            questions[f"candidate_{index}_{head}"] = {
+                "type": "choice",
+                "instructions": RELATION_INSTRUCTIONS[head].format(index=index),
+                "criteria": RELATION_CRITERIA[head],
+            }
+    return {
+        "model": settings["model"],
+        "state": {
+            "contract_version": RELATION_CONTRACT_VERSION,
+            "base": base,
+            "candidates": candidates,
+        },
+        "questions": questions,
+    }
+
+
 def prepare_requests(manifest: dict) -> dict:
     return {provider: {
         shop: [(batch, render_request(provider, settings, data, batch)) for batch in data["batches"]]
@@ -494,6 +674,137 @@ def parse_answers(provider: str, body: dict, batch: dict) -> list:
                                "probability_rounding_warning": not math.isclose(probability_sum, 1, abs_tol=1e-6)})
     return [{"pair_id": item["pair_id"], "candidate_id": item["candidate_id"], **answer}
             for item, answer in zip(items, normalized, strict=True)]
+
+
+def validate_relation_result(result: object, labels: tuple[str, ...]) -> dict:
+    require(isinstance(result, dict) and set(result) == {"label", "reason"}, "Invalid judgment result")
+    require(result["label"] in labels, "Invalid judgment label")
+    require(isinstance(result["reason"], str) and len(result["reason"]) <= 80, "Invalid judgment reason")
+    return {
+        "label": result["label"],
+        "reason": result["reason"],
+        "probabilities": None,
+        "confidence": None,
+    }
+
+
+def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
+    require(isinstance(answer, dict), "Invalid Choice answer")
+    require(answer.get("type") == "choice" and answer.get("choice") in labels, "Invalid Choice answer")
+    probabilities = answer.get("probabilities")
+    require(isinstance(probabilities, dict) and set(probabilities) == set(labels), "Incomplete probability distribution")
+    confidence = answer.get("confidence")
+    values = [*probabilities.values(), confidence]
+    require(all(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1 for value in values),
+            "Invalid probability or confidence")
+    probability_sum = sum(probabilities.values())
+    tolerance = max(PROBABILITY_SUM_TOLERANCE, 0.005 * len(labels))
+    require(math.isclose(probability_sum, 1, rel_tol=0, abs_tol=tolerance + 1e-12),
+            "Probabilities do not sum to one within rounding tolerance")
+    require(probabilities[answer["choice"]] >= max(probabilities.values()) - 1e-6, "Choice is not maximal")
+    return {
+        "label": answer["choice"],
+        "reason": None,
+        "probabilities": probabilities,
+        "confidence": confidence,
+        "probability_sum": probability_sum,
+        "probability_rounding_warning": not math.isclose(probability_sum, 1, abs_tol=1e-6),
+    }
+
+
+def parse_relation_answers(provider: str, body: dict, batch: dict) -> list:
+    require(isinstance(body.get("model"), str) and bool(body["model"]), "Missing served model")
+    items = batch["candidates"]
+    ids = [item["candidate_id"] for item in items]
+    normalized = []
+    if provider == "gpt":
+        require(len(body["choices"]) == 1, "Expected one completion")
+        choice = body["choices"][0]
+        require(choice["finish_reason"] == "stop", "Incomplete completion")
+        require(not choice["message"].get("refusal"), "Provider refusal")
+        parsed = strict_json(choice["message"]["content"])
+        require(set(parsed) == {"judgments"}, "Invalid completion object")
+        answers = index_records(parsed["judgments"], "id")
+        require(set(answers) <= set(ids), "Unknown candidate answers")
+        items = [item for item in items if item["candidate_id"] in answers]
+        for item in items:
+            answer = answers[item["candidate_id"]]
+            require(set(answer) == {"id", "identity", "relations"}, "Invalid judgment fields")
+            relations = answer["relations"]
+            require(isinstance(relations, dict) and set(relations) == set(RELATION_HEADS),
+                    "Invalid relation fields")
+            normalized.append({
+                "identity": validate_relation_result(answer["identity"], IDENTITY_LABELS),
+                "relations": {
+                    head: validate_relation_result(relations[head], RELATION_LABELS) for head in RELATION_HEADS
+                },
+            })
+    else:
+        require(provider == "jev", "Unknown provider")
+        answers = body["answers"]
+        expected = {
+            f"candidate_{index}_{head}"
+            for index in range(len(ids))
+            for head in ("identity", *RELATION_HEADS)
+        }
+        require(set(answers) == expected, "Missing or unknown question answers")
+        for index in range(len(ids)):
+            normalized.append({
+                "identity": parse_jev_choice(answers[f"candidate_{index}_identity"], IDENTITY_LABELS),
+                "relations": {
+                    head: parse_jev_choice(answers[f"candidate_{index}_{head}"], RELATION_LABELS)
+                    for head in RELATION_HEADS
+                },
+            })
+    return [
+        {"pair_id": item["pair_id"], "candidate_id": item["candidate_id"], **answer}
+        for item, answer in zip(items, normalized, strict=True)
+    ]
+
+
+def resolve_basket_judgment(answer: dict) -> dict:
+    identity = answer["identity"]["label"]
+    require(identity in IDENTITY_LABELS, "Invalid identity label")
+    relations = {head: answer["relations"][head]["label"] for head in RELATION_HEADS}
+    require(all(label in RELATION_LABELS for label in relations.values()), "Invalid relation label")
+    yes = {head for head, label in relations.items() if label == "yes"}
+    raw_conflict = len(yes) > 1
+    result = {
+        "resolver_version": RESOLVER_VERSION,
+        "identity_action": "continue_uncertain" if identity == "uncertain" else "continue",
+        "basket_label": None,
+        "resolution_status": None,
+        "resolution": None,
+        "conflict": raw_conflict,
+    }
+    if identity in {"duplicate", "variant", "redundant"}:
+        result.update(
+            identity_action="filter",
+            basket_label="skip",
+            resolution_status="filtered",
+            resolution=f"identity_filtered_{identity}",
+        )
+        return result
+    if raw_conflict:
+        result.update(
+            basket_label="conflict",
+            resolution_status="conflict",
+            resolution="conflicting_positive_relations",
+        )
+        return result
+    labels = tuple(relations[head] for head in RELATION_HEADS)
+    if labels == ("yes", "no", "no"):
+        result.update(basket_label="positive", resolution_status="resolved", resolution="co_purchase_positive")
+    elif labels == ("no", "yes", "no"):
+        result.update(basket_label="hard_negative", resolution_status="resolved", resolution="alternative_only")
+    elif labels == ("no", "no", "yes"):
+        result.update(basket_label="hard_negative", resolution_status="resolved", resolution="incompatible_only")
+    elif "uncertain" in labels:
+        result.update(basket_label="skip", resolution_status="uncertain", resolution="uncertain_skip")
+    else:
+        result.update(basket_label="skip", resolution_status="resolved", resolution="unrelated_skip")
+    require(result["basket_label"] in BASKET_LABELS, "Invalid basket label")
+    return result
 
 
 def extraction_status(answers: list, expected_count: int) -> tuple[str, str | None]:
