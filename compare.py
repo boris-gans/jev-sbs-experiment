@@ -2038,7 +2038,9 @@ def main() -> None:
             directory, baseline = prepare_gpt_baseline(
                 manifest, args.baseline_root, import_run=args.import_run, paid=args.execute)
             print(f"GPT baseline: {directory}")
-            print(f"Retained {len(baseline['classifications'])} labels; {len(baseline['missing_pair_ids'])} missing. "
+            result_name = "labels" if manifest_schema(manifest) == MANIFEST_V1 else "judgments"
+            print(f"Retained {len(baseline['classifications'])} {result_name}; "
+                  f"{len(baseline['missing_pair_ids'])} missing. "
                   f"Complete: {baseline['complete']}.")
             if not args.execute:
                 print("No API requests made. Add --execute only when ready to complete missing GPT answers.")

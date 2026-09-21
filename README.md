@@ -1,13 +1,23 @@
-# Jev / GPT nano SBS comparison
+# Jev / GPT nano SBS relation comparison
 
-A small local experiment for FERODEV-8257. Compare **400 directed rows per shop**
-(200 forward, 200 reverse) for furniture.co.uk's style-compatibility objective
-and themeatboys.nl's complements objective. Both providers receive the same
-frozen product evidence, shop policies, examples, and candidate batches. Prepare
-GPT once, then compare successive Jev prompt variants against that saved baseline.
+A local experiment for FERODEV-8283. It compares Jev and GPT nano on **400
+directed rows per shop** (200 forward and 200 reverse) from furniture.co.uk and
+themeatboys.nl. Both providers receive the same frozen product evidence and answer
+the same four questions for every pair:
+
+1. identity: `duplicate`, `variant`, `redundant`, `distinct`, or `uncertain`;
+2. co-purchase: `yes`, `no`, or `uncertain`;
+3. alternative: `yes`, `no`, or `uncertain`;
+4. incompatibility: `yes`, `no`, or `uncertain`.
+
+The experiment asks all four questions in one combined request so provider results
+remain directly comparable over all 800 pairs. A deterministic resolver derives an
+SBS basket label afterward. The raw heads remain the source of truth.
 
 This is not a production pipeline integration. Nothing imports or changes
-`embedding-service`; no retrieval, summarization, training, or embedding job runs.
+`embedding-service`; no retrieval, summarization, training, embedding, schema, or
+dependency change is involved. Historical FERODEV-8257 runs retain their original
+three-label report format.
 
 ## Setup
 
@@ -26,11 +36,16 @@ whitespace. Tests use synthetic catalogs and mocked HTTP; they never call provid
 
 The transferred files remain local under `data/<shop>/`. Required per shop:
 
-- `stage1/products_processed.json`
-- `stage2/subset_products.json`, `candidates.json`, `classification_context.json`
-- `stage2/forward_judgments.json` and `reverse_judgments.json` (JSONL despite their extensions)
-- `stage2/recommendation.yaml`, `classification_examples.txt`, and the objective's
-  `stage2_classify_*.system.txt` / `stage2_classify_*.user.txt`
+- `stage1/products_processed.json`;
+- `stage2/subset_products.json`, `candidates.json`, and `classification_context.json`;
+- `stage2/forward_judgments.json` and `reverse_judgments.json` (JSONL despite the
+  extensions);
+- the saved recommendation, examples, and `stage2_classify_*` prompt files hashed
+  by that classification context.
+
+The old recommendation objective and prompts are retained as source provenance and
+to validate the frozen population. They are not the v2 provider decision policy.
+The universal relation contract is snapshotted from `compare.py` into the manifest.
 
 Run from this repository root:
 
@@ -38,219 +53,224 @@ Run from this repository root:
 .venv/bin/python compare.py
 ```
 
-This checks context hashes and product references, renders both provider payloads,
-and writes `results/manifest.json`. No credentials or network requests are needed.
-Repeating preparation checks that the manifest is byte-identical; a different
-workload/settings combination requires a new `--manifest` path, never an overwrite.
+This validates source hashes and product references, renders both provider
+payloads, and writes `results/relation-manifest.json`. No credentials or network
+requests are needed. Repeating preparation requires byte-identical output; a
+different workload or contract needs a new `--manifest` path, never an overwrite.
 
-The manifest contains selected evidence, policy, provenance, batching, and models:
+The manifest freezes:
 
-- GPT: `gpt-5-nano-2025-08-07`, medium reasoning, strict structured output;
-  no temperature or output-token override.
-- Jev: `jev-1.13.0`, one three-label Choice question per candidate.
-- At most 20 candidates per request; concurrency defaults to 8 (`--concurrency`).
+- all 800 pair identities, directions, product evidence, retrieval ranks/sources,
+  and source digests;
+- GPT `gpt-5-nano-2025-08-07` with medium reasoning and strict structured output;
+- Jev `jev-1.13.0` with four Choice questions per candidate;
+- the exact GPT policy and the Jev identity/relation criteria and instructions;
+- the resolver version and all accepted labels.
 
-The supplied snapshots produce **62 batches per provider**. Each new experiment
-sends only the 62 Jev batches (800 pairs) and reuses GPT's labels. Reverse batches
-are often smaller than 20. Preflight prints the actual counts.
+Requests contain at most 20 candidates. A full Jev batch therefore has 80 Choice
+questions. Concurrency defaults to 8 (`--concurrency`). The supplied snapshots
+produce **62 batches per provider**; reverse batches are often smaller than 20.
+Preflight prints the actual counts.
 
-## Reusable GPT baseline — Boris operates paid completion
+### Worktrees
 
-Import the existing GPT responses **offline** (including the 795 valid labels
-already returned). This preserves the original run and does not call either API:
+`data/` and `results/` are ignored and therefore do not appear automatically in a
+new Git worktree. Point the worktree at the original checkout's frozen catalog:
 
 ```sh
-.venv/bin/python compare.py --prepare-baseline --import-run results/run
+.venv/bin/python compare.py \
+  --data-dir /absolute/path/to/jev-sbs-experiment/data
 ```
 
-Baseline data lives under `results/baselines/<gpt-input-fingerprint>/`:
+Outputs still go to the current worktree's ignored `results/` directory unless an
+explicit manifest, baseline root, or output directory is supplied. Do not copy or
+edit an existing experiment's snapshots merely to make them visible in a worktree.
+In a worktree, add the same `--data-dir` flag to every non-report-only command below.
 
-- `spec.json`: exact GPT requests and directed pair identities, published once.
-- `imported.jsonl`: immutable snapshot of the initial run; only GPT records are used.
+## Fresh GPT baseline — Boris operates paid completion
+
+The FERODEV-8257 GPT labels are not valid for the revised objectives. Do **not**
+import `results/run` or reuse its baseline. First prepare a fresh v2 baseline
+offline:
+
+```sh
+.venv/bin/python compare.py --prepare-baseline
+```
+
+The initial state reports 0 retained judgments and 800 missing judgments. Baseline
+data lives under `results/baselines/<gpt-input-fingerprint>/`:
+
+- `spec.json`: exact GPT requests and ordered pair identities, published once;
 - `repairs/*.jsonl`: a new durable log for each paid completion invocation, with
-  each HTTP attempt flushed separately. Prior logs are never appended to or replaced.
-- `baseline.json`: created only when all expected labels exist; immutable thereafter.
+  every HTTP attempt flushed separately;
+- `baseline.json`: created only when all 800 judgments exist; immutable thereafter.
 
-The fingerprint covers GPT prompts/examples, product evidence, candidate grouping,
-pair direction, model and request settings. Jev settings/criteria are excluded.
-Only the first valid answer for each pair is retained; later answers cannot replace
-it. Changing GPT inputs selects a different baseline, never silently reuses old labels.
+The completed v2 baseline also snapshots its exact input specification so later
+report-only processing does not rerender prompts from live code. The fingerprint
+covers the GPT system/user prompts, strict schema, product evidence, candidate
+ordering, pair direction, model, and request settings. Jev-only criteria and
+pricing are excluded. Only the first valid answer for each pair is retained.
 
-With `OPENAI_API_KEY` set securely, complete the missing answers explicitly:
+After checking current provider limits and intended spend, set `OPENAI_API_KEY`
+securely and explicitly complete the baseline:
 
 ```sh
 .venv/bin/python compare.py --prepare-baseline --execute
 ```
 
-Only incomplete batches are requested. The current baseline needs **two batches
-to fill five missing answers**, not a rerun of all 62 GPT batches. Retries send the
-original full prompt/candidate batch so context stays unchanged; only missing IDs
-are merged. Partial-answer and transient-error retries share a limit of **three
-HTTP attempts per incomplete batch per invocation**. Completed batches are skipped.
-No Jev credential or call is involved. Repeating this command after completion
-makes zero requests, even without credentials.
+This can make all 62 GPT requests for a fresh baseline. Only incomplete batches are
+sent on later invocations. Partial valid candidate judgments are retained; retries
+send the original full request and share a maximum of three HTTP attempts per batch
+per invocation. A nonzero exit preserves progress. Completed baseline preparation
+makes zero requests even if repeated without credentials.
 
-If still incomplete, the command exits nonzero with progress preserved. A later
-explicit invocation resumes from the saved answers; it is not an unlimited loop.
-An interrupted attempt that reached the provider but was not persisted might be
-billed again. Completed attempts are checkpointed before retrying. Historical usage
-and wall times remain separate from repair usage and wall times in the baseline.
-File locking prevents concurrent baseline preparation on macOS/Linux. Completed
-baseline loading is offline-only and rejects absent, incomplete, or changed history.
+Baseline preparation uses a file lock on macOS/Linux. Immutable specs, response
+history, and completed baselines cannot be replaced. An interrupted request that
+reached the provider before its checkpoint may be billed again.
 
-## Repeatable Jev experiments — Boris operates paid execution
+`--import-run` remains available only for a run containing the **exact matching v2
+GPT requests**. A legacy or differently prompted run is rejected.
 
-Once the GPT baseline is complete, set only `TYPESAFE_API_KEY` for experiments.
-`OPENAI_API_KEY` is not required and GPT is never called by this command. An absent,
-incomplete, or mismatched baseline is an error, not permission to rebuild it online.
+## Jev execution — Boris operates the paid run
 
-Keep credentials out of source, shell history, chat, and logs. Use your local
-secret-management method. `.env.sample` lists the names; **the script does not load
-`.env` files**.
-
-Before execution, check account limits, current prices, and your intended spend
-limit in the provider consoles. There is **no hard dollar-budget limiter**; usage
-is reported after requests, and GPT has no output-token override.
-
-After reviewing the offline preflight, run a Jev experiment:
+Plain `--execute` never runs GPT. It requires a complete matching v2 baseline and
+only calls Jev. Set `TYPESAFE_API_KEY`; `OPENAI_API_KEY` is not needed:
 
 ```sh
 .venv/bin/python compare.py --execute
 ```
 
-Every invocation creates a fresh `results/experiments/<UTC-timestamp>-<unique-id>/`
-directory and prints its path. You may choose a directory with `--output-dir`, but
-it must not exist. `results/run/` (the original combined run) remains intact.
+Every invocation creates a fresh
+`results/experiments/<UTC-timestamp>-<unique-id>/` directory and prints its path.
+`--output-dir` may select another new directory, but it must not already exist.
+There is no automatic Jev resume: every new execution resends the entire workload
+and can incur new charges.
 
-The two Jev shop groups run separately; batches within each group run concurrently.
-Each HTTP attempt has a 120-second I/O timeout. Transient transport errors, 408,
-429, and 5xx get at most two retries (up to 186 Jev attempts for this
-workload). `Retry-After` is honored up to 60 seconds; longer waits stop that batch
-rather than retrying early. Retries, including requests that timed out after being
-processed remotely, can incur additional cost. Authentication/validation failures
-and malformed successful responses are not retried. GPT responses missing candidate
-answers are retried within the same attempt budget, retaining first-valid answers.
+Keep credentials out of source, shell history, chat, and logs. `.env.sample` lists
+the variable names; the script does not load `.env` files. Before execution, check
+provider limits, current prices, and intended spend. There is no hard dollar cap.
 
-A stopped GPT completion can omit candidate IDs. Valid returned judgments are
-retained as a partial batch; omitted candidates remain explicit errors with null
-labels, never `skip`. Unknown/duplicate IDs and malformed judgments still fail
-validation. Jev's three probabilities may sum within 0.015 of one to accommodate
-two-decimal rounding. Their reported values and selected label are preserved, not
-renormalized; classification JSONL and summary counts flag rounding discrepancies.
+Each request has a 120-second I/O timeout. Transport errors, 408, 429, and 5xx
+responses receive at most two retries. `Retry-After` is honored up to 60 seconds;
+longer waits stop the batch. Authentication/validation failures are not retried.
+Retries can incur additional charges.
 
-Each new experiment resends the complete Jev workload and incurs new charges;
-there is no automatic Jev resume. Use `--report-only` to inspect/regenerate existing
-results without new inference. Never rerun `--execute` merely to obtain reports.
+GPT may return valid judgments for only part of a batch; those judgments survive
+while omitted candidates remain operational failures. Jev must answer every Choice
+question in a batch. Unknown IDs, missing heads, invalid labels, and malformed
+responses fail validation rather than becoming `uncertain` or `skip`.
 
-## Jev prompt variants
+Jev probabilities are preserved exactly. Three-choice relation distributions may
+sum within 0.015 of one; the five-choice identity distribution may sum within 0.025
+to accommodate two-decimal rounding. Reports flag discrepancies and never
+renormalize provider values.
 
-`compare.py` contains separate `JEV_INSTRUCTIONS` and `JEV_CRITERIA` entries for
-`style_compatibility` and `complements`, plus the descriptive `JEV_PROMPT_VERSION`.
-The original shop policy/examples remain in shared state; each candidate receives
-its own Choice with the applicable objective's complete ordered decision procedure.
-The prompts explicitly define:
+## Relation contract and basket projection
 
-- Furniture: variants and redundancy first, conventional complements next, then
-  distinct-model compatibility requiring both a compatible context and concrete
-  material, finish, construction, shape, or design-era evidence.
-- Complements: variants (including same-brand/same-category line extensions) and
-  redundancy first, then a direct functional add-on—not merely another related
-  product, extra unit, broad shared activity, or meal variety.
-- Hard negative: only after earlier checks, for confident substitution or explicit
-  incompatibility/wrong context. Uncertainty defaults to `skip`.
-- Each Choice criterion also contains short catalog-grounded boundary examples.
-  Furniture distinguishes named family variants, matching room furniture, and
-  explicit wrong-size/wrong-context products. Complements distinguishes same-cut
-  variants, alternative main proteins, meal variety, and model-matched accessories.
-  These teach shared rules and never identify product IDs as exceptions.
+Identity and each relation are intentionally separate. Providers must answer all
+three relation heads even when they classify a pair as a duplicate or variant. This
+keeps the raw comparison complete and lets the resolver apply precedence offline.
 
-For a prompt-only experiment, change the applicable objective's Jev definitions and
-run again. Do not edit the frozen GPT templates, input data, or candidate batches.
-Prompt changes are snapshotted per experiment and do not invalidate the saved GPT
-baseline.
+The resolver is conservative:
+
+| Identity / relations | Basket result |
+|---|---|
+| `duplicate`, `variant`, or directional `redundant` | `skip` |
+| co-purchase `yes`, alternative `no`, incompatible `no` | `positive` |
+| co-purchase `no`, alternative `yes`, incompatible `no` | `hard_negative` |
+| co-purchase `no`, alternative `no`, incompatible `yes` | `hard_negative` |
+| all relation heads `no` | `skip` |
+| unresolved uncertainty without a decisive matrix row | `skip` with uncertain status |
+| more than one relation head `yes` | `conflict` for review |
+
+`uncertain` identity continues to the relation matrix but remains visible in the
+resolution record. No probability threshold or maximum-probability conflict rule is
+applied. Raw identity, relation choices, reasons, probabilities, and confidence are
+preserved even when identity filters the derived basket label.
+
+Changing the GPT prompt/schema or pair evidence selects a fresh baseline. A
+Jev-only criteria experiment may reuse the baseline, but creates a new manifest and
+experiment snapshot. Agreement with GPT is comparison evidence, not ground truth.
 
 ## Results
 
-All outputs are ignored by Git. Each experiment directory contains:
+All outputs are ignored by Git. Each v2 experiment directory contains:
 
 | File | Contents |
 |---|---|
-| `manifest.json` | Frozen workload snapshot |
-| `baseline.json` | Completed GPT labels, provenance, and historical accounting; no copy of raw GPT logs |
-| `experiment.json` | Exact Jev criteria/instructions/version, dated pricing, baseline and manifest digests, and intended payload hashes |
-| `requests.jsonl` | Only this experiment's Jev requests/responses, attempt usage/latency/status, retries, model IDs, and group wall times; no authorization headers |
-| `gpt_classifications.jsonl`, `jev_classifications.jsonl` | One record per expected pair/provider; statuses `ok`, `error`, or `missing`; errors/missing rows have null labels |
-| `paired_results.csv` | All 800 directed rows with evidence, labels, GPT reasons, Jev probabilities, statuses, and agreement |
-| `disagreements.csv` | Only pairs where both providers succeeded but chose different labels |
-| `summary.json` | Agreement matrices, new Jev timing/cost/usage, and separately identified historical GPT baseline measurements |
+| `manifest.json` | Frozen 800-pair workload and universal relation contract |
+| `baseline.json` | Completed GPT raw heads, exact input specification, provenance, and historical accounting |
+| `experiment.json` | Exact Jev criteria/instructions, resolver version, dated pricing, digests, and intended request hashes |
+| `requests.jsonl` | This experiment's Jev requests/responses, attempt usage/latency/status, retries, model IDs, and group wall times |
+| `gpt_classifications.jsonl`, `jev_classifications.jsonl` | One record per pair/provider with status, raw heads, and deterministic resolution |
+| `paired_results.csv` | All 800 rows with product/retrieval evidence, every provider head, GPT reasons, Jev probabilities/confidence, derived basket labels, and agreement flags |
+| `disagreements.csv` | Successful pairs differing on any raw head or basket result |
+| `summary.json` | Per-head/basket matrices, distributions, filtered/conflict counts, failures, and separated historical GPT versus new Jev accounting |
 
-The CSV writer prefixes formula-like text with an apostrophe for spreadsheet
-safety. JSON retains original text. Usage belongs to requests, not individual
-pairs; it is not duplicated or arbitrarily apportioned across classification rows.
+The CSV writer prefixes formula-like catalog text with an apostrophe. JSON retains
+the original text. Usage belongs to requests and is not apportioned across pairs.
 
-Reports can be regenerated without inputs, credentials, or network access:
+Regenerate reports without catalog inputs, credentials, or network access:
 
 ```sh
-.venv/bin/python compare.py --report-only --output-dir results/experiments/YOUR-RUN-ID
+.venv/bin/python compare.py --report-only \
+  --output-dir results/experiments/YOUR-RUN-ID
 ```
 
-Replace `YOUR-RUN-ID` with the printed directory name. Reports use that directory's
-snapshots: no original catalog, baseline directory, credentials, or current Jev
-criteria are needed. They verify manifest/baseline/experiment digests and logged
-payload hashes, so changing the code's criteria or pricing cannot rewrite history.
-An explicit `--manifest` must match the snapshot.
+Reports use only that directory's immutable manifest, GPT baseline, experiment,
+and raw request log. They verify snapshot digests and Jev request hashes. Changing
+live provider prompts, criteria, or pricing cannot rewrite the snapshotted inputs.
+Derived reports are replaced deterministically by the report extraction version;
+raw snapshots and `requests.jsonl` are not.
 
-For the original combined run, use `--report-only --output-dir results/run`;
-omitting `--output-dir` in report-only mode also selects that legacy run. Its
-original report format is retained. Only derived reports
-are overwritten; the request log and manifest are never overwritten. Interrupted
-runs retain completed batches; an unterminated, malformed final log line is
-flagged and omitted. Malformed interior lines or conflicting identities fail
-reporting rather than silently mixing results.
+For the original FERODEV-8257 combined run, use:
 
-Report-only processing also re-extracts saved HTTP-200 validation failures with
-the current parser. This recovers valid answers rejected by earlier batch-wide
-checks **without new API calls or edits to the original request log**. Reports
-record the extraction version and source-log hash. `recorded_failed_attempts`
-retains the original failure count; `failed_attempts` reflects current validation.
-`partial_batches` have some valid answers; `failed_batches` have none.
-Cost, token usage, request timing, and wall time remain the original measurements.
+```sh
+.venv/bin/python compare.py --report-only --output-dir results/run
+```
+
+Its v1 three-label reports remain unchanged. Omitting `--output-dir` in report-only
+mode still selects this legacy directory.
+
+Interrupted v2 logs retain completed batches. Failed or missing answers remain
+explicit errors and never enter agreement denominators. A malformed final partial
+line is flagged and omitted; malformed interior lines or conflicting identities
+stop reporting. Saved HTTP-200 responses rejected by an earlier parser may be
+re-extracted offline without editing the raw log or making new calls.
 
 ## Reading the numbers
 
-- **Agreement is not correctness.** Its denominator includes only paired valid
-  results; failed/missing responses are excluded and separately counted. A valid
-  `skip` is a real label, not an operational failure.
-- **New versus historical:** experiment summaries contain only fresh Jev inference
-  under `groups` and `new_inference`. GPT has zero new calls/cost; its original and
-  repair measurements live under `gpt_baseline.accounting`. Cached lookup time is
-  not GPT inference latency, and historical GPT cost is not charged to each run.
-- **Wall time** covers each provider/shop group including retries and persistence,
-  excluding offline preparation. Throughput is successful pairs divided by that
-  time. Incomplete groups have null wall time/throughput.
-- **Request latency** is measured per HTTP attempt, including failed attempts,
-  but excludes retry sleeps. p50 is the median; p95 is nearest-rank. Logical batch
-  counts and HTTP-attempt/retry counts are separate.
-- **Usage** includes every recorded attempt, not just successful batches. Each
-  field has a reported subtotal, missing-attempt count, and a total only when the
-  group and field coverage are complete. Null never means zero.
-- **Costs are dated estimates**, not bills. Rates as of 2026-09-17, USD per million
-  tokens: GPT input $0.05, cached input $0.005, output $0.40; Jev input $0.042,
-  output free. GPT completion tokens already include reasoning tokens. A GPT
-  attempt needs input, cached-input, and output counts to be priced; a Jev attempt
-  needs input counts. Missing counts leave the total unknown and expose only a
-  priced-attempt subtotal. In-flight attempts lost on interruption may still be
-  billed. Reconcile against the provider consoles.
+- **Agreement is not correctness.** Identity, each relation head, and the basket
+  projection have separate matrices. Denominators include only pairs where both
+  providers returned valid complete judgments.
+- **Failures are not semantic labels.** `uncertain`, `skip`, and `conflict` are valid
+  outcomes; provider errors and missing answers are separately counted and excluded.
+- **New versus historical:** `groups` and `new_inference` cover only fresh Jev
+  inference. GPT baseline timing, usage, and estimated cost remain under
+  `gpt_baseline.accounting`; they are not charged to every Jev experiment.
+- **Conflicts and filtering:** `resolution_review` exposes raw multi-head conflicts,
+  identity-filtered pairs, and uncertain identities for semantic review.
+- **Wall time** covers a complete provider/shop group including retries and
+  persistence. Incomplete groups have null wall time and throughput.
+- **Request latency** is per HTTP attempt and excludes retry sleeps. Batch requests,
+  HTTP attempts, and retries are separate counts.
+- **Usage and cost:** every recorded attempt contributes. Missing provider usage
+  leaves totals null rather than zero. Costs are dated estimates, not bills; verify
+  them in provider consoles.
 
-Pricing references: [OpenAI](https://platform.openai.com/docs/pricing),
+Pricing references: [OpenAI](https://platform.openai.com/docs/pricing) and
 [TypeSafe](https://docs.typesafe.ai/models).
 
 ## Interpretation limits
 
-Sampling uses stable-hash anchor ordering and retains candidate order, not uniform
-sampling of the full catalog. Historical GPT labels do not select sample rows,
-but the **saved reverse population was originally chosen from GPT non-skip forward
-judgments**. Forward/reverse direction is part of record identity; the same ordered
-product IDs may appear in both populations and are not independent observations.
-Batch context and different API interfaces can affect answers. These experiments
-are prompt/extraction diagnostics, not calibrated accuracy or capacity benchmarks.
+Sampling uses stable-hash anchor ordering and retained candidate order, not uniform
+sampling of the full catalogs. The **saved reverse population was originally chosen
+from historical GPT non-skip forward judgments**, so it is not an independent
+sample under the revised objectives. Forward/reverse direction is part of pair
+identity; the same product IDs can appear in both directions.
+
+Combined requests maximize provider comparability but do not measure the request or
+token savings of a future two-pass identity gate. Batch context and different API
+interfaces can affect answers. The experiment is a semantic prompt/extraction
+diagnostic, not calibrated accuracy, capacity, recommendation-quality, or production
+training validation. Paid-run results still require human or agent semantic review.
