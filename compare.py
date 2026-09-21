@@ -185,6 +185,10 @@ RELATION_CRITERIA = {
         "uncertain": "The supplied text is insufficient to establish or reject incompatibility.",
     },
 }
+IDENTITY_INSTRUCTION = (
+    "Classify the IDENTITY of candidates[{index}] relative to base in this direction. Identity is separate from "
+    "whether the products complement, replace, or conflict with each other."
+)
 RELATION_INSTRUCTIONS = {
     "co_purchase": (
         "Judge candidates[{index}] independently for CO-PURCHASE in this direction: after selecting base, would the "
@@ -466,6 +470,7 @@ def relation_contract_snapshot() -> dict:
         "basket_labels": list(BASKET_LABELS),
         "resolver_version": RESOLVER_VERSION,
         "gpt_system_prompt": GPT_RELATION_SYSTEM_PROMPT,
+        "identity_instruction": IDENTITY_INSTRUCTION,
         "identity_criteria": copy.deepcopy(IDENTITY_CRITERIA),
         "relation_criteria": copy.deepcopy(RELATION_CRITERIA),
         "relation_instructions": copy.deepcopy(RELATION_INSTRUCTIONS),
@@ -629,10 +634,7 @@ def render_relation_request(provider: str, settings: dict, data: dict, batch: di
     for index in range(len(candidates)):
         questions[f"candidate_{index}_identity"] = {
             "type": "choice",
-            "instructions": (
-                f"Classify the IDENTITY of candidates[{index}] relative to base in this direction. Identity is "
-                "separate from whether the products complement, replace, or conflict with each other."
-            ),
+            "instructions": contract["identity_instruction"].format(index=index),
             "criteria": contract["identity_criteria"],
         }
         for head in relation_heads:
@@ -644,7 +646,7 @@ def render_relation_request(provider: str, settings: dict, data: dict, batch: di
     return {
         "model": settings["model"],
         "state": {
-            "contract_version": RELATION_CONTRACT_VERSION,
+            "contract_version": contract["version"],
             "base": base,
             "candidates": candidates,
         },
@@ -826,7 +828,7 @@ def parse_provider_answers(schema: str, provider: str, body: dict, batch: dict) 
     return parse_relation_answers(provider, body, batch)
 
 
-def resolve_basket_judgment(answer: dict) -> dict:
+def resolve_basket_judgment_v1(answer: dict) -> dict:
     identity = answer["identity"]["label"]
     require(identity in IDENTITY_LABELS, "Invalid identity label")
     relations = {head: answer["relations"][head]["label"] for head in RELATION_HEADS}
@@ -869,6 +871,14 @@ def resolve_basket_judgment(answer: dict) -> dict:
         result.update(basket_label="skip", resolution_status="resolved", resolution="unrelated_skip")
     require(result["basket_label"] in BASKET_LABELS, "Invalid basket label")
     return result
+
+
+RESOLVERS = {RESOLVER_VERSION: resolve_basket_judgment_v1}
+
+
+def resolve_basket_judgment(answer: dict, resolver_version: str = RESOLVER_VERSION) -> dict:
+    require(resolver_version in RESOLVERS, f"Unsupported saved resolver version: {resolver_version}")
+    return RESOLVERS[resolver_version](answer)
 
 
 def extraction_status(answers: list, expected_count: int) -> tuple[str, str | None]:
@@ -1351,6 +1361,7 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
             manifest_schema_version=MANIFEST_V2,
             relation_contract_version=contract["version"],
             resolver_version=contract["resolver_version"],
+            jev_identity_instruction=contract["identity_instruction"],
             jev_identity_criteria=contract["identity_criteria"],
             jev_relation_criteria=contract["relation_criteria"],
             jev_relation_instructions=contract["relation_instructions"],
@@ -1402,6 +1413,8 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
                 "Experiment relation contract mismatch")
         require(experiment.get("resolver_version") == contract["resolver_version"],
                 "Experiment resolver mismatch")
+        require(experiment.get("jev_identity_instruction") == contract["identity_instruction"],
+                "Experiment identity instruction mismatch")
         require(experiment.get("jev_identity_criteria") == contract["identity_criteria"],
                 "Experiment identity criteria mismatch")
         require(experiment.get("jev_relation_criteria") == contract["relation_criteria"],
@@ -1457,8 +1470,8 @@ def validate_v2_experiment_log(directory: Path) -> tuple[dict, dict]:
     return experiment, baseline
 
 
-def relation_distribution(answers: list) -> dict:
-    resolutions = [resolve_basket_judgment(answer) for answer in answers]
+def relation_distribution(answers: list, resolver_version: str = RESOLVER_VERSION) -> dict:
+    resolutions = [resolve_basket_judgment(answer, resolver_version) for answer in answers]
     return {
         "identity_counts": {
             label: sum(answer["identity"]["label"] == label for answer in answers) for label in IDENTITY_LABELS
@@ -1485,7 +1498,8 @@ def relation_probability_warnings(answer: dict) -> int:
 
 
 def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int,
-                    pricing: dict | None = None, schema_version: str = MANIFEST_V1) -> dict:
+                    pricing: dict | None = None, schema_version: str = MANIFEST_V1,
+                    resolver_version: str = RESOLVER_VERSION) -> dict:
     attempts = [attempt for record in records for attempt in record["attempts"]]
     complete = end is not None and len(records) == len(expected)
     wall = end["wall_seconds"] if complete else None
@@ -1549,7 +1563,7 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
         result["label_counts"] = {label: sum(answer["label"] == label for answer in successes) for label in LABELS}
     else:
         require(schema_version == MANIFEST_V2, "Unsupported manifest schema")
-        result.update(relation_distribution(successes))
+        result.update(relation_distribution(successes, resolver_version))
     return result
 
 
@@ -1761,6 +1775,9 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
     require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
     require(start["concurrency"] == manifest["concurrency"], "Run/manifest concurrency mismatch")
     experiment, baseline = experiment_snapshot(output_dir, raw_manifest, manifest, start)
+    saved_resolver_version = experiment["resolver_version"]
+    require(saved_resolver_version in RESOLVERS,
+            f"Unsupported saved resolver version: {saved_resolver_version}")
     groups = {("jev", shop) for shop in manifest["shops"]}
     expected = {
         ("jev", shop, batch["batch_id"]): batch
@@ -1813,7 +1830,7 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
 
     classifications = {"gpt": {}, "jev": {}}
     for answer in baseline["classifications"]:
-        resolution = resolve_basket_judgment(answer)
+        resolution = resolve_basket_judgment(answer, saved_resolver_version)
         classifications["gpt"][answer["pair_id"]] = {
             **answer,
             "cached": True,
@@ -1846,7 +1863,10 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
             "accounting": baseline["accounting"],
             "pricing": baseline["pricing"],
             "distributions": {
-                shop: relation_distribution([answer for answer in baseline["classifications"] if answer["shop"] == shop])
+                shop: relation_distribution(
+                    [answer for answer in baseline["classifications"] if answer["shop"] == shop],
+                    saved_resolver_version,
+                )
                 for shop in manifest["shops"]
             },
             "note": "Historical measurements, not inference performed during this Jev experiment.",
@@ -1862,7 +1882,8 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
                          if ("jev", shop, batch["batch_id"]) in observed]
         end = ends.get(("jev", shop)) if ("jev", shop) in starts else None
         summary["groups"][f"jev/{shop}"] = summarize_group(
-            "jev", group_records, data["batches"], end, manifest["concurrency"], experiment["pricing"], MANIFEST_V2
+            "jev", group_records, data["batches"], end, manifest["concurrency"], experiment["pricing"], MANIFEST_V2,
+            saved_resolver_version,
         )
         for batch in data["batches"]:
             record = observed.get(("jev", shop, batch["batch_id"]))
@@ -1886,7 +1907,7 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
                     "served_model": record["served_model"] if record else None,
                     "identity": answer["identity"] if answer else None,
                     "relations": answer["relations"] if answer else None,
-                    "resolution": resolve_basket_judgment(answer) if answer else None,
+                    "resolution": resolve_basket_judgment(answer, saved_resolver_version) if answer else None,
                 }
 
     paired = []
@@ -1945,7 +1966,7 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
         for shop in manifest["shops"]:
             successful = [row for row in classifications[provider].values()
                           if row["shop"] == shop and row["status"] == "ok"]
-            summary["classifications"][provider][shop] = relation_distribution(successful)
+            summary["classifications"][provider][shop] = relation_distribution(successful, saved_resolver_version)
             resolutions = [row["resolution"] for row in successful]
             summary["resolution_review"][provider][shop] = {
                 "conflicts": sum(resolution["conflict"] for resolution in resolutions),

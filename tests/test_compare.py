@@ -2,6 +2,7 @@ import copy
 import csv
 import fcntl
 import hashlib
+import itertools
 import json
 import socket
 import threading
@@ -390,6 +391,8 @@ def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
     assert len(jev["questions"]) == len(candidates) * 4
     for index in range(len(candidates)):
         assert set(jev["questions"][f"candidate_{index}_identity"]["criteria"]) == set(compare.IDENTITY_LABELS)
+        assert (jev["questions"][f"candidate_{index}_identity"]["instructions"]
+                == compare.IDENTITY_INSTRUCTION.format(index=index))
         for head in compare.RELATION_HEADS:
             question = jev["questions"][f"candidate_{index}_{head}"]
             assert set(question["criteria"]) == set(compare.RELATION_LABELS)
@@ -401,6 +404,21 @@ def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
     assert all(head in gpt["messages"][0]["content"] for head in compare.RELATION_HEADS)
     assert all(candidate["id"] in gpt["messages"][1]["content"] for candidate in candidates)
     assert "temperature" not in gpt and "max_completion_tokens" not in gpt
+
+
+def test_relation_request_uses_saved_contract_version_and_identity_instruction(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    contract = compare.relation_contract_snapshot()
+    contract["version"] = "saved-contract-version"
+    contract["identity_instruction"] = "Saved identity instruction for candidates[{index}]."
+
+    payload = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch, contract)
+    assert payload["state"]["contract_version"] == "saved-contract-version"
+    for index in range(len(batch["candidates"])):
+        assert (payload["questions"][f"candidate_{index}_identity"]["instructions"]
+                == f"Saved identity instruction for candidates[{index}].")
 
 
 def test_v2_manifest_preserves_v1_frozen_workload(catalogs, relation_prepared):
@@ -513,6 +531,42 @@ def test_basket_resolver(identity, relations, basket, status, resolution):
         "filter" if identity in {"duplicate", "variant", "redundant"}
         else "continue_uncertain" if identity == "uncertain" else "continue"
     )
+
+
+@pytest.mark.parametrize("identity", compare.IDENTITY_LABELS)
+@pytest.mark.parametrize("relations", itertools.product(compare.RELATION_LABELS, repeat=3))
+def test_basket_resolver_covers_complete_decision_matrix(identity, relations):
+    answer = {
+        "identity": {"label": identity},
+        "relations": {
+            head: {"label": label} for head, label in zip(compare.RELATION_HEADS, relations, strict=True)
+        },
+    }
+    result = compare.resolve_basket_judgment(answer, compare.RESOLVER_VERSION)
+    yes_count = relations.count("yes")
+    assert result["conflict"] == (yes_count > 1)
+    if identity in {"duplicate", "variant", "redundant"}:
+        assert result["basket_label"] == "skip" and result["resolution_status"] == "filtered"
+    elif yes_count > 1:
+        assert result["basket_label"] == "conflict" and result["resolution_status"] == "conflict"
+    elif relations == ("yes", "no", "no"):
+        assert result["basket_label"] == "positive" and result["resolution_status"] == "resolved"
+    elif relations in {("no", "yes", "no"), ("no", "no", "yes")}:
+        assert result["basket_label"] == "hard_negative" and result["resolution_status"] == "resolved"
+    elif "uncertain" in relations:
+        assert result["basket_label"] == "skip" and result["resolution_status"] == "uncertain"
+    else:
+        assert relations == ("no", "no", "no")
+        assert result["basket_label"] == "skip" and result["resolution_status"] == "resolved"
+
+
+def test_basket_resolver_rejects_unknown_saved_version():
+    answer = {
+        "identity": {"label": "distinct"},
+        "relations": {head: {"label": "no"} for head in compare.RELATION_HEADS},
+    }
+    with pytest.raises(ValueError, match="Unsupported saved resolver version"):
+        compare.resolve_basket_judgment(answer, "future-unknown-resolver")
 
 
 def test_jev_payload_preserves_recommendation_direction(prepared):
@@ -1539,6 +1593,7 @@ def test_v2_jev_experiment_uses_immutable_relation_snapshots(
     assert experiment["manifest_schema_version"] == compare.MANIFEST_V2
     assert experiment["relation_contract_version"] == manifest["contract"]["version"]
     assert experiment["resolver_version"] == compare.RESOLVER_VERSION
+    assert experiment["jev_identity_instruction"] == manifest["contract"]["identity_instruction"]
     assert experiment["jev_identity_criteria"] == manifest["contract"]["identity_criteria"]
     assert json.loads((directory / "baseline.json").read_text()) == baseline
     validated_experiment, validated_baseline = compare.validate_v2_experiment_log(directory)
@@ -1555,11 +1610,27 @@ def test_v2_jev_experiment_uses_immutable_relation_snapshots(
         compare.main()
     assert "Reports rebuilt offline" in capsys.readouterr().out
     assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == report_files
+
+    def future_resolver(answer):
+        result = compare.resolve_basket_judgment_v1(answer)
+        return {**result, "resolver_version": "future-resolver", "basket_label": "skip",
+                "resolution_status": "future", "resolution": "future_resolution"}
+
     with monkeypatch.context() as patch:
         patch.setattr(compare, "GPT_RELATION_SYSTEM_PROMPT", "future GPT prompt")
+        patch.setattr(compare, "IDENTITY_INSTRUCTION", "future identity instruction")
         patch.setattr(compare, "RELATION_CRITERIA", {"future": "Jev criteria"})
+        patch.setattr(compare, "RESOLVER_VERSION", "future-resolver")
+        patch.setattr(compare, "RESOLVERS", {
+            compare.RESOLVER_VERSION: future_resolver,
+            experiment["resolver_version"]: compare.resolve_basket_judgment_v1,
+        })
         assert compare.validate_v2_experiment_log(directory) == (experiment, baseline)
         assert compare.write_reports(directory / "manifest.json", directory) == summary
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "RESOLVERS", {"future-resolver": future_resolver})
+        with pytest.raises(ValueError, match="Unsupported saved resolver version"):
+            compare.write_reports(directory / "manifest.json", directory)
 
     log_path = directory / "requests.jsonl"
     original_log = log_path.read_bytes()

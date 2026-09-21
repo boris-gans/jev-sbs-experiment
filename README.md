@@ -220,8 +220,10 @@ Regenerate reports without catalog inputs, credentials, or network access:
 Reports use only that directory's immutable manifest, GPT baseline, experiment,
 and raw request log. They verify snapshot digests and Jev request hashes. Changing
 live provider prompts, criteria, or pricing cannot rewrite the snapshotted inputs.
-Derived reports are replaced deterministically by the report extraction version;
-raw snapshots and `requests.jsonl` are not.
+Basket projection dispatches to the saved resolver version; an unavailable version
+stops reporting rather than reinterpreting historical judgments. Derived reports
+are replaced deterministically by the report extraction and resolver versions; raw
+snapshots and `requests.jsonl` are not.
 
 For the original FERODEV-8257 combined run, use:
 

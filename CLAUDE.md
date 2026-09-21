@@ -39,7 +39,8 @@ None known. This local experiment does not change embedding-service contracts.
 - FERODEV-8257's GPT labels and `results/run` are not objective-aligned and must not
   seed the v2 baseline. A fresh baseline starts with all 800 judgments missing.
 - Keep each experiment's snapshots and raw log immutable. Report-only processing
-  uses those snapshots and separates cached GPT measurements from new Jev inference.
+  uses those snapshots, rejects unavailable resolver versions, and separates cached
+  GPT measurements from new Jev inference.
 - Baseline preparation uses macOS/Linux file locks. Completed baselines and their
   input/history files are immutable; Jev-only criteria changes do not invalidate
   GPT, while GPT prompt/schema or evidence changes select a new baseline.
