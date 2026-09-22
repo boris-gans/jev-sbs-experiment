@@ -398,6 +398,26 @@ def decomposed_response_for(payload, *, missing: str | None = None):
     return {"model": payload["model"], "answers": answers, "usage": {"input_tokens": 100, "output_tokens": 0}}
 
 
+def decomposed_policy_rules(contract, probability=0.7, margin=0.1):
+    rule = {"min_probability": probability, "min_margin": margin}
+    return {
+        "identity": dict(rule),
+        "objectives": {
+            objective: {stream: dict(rule) for stream in streams}
+            for objective, streams in contract["objectives"].items()
+        },
+    }
+
+
+def decomposed_answer(label, labels, probability=0.8):
+    remainder = (1 - probability) / (len(labels) - 1)
+    return {
+        "label": label, "probabilities": {choice: probability if choice == label else remainder for choice in labels},
+        "confidence": probability, "probability_sum": 1.0,
+        "probability_rounding_warning": False, "choice_probability_warning": False,
+    }
+
+
 def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
     manifest, _ = prepared
     data = manifest["shops"]["furniture.co.uk"]
@@ -573,6 +593,141 @@ def test_decomposed_batch_retries_transport_failures_and_rejects_partial_choice_
         )
     assert failed["status"] == "error" and failed["error"] == "invalid_response"
     assert failed["answers"] == [] and failed["retries"] == 0
+
+
+def test_probability_policy_boundaries_are_inclusive_and_never_auto_selected():
+    answer = decomposed_answer("distinct", compare.IDENTITY_LABELS, probability=0.6)
+    accepted = compare.apply_probability_policy(answer, {"min_probability": 0.6, "min_margin": 0.5})
+    assert accepted["accepted"] and accepted["probability"] == pytest.approx(0.6)
+    assert accepted["margin"] == pytest.approx(0.5)
+    assert not compare.apply_probability_policy(
+        answer, {"min_probability": 0.600001, "min_margin": 0.5},
+    )["accepted"]
+    assert not compare.apply_probability_policy(
+        answer, {"min_probability": 0.6, "min_margin": 0.500001},
+    )["accepted"]
+
+
+def test_objective_specific_resolvers_gate_identity_and_preserve_conflicts():
+    contract = compare.decomposed_contract_snapshot()
+    rules = decomposed_policy_rules(contract, probability=0, margin=0)
+    complements = {
+        "identity": decomposed_answer("distinct", compare.IDENTITY_LABELS),
+        "together_use": decomposed_answer(
+            "accessory_component", tuple(contract["objectives"]["complements"]["together_use"]["criteria"]),
+        ),
+        "substitute": decomposed_answer(
+            "no_concrete_substitute", tuple(contract["objectives"]["complements"]["substitute"]["criteria"]),
+        ),
+        "incompatibility": decomposed_answer(
+            "no_explicit_mismatch", tuple(contract["objectives"]["complements"]["incompatibility"]["criteria"]),
+        ),
+    }
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", complements, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "positive" and not resolved["conflict"]
+
+    conflicting = copy.deepcopy(complements)
+    conflicting["substitute"] = decomposed_answer(
+        "same_immediate_purchasing_role",
+        tuple(contract["objectives"]["complements"]["substitute"]["criteria"]),
+    )
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", conflicting, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "conflict" and resolved["conflict"]
+    assert len(resolved["accepted_signals"]) == 2
+
+    hard_negative = copy.deepcopy(complements)
+    hard_negative["together_use"] = decomposed_answer(
+        "no_concrete_mechanism",
+        tuple(contract["objectives"]["complements"]["together_use"]["criteria"]),
+    )
+    hard_negative["substitute"] = conflicting["substitute"]
+    hard_negative["incompatibility"] = decomposed_answer(
+        "size_interface_mismatch",
+        tuple(contract["objectives"]["complements"]["incompatibility"]["criteria"]),
+    )
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", hard_negative, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "hard_negative" and len(resolved["accepted_signals"]) == 2
+
+    filtered = copy.deepcopy(complements)
+    filtered["identity"] = decomposed_answer("variant", compare.IDENTITY_LABELS)
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", filtered, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "skip" and resolved["identity_action"] == "filter"
+
+    style = {
+        "identity": decomposed_answer("distinct", compare.IDENTITY_LABELS),
+        "construction_finish": decomposed_answer(
+            "concrete_coordination",
+            tuple(contract["objectives"]["style_compatibility"]["construction_finish"]["criteria"]),
+        ),
+        "design_language": decomposed_answer(
+            "concrete_coordination",
+            tuple(contract["objectives"]["style_compatibility"]["design_language"]["criteria"]),
+        ),
+        "placement_context": decomposed_answer(
+            "no_concrete_evidence",
+            tuple(contract["objectives"]["style_compatibility"]["placement_context"]["criteria"]),
+        ),
+    }
+    resolved = compare.resolve_decomposed_judgment(
+        "style_compatibility", style, rules, compare.DECOMPOSED_STYLE_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "positive" and len(resolved["accepted_signals"]) == 2
+    style["placement_context"] = decomposed_answer(
+        "explicit_context_mismatch",
+        tuple(contract["objectives"]["style_compatibility"]["placement_context"]["criteria"]),
+    )
+    resolved = compare.resolve_decomposed_judgment(
+        "style_compatibility", style, rules, compare.DECOMPOSED_STYLE_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "conflict" and resolved["conflict"]
+
+
+def test_incomplete_review_and_cross_split_groups_cannot_drive_policy_curves():
+    contract = compare.decomposed_contract_snapshot()
+    evidence = [
+        {"pair_id": "development", "pair_group_id": "same", "split": "development",
+         "objective": "complements"},
+        {"pair_id": "holdout", "pair_group_id": "same", "split": "holdout",
+         "objective": "complements"},
+    ]
+    labels = [{"pair_id": "development", "split": "development", "identity": None,
+               "mechanisms": {}, "final_label": None}]
+    with pytest.raises(ValueError, match="cross development and holdout"):
+        compare.build_probability_curves({}, labels, evidence, contract)
+
+    evidence[1]["pair_group_id"] = "other"
+    with pytest.raises(ValueError, match="complete development review"):
+        compare.build_probability_curves({}, labels, evidence, contract)
+
+
+def test_human_metrics_keep_abstentions_in_coverage_and_use_human_labels_as_truth():
+    def classification(label, status="resolved", probability=0.8):
+        return {"resolution": {
+            "basket_label": label, "resolution_status": status, "conflict": label == "conflict",
+            "identity_action": "continue", "decision_probability": probability,
+        }}
+
+    rows = [
+        ({"final_label": "positive"}, classification("positive", probability=0.9)),
+        ({"final_label": "hard_negative"}, classification("hard_negative", probability=0.8)),
+        ({"final_label": "positive"}, classification("hard_negative", probability=0.7)),
+        ({"final_label": "skip"}, classification("skip", status="abstained", probability=None)),
+    ]
+    metrics = compare.metric_block(rows, allocated_cost=0.6)
+    assert metrics["precision"] == pytest.approx(2 / 3)
+    assert metrics["hard_negative_precision"] == pytest.approx(0.5)
+    assert metrics["coverage"] == pytest.approx(0.75)
+    assert metrics["abstentions"] == 1
+    assert metrics["cost_per_accepted_correct_label_usd"] == pytest.approx(0.3)
+    assert metrics["confusion_human_rows_jev_columns"]["positive"]["hard_negative"] == 1
 
 
 def write_adjudication_sources(manifest, first_path, second_path):
@@ -1873,7 +2028,7 @@ def test_baseline_recovers_checkpoint_before_interrupted_tail(baseline_seed, tmp
 
 
 def test_v3_jev_experiment_uses_stream_qualified_immutable_snapshots(
-        relation_baseline_ready, tmp_path, monkeypatch):
+        relation_baseline_ready, tmp_path, monkeypatch, capsys):
     relation_manifest, baseline_root, baseline_directory, baseline = relation_baseline_ready
     manifest = compare.decompose_relation_manifest(relation_manifest)
     first = tmp_path / "first/paired_results.csv"
@@ -1899,9 +2054,15 @@ def test_v3_jev_experiment_uses_stream_qualified_immutable_snapshots(
     )
 
     assert failures == 0 and len(calls) == 160
-    assert not (directory / "summary.json").exists()
+    raw_summary = json.loads((directory / "summary.json").read_text())
+    assert raw_summary["schema_version"] == compare.DECOMPOSED_REPORT_V1
+    assert raw_summary["run_complete"] and raw_summary["all_pairs_classified"]
+    assert raw_summary["policy"] == {"status": "not_selected", "auto_selection": False}
+    assert raw_summary["human_metrics"] == {"status": "unavailable"}
     assert {path.name for path in directory.iterdir()} == {
         "manifest.json", "baseline.json", "adjudication.json", "experiment.json", "requests.jsonl",
+        "gpt_classifications.jsonl", "jev_stream_classifications.jsonl", "paired_results.csv",
+        "disagreements.csv", "summary.json",
     }
     experiment = json.loads((directory / "experiment.json").read_text())
     assert experiment["schema_version"] == compare.JEV_EXPERIMENT_V3
@@ -1931,6 +2092,67 @@ def test_v3_jev_experiment_uses_stream_qualified_immutable_snapshots(
     assert {record["extraction_version"] for record in batches} == {compare.DECOMPOSED_EXTRACTION_V1}
     assert {str(path.relative_to(baseline_directory)): path.read_bytes()
             for path in baseline_directory.rglob("*") if path.is_file()} == baseline_files
+
+    reviewed = compare.jsonl_records(adjudication_dir / "labels-template.jsonl")
+    no_evidence = {
+        "together_use": "no_concrete_mechanism", "substitute": "no_concrete_substitute",
+        "incompatibility": "no_explicit_mismatch", "construction_finish": "no_concrete_evidence",
+        "design_language": "no_concrete_evidence", "placement_context": "no_concrete_evidence",
+    }
+    for row in reviewed:
+        row.update(
+            reviewed_at="2026-09-22T12:00:00+00:00", identity="distinct", final_label="skip",
+            ambiguity=False, review_notes="Synthetic complete review",
+        )
+        row["mechanisms"] = {stream: no_evidence[stream] for stream in row["mechanisms"]}
+    revision = compare.publish_adjudication_labels(adjudication_dir, reviewed, 1)
+    pre_policy = compare.write_decomposed_reports(
+        directory / "manifest.json", directory, adjudication_dir=adjudication_dir, review_revision=1,
+    )
+    assert pre_policy["human_metrics"]["holdout_status"] == "sealed"
+    assert not (directory / "review-labels.jsonl").exists()
+    curves = json.loads((directory / "probability-curves.json").read_text())
+    assert curves["streams"]["identity"]["reviewed_pairs"] == 48
+    pre_policy_rows = list(csv.DictReader((directory / "paired_results.csv").open()))
+    assert sum(bool(row["human_final_label"]) for row in pre_policy_rows) == 48
+    assert all(not row["human_final_label"] for row in pre_policy_rows if row["review_split"] != "development")
+    selection = {
+        "schema_version": compare.DECOMPOSED_POLICY_SELECTION_V1,
+        "chosen_by": "Boris", "chosen_at": "2026-09-22T13:00:00+00:00",
+        "rules": decomposed_policy_rules(manifest["decomposed_contract"]),
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "POLICY_THRESHOLD_GRID", (0.0,))
+        summary = compare.write_decomposed_reports(
+            directory / "manifest.json", directory, adjudication_dir=adjudication_dir,
+            review_revision=1, policy_selection=selection,
+        )
+    assert summary["policy"]["status"] == "selected"
+    assert summary["policy"]["policy"]["chosen_by"] == "Boris"
+    assert summary["probability_curves"]["selection_split"] == "development"
+    assert summary["human_metrics"]["development"]["reviewed"] == 48
+    assert summary["human_metrics"]["holdout"]["reviewed"] == 96
+    assert summary["human_metrics"]["holdout_not_used_for_selection"]
+    assert json.loads((directory / "probability-curves.json").read_text())["auto_selected_policy"] is None
+    assert json.loads((directory / "review-labels.manifest.json").read_text()) == revision
+    assert len(compare.jsonl_records(directory / "jev_stream_classifications.jsonl")) == 800
+    assert compare.write_decomposed_reports(directory / "manifest.json", directory) == summary
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "POLICY_THRESHOLD_GRID", (0.0,))
+        assert compare.write_decomposed_reports(directory / "manifest.json", directory) == summary
+    with monkeypatch.context() as patch:
+        patch.setattr(compare.httpx, "Client", lambda *args, **kwargs: pytest.fail("Report-only used network"))
+        patch.setattr("sys.argv", ["compare.py", "--report-only", "--output-dir", str(directory)])
+        compare.main()
+    assert "Reports rebuilt offline" in capsys.readouterr().out
+
+    changed_selection = copy.deepcopy(selection)
+    changed_selection["rules"]["identity"]["min_probability"] = 0.8
+    with pytest.raises(ValueError, match="Refusing to replace immutable baseline file"):
+        compare.write_decomposed_reports(
+            directory / "manifest.json", directory, adjudication_dir=adjudication_dir,
+            review_revision=1, policy_selection=changed_selection,
+        )
 
     log_path = directory / "requests.jsonl"
     original_log = log_path.read_bytes()

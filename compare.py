@@ -60,6 +60,10 @@ DECOMPOSED_EXTRACTION_V1 = "decomposed-choice-extraction-v1"
 DECOMPOSED_EXTRACTION_VERSION = DECOMPOSED_EXTRACTION_V1
 DECOMPOSED_PROBABILITY_SUM_TOLERANCE_V1 = 0.015
 DECOMPOSED_CHOICE_MAX_TOLERANCE_V1 = 0.01
+DECOMPOSED_POLICY_SELECTION_V1 = "decomposed-probability-policy-selection-v1"
+DECOMPOSED_POLICY_V1 = "decomposed-probability-policy-v1"
+DECOMPOSED_REPORT_V1 = "jev-sbs-decomposed-report-v1"
+POLICY_THRESHOLD_GRID = tuple(value / 20 for value in range(21))
 ADJUDICATION_SCHEMA_VERSION = "jev-sbs-adjudication-v1"
 ADJUDICATION_SEED = "FERODEV-8283-adjudication-v1"
 GPT_INPUT_V1 = "gpt-input-v1"
@@ -1159,6 +1163,157 @@ def resolve_basket_judgment(answer: dict, resolver_version: str = RESOLVER_VERSI
     return RESOLVERS[resolver_version](answer)
 
 
+def validate_probability_rule(rule: object) -> dict:
+    require(isinstance(rule, dict) and set(rule) == {"min_probability", "min_margin"},
+            "Probability rules require min_probability and min_margin")
+    for field in ("min_probability", "min_margin"):
+        value = rule[field]
+        require(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1,
+                f"Invalid probability-policy threshold: {field}")
+    return {field: float(rule[field]) for field in ("min_probability", "min_margin")}
+
+
+def validate_probability_rules(rules: object, contract: dict) -> dict:
+    require(isinstance(rules, dict) and set(rules) == {"identity", "objectives"},
+            "Probability policy requires identity and objectives rules")
+    objectives = rules["objectives"]
+    require(isinstance(objectives, dict) and set(objectives) == set(contract["objectives"]),
+            "Probability-policy objective coverage mismatch")
+    normalized = {"identity": validate_probability_rule(rules["identity"]), "objectives": {}}
+    for objective, streams in contract["objectives"].items():
+        supplied = objectives[objective]
+        require(isinstance(supplied, dict) and set(supplied) == set(streams),
+                f"Probability-policy stream coverage mismatch: {objective}")
+        normalized["objectives"][objective] = {
+            stream: validate_probability_rule(supplied[stream]) for stream in streams
+        }
+    return normalized
+
+
+def probability_margin(answer: dict) -> tuple[float, float]:
+    label = answer["label"]
+    probabilities = answer["probabilities"]
+    require(isinstance(probabilities, dict) and label in probabilities, "Missing selected-label probability")
+    selected = probabilities[label]
+    alternatives = [value for choice, value in probabilities.items() if choice != label]
+    require(bool(alternatives), "Probability policy requires at least two choices")
+    return selected, selected - max(alternatives)
+
+
+def apply_probability_policy(answer: dict, rule: dict) -> dict:
+    normalized = validate_probability_rule(rule)
+    probability, margin = probability_margin(answer)
+    accepted = (probability >= normalized["min_probability"] - 1e-12
+                and margin >= normalized["min_margin"] - 1e-12)
+    return {
+        "label": answer["label"],
+        "accepted": accepted,
+        "status": "accepted" if accepted else "abstained",
+        "probability": probability,
+        "margin": margin,
+        "min_probability": normalized["min_probability"],
+        "min_margin": normalized["min_margin"],
+        "confidence": answer["confidence"],
+        "probability_rounding_warning": answer.get("probability_rounding_warning", False),
+        "choice_probability_warning": answer.get("choice_probability_warning", False),
+    }
+
+
+def resolve_decomposed_v1(objective: str, answers: dict, rules: dict, contract: dict) -> dict:
+    require(objective in contract["objectives"], "Unsupported decomposed objective")
+    require(set(answers) == set(decomposed_stream_names(contract, objective)),
+            "Incomplete decomposed resolver inputs")
+    normalized_rules = validate_probability_rules(rules, contract)
+    decisions = {
+        "identity": apply_probability_policy(answers["identity"], normalized_rules["identity"]),
+        **{
+            stream: apply_probability_policy(answer, normalized_rules["objectives"][objective][stream])
+            for stream, answer in answers.items() if stream != "identity"
+        },
+    }
+    identity = decisions["identity"]
+    result = {
+        "resolver_version": contract["resolver_versions"][objective],
+        "identity_action": None,
+        "basket_label": "skip",
+        "resolution_status": None,
+        "resolution": None,
+        "conflict": False,
+        "accepted_signals": [],
+        "abstentions": [stream for stream, decision in decisions.items() if not decision["accepted"]],
+        "decisions": decisions,
+        "decision_probability": None,
+    }
+    if not identity["accepted"]:
+        result.update(identity_action="abstain", resolution_status="abstained",
+                      resolution="identity_probability_abstention")
+        return result
+    if identity["label"] != "distinct":
+        status = "abstained" if identity["label"] == "uncertain" else "filtered"
+        action = "abstain" if identity["label"] == "uncertain" else "filter"
+        result.update(identity_action=action, resolution_status=status,
+                      resolution=f"identity_{status}_{identity['label']}")
+        return result
+    result["identity_action"] = "continue"
+    positive, negative = [], []
+    accepted = {stream: decision["label"] for stream, decision in decisions.items()
+                if stream != "identity" and decision["accepted"]}
+    if objective == "complements":
+        together = accepted.get("together_use")
+        if together is not None and together != "no_concrete_mechanism":
+            positive.append(f"together_use:{together}")
+        if accepted.get("substitute") == "same_immediate_purchasing_role":
+            negative.append("substitute:same_immediate_purchasing_role")
+        mismatch = accepted.get("incompatibility")
+        if mismatch is not None and mismatch != "no_explicit_mismatch":
+            negative.append(f"incompatibility:{mismatch}")
+    else:
+        require(objective == "style_compatibility", "Unsupported decomposed objective")
+        for stream, label in accepted.items():
+            if label in {"concrete_coordination", "compatible_context"}:
+                positive.append(f"{stream}:{label}")
+            elif label in {"explicit_mismatch", "explicit_context_mismatch"}:
+                negative.append(f"{stream}:{label}")
+    result["accepted_signals"] = [*positive, *negative]
+    signal_decisions = [decisions[signal.split(":", 1)[0]] for signal in result["accepted_signals"]]
+    if signal_decisions:
+        result["decision_probability"] = min([identity["probability"],
+                                               *(decision["probability"] for decision in signal_decisions)])
+    if positive and negative:
+        result.update(basket_label="conflict", resolution_status="conflict",
+                      resolution="conflicting_objective_signals", conflict=True)
+    elif positive:
+        result.update(basket_label="positive", resolution_status="resolved",
+                      resolution="objective_positive")
+    elif negative:
+        result.update(basket_label="hard_negative", resolution_status="resolved",
+                      resolution="objective_hard_negative")
+    elif result["abstentions"]:
+        result.update(resolution_status="abstained", resolution="no_accepted_objective_signal")
+    else:
+        result.update(resolution_status="resolved", resolution="no_objective_signal")
+    return result
+
+
+DECOMPOSED_RESOLVERS = {
+    DECOMPOSED_COMPLEMENTS_RESOLVER_V1: lambda answers, rules, contract: resolve_decomposed_v1(
+        "complements", answers, rules, contract,
+    ),
+    DECOMPOSED_STYLE_RESOLVER_V1: lambda answers, rules, contract: resolve_decomposed_v1(
+        "style_compatibility", answers, rules, contract,
+    ),
+}
+
+
+def resolve_decomposed_judgment(objective: str, answers: dict, rules: dict, resolver_version: str,
+                                contract: dict | None = None) -> dict:
+    contract = decomposed_contract_snapshot() if contract is None else contract
+    require(contract["resolver_versions"].get(objective) == resolver_version
+            and resolver_version in DECOMPOSED_RESOLVERS,
+            f"Unsupported saved decomposed resolver version: {resolver_version}")
+    return DECOMPOSED_RESOLVERS[resolver_version](answers, rules, contract)
+
+
 def extraction_status(answers: list, expected_count: int) -> tuple[str, str | None]:
     if len(answers) == expected_count:
         return "ok", None
@@ -1815,6 +1970,73 @@ def publish_adjudication_labels(directory: Path, records: list[dict], revision: 
     return revision_manifest
 
 
+def load_adjudication_revision(directory: Path, revision: int) -> tuple[dict, list[dict], dict, bytes, bytes]:
+    require(type(revision) is int and revision > 0, "Label revision must be positive")
+    artifact, evidence, manifest_digest = validate_adjudication_artifact(directory)
+    labels_path = directory / f"labels-v{revision}.jsonl"
+    revision_path = directory / f"labels-v{revision}.manifest.json"
+    require(labels_path.is_file() and revision_path.is_file(), f"Missing label revision {revision}")
+    labels_bytes, revision_bytes = labels_path.read_bytes(), revision_path.read_bytes()
+    labels = [strict_json(line) for line in labels_bytes.decode("utf-8").splitlines() if line.strip()]
+    revision_manifest = strict_json(revision_bytes.decode("utf-8"))
+    require(previous_review_revision(directory, artifact, revision + 1, manifest_digest) == sha256(labels_bytes),
+            "Label revision chain mismatch")
+    require(revision_manifest["labels_sha256"] == sha256(labels_bytes), "Label revision digest mismatch")
+    require(set(index_records(labels, "pair_id")) == set(index_records(evidence, "pair_id")),
+            "Label revision pair coverage mismatch")
+    return artifact, evidence, revision_manifest, labels_bytes, revision_bytes
+
+
+def load_experiment_review_revision(directory: Path, revision: int,
+                                    experiment: dict) -> tuple[list[dict], list[dict], dict]:
+    artifact, evidence, revision_manifest, labels_bytes, _ = load_adjudication_revision(
+        directory, revision,
+    )
+    saved = experiment["adjudication"]
+    require(artifact["artifact_id"] == saved["artifact_id"], "Review artifact identity mismatch")
+    require(revision_manifest["artifact_manifest_sha256"] == saved["manifest_sha256"],
+            "Review artifact manifest mismatch")
+    require(artifact["evidence_sha256"] == saved["evidence_sha256"], "Review evidence mismatch")
+    return ([strict_json(line) for line in labels_bytes.decode("utf-8").splitlines() if line.strip()],
+            evidence, revision_manifest)
+
+
+def snapshot_review(output_dir: Path, labels: list[dict], evidence: list[dict],
+                    revision_manifest: dict) -> None:
+    labels_bytes = b"".join(canonical_json(row) + b"\n" for row in labels)
+    evidence_bytes = b"".join(canonical_json(row) + b"\n" for row in evidence)
+    require(sha256(labels_bytes) == revision_manifest["labels_sha256"], "Review snapshot labels mismatch")
+    require(sha256(evidence_bytes) == revision_manifest["evidence_sha256"], "Review snapshot evidence mismatch")
+    immutable_bytes(output_dir / "review-labels.jsonl", labels_bytes)
+    immutable_bytes(output_dir / "review-labels.manifest.json", (
+        json.dumps(revision_manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode())
+    immutable_bytes(output_dir / "review-evidence.jsonl", evidence_bytes)
+
+
+def load_saved_review(output_dir: Path, experiment: dict) -> tuple[list[dict], list[dict], dict] | None:
+    paths = tuple(output_dir / name for name in (
+        "review-labels.jsonl", "review-labels.manifest.json", "review-evidence.jsonl",
+    ))
+    if not any(path.exists() for path in paths):
+        return None
+    require(all(path.is_file() for path in paths), "Incomplete saved review snapshot")
+    labels, evidence = jsonl_records(paths[0]), jsonl_records(paths[2])
+    revision_manifest = strict_json(paths[1].read_text(encoding="utf-8"))
+    saved = experiment["adjudication"]
+    require(revision_manifest.get("artifact_id") == saved["artifact_id"], "Saved review identity mismatch")
+    require(revision_manifest.get("artifact_manifest_sha256") == saved["manifest_sha256"],
+            "Saved review manifest mismatch")
+    require(revision_manifest.get("labels_sha256") == sha256(paths[0].read_bytes()),
+            "Saved review labels changed")
+    require(revision_manifest.get("evidence_sha256") == saved["evidence_sha256"],
+            "Saved review evidence mismatch")
+    require(sha256(paths[2].read_bytes()) == saved["evidence_sha256"], "Saved review evidence changed")
+    require(set(index_records(labels, "pair_id")) == set(index_records(evidence, "pair_id")),
+            "Saved review pair coverage mismatch")
+    return labels, evidence, revision_manifest
+
+
 def check_baseline_record(record: dict, expected: dict) -> dict:
     key = (record["shop"], record["batch_id"])
     require(record["provider"] == "gpt" and key in expected, "Unknown GPT baseline batch")
@@ -2121,7 +2343,7 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
     if schema in {MANIFEST_V1, MANIFEST_V2}:
         write_reports(directory / "manifest.json", directory)
     else:
-        validate_v3_experiment_log(directory)
+        write_decomposed_reports(directory / "manifest.json", directory)
     return directory, failures
 
 
@@ -2452,8 +2674,8 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
         "partial_batches": sum(record["status"] == "partial" for record in records),
         "reextracted_batches": sum("recorded_status" in record for record in records),
         "probability_rounding_warnings": sum(
-            answer.get("probability_rounding_warning", False) if schema_version == MANIFEST_V1
-            else relation_probability_warnings(answer)
+            relation_probability_warnings(answer) if schema_version == MANIFEST_V2
+            else answer.get("probability_rounding_warning", False)
             for answer in successes
         ),
         "successful_pairs": len(successes), "failed_pairs": recorded_pairs - len(successes),
@@ -2478,12 +2700,17 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
     }
     if schema_version == MANIFEST_V1:
         result["label_counts"] = {label: sum(answer["label"] == label for answer in successes) for label in LABELS}
-    else:
-        require(schema_version == MANIFEST_V2, "Unsupported manifest schema")
+    elif schema_version == MANIFEST_V2:
         result["choice_probability_warnings"] = sum(
             relation_choice_probability_warnings(answer) for answer in successes
         )
         result.update(relation_distribution(successes, resolver_version))
+    else:
+        require(schema_version == MANIFEST_V3, "Unsupported manifest schema")
+        result["choice_probability_warnings"] = sum(
+            answer.get("choice_probability_warning", False) for answer in successes
+        )
+        result["choice_counts"] = dict(sorted(Counter(answer["label"] for answer in successes).items()))
     return result
 
 
@@ -2939,11 +3166,553 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
     return summary
 
 
-def write_reports(manifest_path: Path, output_dir: Path) -> dict:
+def decomposed_classifications(manifest: dict, records: list[dict]) -> dict:
+    observed = {
+        (record["shop"], record["stream"], record["batch_id"]): record
+        for record in records if record["record_type"] == "batch"
+    }
+    result = {}
+    contract = manifest["decomposed_contract"]
+    for shop, data in manifest["shops"].items():
+        streams = decomposed_stream_names(contract, data["objective"])
+        for batch in data["batches"]:
+            by_stream = {
+                stream: observed.get((shop, stream, batch["batch_id"])) for stream in streams
+            }
+            answers = {
+                stream: index_records(record["answers"], "pair_id") if record else {}
+                for stream, record in by_stream.items()
+            }
+            for item in batch["candidates"]:
+                stream_rows = {}
+                for stream in streams:
+                    record, answer = by_stream[stream], answers[stream].get(item["pair_id"])
+                    stream_rows[stream] = {
+                        "status": "ok" if answer else ("error" if record else "missing"),
+                        "error": None if answer else (
+                            "missing_candidate_answer" if record and record["status"] == "partial"
+                            else record["error"] if record else "batch_not_recorded"
+                        ),
+                        "recorded_batch_status": record.get("recorded_status", record["status"]) if record else None,
+                        "served_model": record["served_model"] if record else None,
+                        **({key: copy.deepcopy(answer[key]) for key in (
+                            "label", "probabilities", "confidence", "probability_sum",
+                            "probability_rounding_warning", "choice_probability_warning",
+                        )} if answer else {key: None for key in (
+                            "label", "probabilities", "confidence", "probability_sum",
+                            "probability_rounding_warning", "choice_probability_warning",
+                        )}),
+                    }
+                result[item["pair_id"]] = {
+                    "provider": "jev", "shop": shop, "objective": data["objective"],
+                    "direction": batch["direction"], "pair_id": item["pair_id"],
+                    "batch_id": batch["batch_id"], "anchor_id": batch["anchor_id"],
+                    "candidate_id": item["candidate_id"], "streams": stream_rows,
+                    "status": "ok" if all(row["status"] == "ok" for row in stream_rows.values()) else "incomplete",
+                    "resolution": None,
+                }
+    return result
+
+
+def completed_review_rows(labels: list[dict], evidence: list[dict], contract: dict,
+                          split: str) -> tuple[list[tuple[dict, dict]], bool]:
+    require(split in {"development", "holdout"}, "Invalid review split")
+    by_pair = index_records(labels, "pair_id")
+    selected = []
+    complete = True
+    development_groups, holdout_groups = set(), set()
+    for row in evidence:
+        group_target = development_groups if row["split"] == "development" else holdout_groups
+        group_target.add(row["pair_group_id"])
+        if row["split"] != split:
+            continue
+        review = by_pair.get(row["pair_id"])
+        if review is None or review.get("split") != split:
+            complete = False
+            continue
+        streams = set(decomposed_stream_names(contract, row["objective"])) - {"identity"}
+        if (review.get("identity") not in IDENTITY_LABELS
+                or review.get("final_label") not in BASKET_LABELS
+                or not isinstance(review.get("mechanisms"), dict)
+                or set(review["mechanisms"]) != streams
+                or any(review["mechanisms"][stream] not in contract["objectives"][row["objective"]][stream]["criteria"]
+                       for stream in streams)):
+            complete = False
+            continue
+        selected.append((row, review))
+    require(not development_groups & holdout_groups, "Review groups cross development and holdout")
+    return selected, complete and len(selected) == sum(row["split"] == split for row in evidence)
+
+
+def curve_points(examples: list[tuple[dict, str]]) -> list[dict]:
+    points = []
+    total = len(examples)
+    for minimum_probability in POLICY_THRESHOLD_GRID:
+        for minimum_margin in POLICY_THRESHOLD_GRID:
+            accepted = [
+                (answer, expected) for answer, expected in examples
+                if probability_margin(answer)[0] >= minimum_probability - 1e-12
+                and probability_margin(answer)[1] >= minimum_margin - 1e-12
+            ]
+            correct = sum(answer["label"] == expected for answer, expected in accepted)
+            points.append({
+                "min_probability": minimum_probability,
+                "min_margin": minimum_margin,
+                "accepted": len(accepted),
+                "correct": correct,
+                "incorrect": len(accepted) - correct,
+                "precision": correct / len(accepted) if accepted else None,
+                "coverage": len(accepted) / total if total else None,
+                "abstentions": total - len(accepted),
+            })
+    return points
+
+
+def build_probability_curves(classifications: dict, labels: list[dict], evidence: list[dict],
+                             contract: dict) -> dict:
+    reviewed, complete = completed_review_rows(labels, evidence, contract, "development")
+    require(complete, "Probability curves require complete development review")
+    identity_examples = []
+    for evidence_row, review in reviewed:
+        classification = classifications.get(evidence_row["pair_id"])
+        require(classification is not None and classification["objective"] == evidence_row["objective"],
+                "Development review/classification mismatch")
+        answer = classification["streams"]["identity"]
+        require(answer["status"] == "ok", "Probability curves require complete development inference")
+        identity_examples.append((answer, review["identity"]))
+    streams = {
+        "identity": {
+            "objective": "all", "stream": "identity", "reviewed_pairs": len(identity_examples),
+            "points": curve_points(identity_examples),
+        },
+    }
+    for objective in contract["objectives"]:
+        objective_rows = [(row, review) for row, review in reviewed if row["objective"] == objective]
+        for stream in decomposed_stream_names(contract, objective)[1:]:
+            examples = []
+            for evidence_row, review in objective_rows:
+                classification = classifications.get(evidence_row["pair_id"])
+                require(classification is not None and classification["objective"] == objective,
+                        "Development review/classification mismatch")
+                answer = classification["streams"][stream]
+                require(answer["status"] == "ok", "Probability curves require complete development inference")
+                expected = review["identity"] if stream == "identity" else review["mechanisms"][stream]
+                examples.append((answer, expected))
+            streams[f"{objective}/{stream}"] = {
+                "objective": objective, "stream": stream, "reviewed_pairs": len(examples),
+                "points": curve_points(examples),
+            }
+    return {
+        "schema_version": "decomposed-probability-curves-v1",
+        "selection_split": "development",
+        "threshold_grid": list(POLICY_THRESHOLD_GRID),
+        "reviewed_pairs": len(reviewed),
+        "streams": streams,
+        "auto_selected_policy": None,
+    }
+
+
+def validate_policy_selection(selection: object, contract: dict) -> dict:
+    require(isinstance(selection, dict) and set(selection) == {
+        "schema_version", "chosen_by", "chosen_at", "rules",
+    }, "Invalid probability-policy selection")
+    require(selection["schema_version"] == DECOMPOSED_POLICY_SELECTION_V1,
+            "Unsupported probability-policy selection")
+    require(selection["chosen_by"] == "Boris", "Probability policy must be chosen by Boris")
+    require(isinstance(selection["chosen_at"], str) and bool(selection["chosen_at"]),
+            "Probability policy requires chosen_at")
+    try:
+        chosen_at = datetime.fromisoformat(selection["chosen_at"].replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("Invalid probability-policy chosen_at") from None
+    require(chosen_at.tzinfo is not None, "Probability-policy chosen_at must include a timezone")
+    return {
+        "schema_version": DECOMPOSED_POLICY_SELECTION_V1,
+        "chosen_by": "Boris",
+        "chosen_at": selection["chosen_at"],
+        "rules": validate_probability_rules(selection["rules"], contract),
+    }
+
+
+def policy_identity(output_dir: Path, experiment: dict, review_manifest: dict,
+                    curves_bytes: bytes, selection: dict) -> dict:
+    return {
+        "schema_version": DECOMPOSED_POLICY_V1,
+        "chosen_by": selection["chosen_by"],
+        "chosen_at": selection["chosen_at"],
+        "selection_source": "development-only",
+        "selection_sha256": sha256(canonical_json(selection)),
+        "rules": selection["rules"],
+        "manifest_sha256": experiment["manifest_sha256"],
+        "experiment_sha256": sha256((output_dir / "experiment.json").read_bytes()),
+        "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes()),
+        "adjudication_artifact_id": review_manifest["artifact_id"],
+        "adjudication_manifest_sha256": review_manifest["artifact_manifest_sha256"],
+        "review_revision": review_manifest["revision"],
+        "review_labels_sha256": review_manifest["labels_sha256"],
+        "review_evidence_sha256": review_manifest["evidence_sha256"],
+        "probability_curves_sha256": sha256(curves_bytes),
+        "resolver_versions": experiment["resolver_versions"],
+    }
+
+
+def publish_probability_policy(output_dir: Path, selection: dict, experiment: dict,
+                               review_manifest: dict, curves_bytes: bytes) -> dict:
+    normalized = validate_policy_selection(selection, experiment["decomposed_contract"])
+    identity = policy_identity(output_dir, experiment, review_manifest, curves_bytes, normalized)
+    policy = {
+        **identity,
+        "policy_id": f"{DECOMPOSED_POLICY_V1}-{sha256(canonical_json(identity))[:12]}",
+    }
+    content = (json.dumps(policy, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+    immutable_bytes(output_dir / "probability-policy.json", content)
+    return policy
+
+
+def load_probability_policy(output_dir: Path, experiment: dict, review_manifest: dict,
+                            curves_bytes: bytes) -> dict | None:
+    path = output_dir / "probability-policy.json"
+    if not path.exists():
+        return None
+    policy = strict_json(path.read_text(encoding="utf-8"))
+    require(isinstance(policy, dict) and policy.get("schema_version") == DECOMPOSED_POLICY_V1,
+            "Invalid saved probability policy")
+    selection = validate_policy_selection({
+        "schema_version": DECOMPOSED_POLICY_SELECTION_V1,
+        "chosen_by": policy.get("chosen_by"), "chosen_at": policy.get("chosen_at"),
+        "rules": policy.get("rules"),
+    }, experiment["decomposed_contract"])
+    identity = policy_identity(output_dir, experiment, review_manifest, curves_bytes, selection)
+    expected = {**identity, "policy_id": f"{DECOMPOSED_POLICY_V1}-{sha256(canonical_json(identity))[:12]}"}
+    require(policy == expected, "Saved probability policy no longer matches its evidence")
+    return policy
+
+
+def metric_block(rows: list[tuple[dict, dict]], allocated_cost: float | None = None) -> dict:
+    expected = len(rows)
+    complete_rows = [(review, classification) for review, classification in rows
+                     if review.get("final_label") in BASKET_LABELS and classification.get("resolution") is not None]
+    if len(complete_rows) != expected:
+        return {"status": "incomplete", "expected": expected, "complete": len(complete_rows)}
+    accepted = [(review, classification) for review, classification in complete_rows
+                if classification["resolution"]["basket_label"] in {"positive", "hard_negative"}]
+    correct = sum(review["final_label"] == classification["resolution"]["basket_label"]
+                  for review, classification in accepted)
+    hard_negative = [(review, classification) for review, classification in accepted
+                     if classification["resolution"]["basket_label"] == "hard_negative"]
+    labels = (*BASKET_LABELS, "unavailable")
+    calibration = []
+    for lower in (0.0, 0.2, 0.4, 0.6, 0.8):
+        upper = lower + 0.2
+        bucket = [(review, classification) for review, classification in accepted
+                  if classification["resolution"]["decision_probability"] is not None
+                  and lower <= classification["resolution"]["decision_probability"]
+                  and (classification["resolution"]["decision_probability"] < upper or upper >= 1)]
+        calibration.append({
+            "lower": lower, "upper": min(upper, 1.0), "count": len(bucket),
+            "mean_probability": statistics.fmean(
+                classification["resolution"]["decision_probability"] for _, classification in bucket
+            ) if bucket else None,
+            "accuracy": sum(review["final_label"] == classification["resolution"]["basket_label"]
+                            for review, classification in bucket) / len(bucket) if bucket else None,
+        })
+    result = {
+        "status": "complete", "reviewed": expected, "accepted": len(accepted),
+        "accepted_correct": correct, "precision": correct / len(accepted) if accepted else None,
+        "hard_negative_precision": (
+            sum(review["final_label"] == "hard_negative" for review, _ in hard_negative) / len(hard_negative)
+            if hard_negative else None
+        ),
+        "coverage": len(accepted) / expected if expected else None,
+        "abstentions": sum(classification["resolution"]["resolution_status"] == "abstained"
+                           for _, classification in complete_rows),
+        "conflicts": sum(classification["resolution"]["conflict"] for _, classification in complete_rows),
+        "identity_filtered": sum(classification["resolution"]["identity_action"] == "filter"
+                                 for _, classification in complete_rows),
+        "confusion_human_rows_jev_columns": {
+            human: {predicted: sum(review["final_label"] == human
+                                   and classification["resolution"]["basket_label"] == predicted
+                                   for review, classification in complete_rows)
+                    for predicted in labels}
+            for human in BASKET_LABELS
+        },
+        "calibration": calibration,
+    }
+    result["allocated_inference_cost_usd"] = allocated_cost
+    result["cost_per_accepted_correct_label_usd"] = (
+        allocated_cost / correct if allocated_cost is not None and correct else None
+    )
+    return result
+
+
+def evaluate_human_metrics(classifications: dict, labels: list[dict], evidence: list[dict],
+                           contract: dict, split: str, allocated_cost: float | None = None) -> dict:
+    reviewed, complete = completed_review_rows(labels, evidence, contract, split)
+    indexed = [(review, classifications.get(row["pair_id"], {})) for row, review in reviewed]
+    if not complete:
+        return {"status": "incomplete", "expected": sum(row["split"] == split for row in evidence),
+                "complete": len(reviewed)}
+    result = metric_block(indexed, allocated_cost)
+    result["slices"] = {
+        "objective": {
+            objective: metric_block([(review, classification) for review, classification in indexed
+                                     if classification["objective"] == objective])
+            for objective in contract["objectives"]
+        },
+        "shop": {
+            shop: metric_block([(review, classification) for review, classification in indexed
+                                if classification["shop"] == shop])
+            for shop in sorted({classification["shop"] for _, classification in indexed})
+        },
+        "direction": {
+            direction: metric_block([(review, classification) for review, classification in indexed
+                                     if classification["direction"] == direction])
+            for direction in ("forward", "reverse")
+        },
+    }
+    return result
+
+
+def write_decomposed_reports(manifest_path: Path, output_dir: Path, *,
+                             adjudication_dir: Path | None = None, review_revision: int | None = None,
+                             policy_selection: dict | None = None) -> dict:
+    raw_manifest = manifest_path.read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V3, "Expected decomposed report manifest")
+    experiment, baseline = validate_v3_experiment_log(output_dir)
+    records, truncated = read_request_log(output_dir / "requests.jsonl")
+    classifications = decomposed_classifications(manifest, records)
+    contract = experiment["decomposed_contract"]
+    saved_review = load_saved_review(output_dir, experiment)
+    external_review = None
+    if review_revision is not None:
+        require(adjudication_dir is not None, "Review revision requires an adjudication directory")
+        external_review = load_experiment_review_revision(adjudication_dir, review_revision, experiment)
+    review = external_review or saved_review
+    require(policy_selection is None or review is not None,
+            "Probability-policy selection requires a saved review revision")
+    policy_path, curves_path = output_dir / "probability-policy.json", output_dir / "probability-curves.json"
+    curves, curves_bytes, policy = None, None, None
+    if policy_path.exists():
+        require(review is not None and curves_path.is_file(),
+                "Saved probability policy requires its review and curve snapshots")
+        labels, evidence, review_manifest = review
+        curves_bytes = curves_path.read_bytes()
+        curves = strict_json(curves_bytes.decode("utf-8"))
+        if policy_selection is not None:
+            publish_probability_policy(output_dir, policy_selection, experiment, review_manifest, curves_bytes)
+        policy = load_probability_policy(output_dir, experiment, review_manifest, curves_bytes)
+        if saved_review is None:
+            require(external_review is not None and policy_selection is not None,
+                    "Recovering a policy review snapshot requires the original selection input")
+            snapshot_review(output_dir, labels, evidence, review_manifest)
+            saved_review = load_saved_review(output_dir, experiment)
+            labels, evidence, review_manifest = saved_review
+            review = saved_review
+    elif review is not None:
+        labels, evidence, review_manifest = review
+        curve_context = {
+            "review_revision": review_manifest["revision"],
+            "review_labels_sha256": review_manifest["labels_sha256"],
+            "review_evidence_sha256": review_manifest["evidence_sha256"],
+            "manifest_sha256": experiment["manifest_sha256"],
+            "experiment_sha256": sha256((output_dir / "experiment.json").read_bytes()),
+            "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes()),
+        }
+        if curves_path.exists():
+            curves_bytes = curves_path.read_bytes()
+            curves = strict_json(curves_bytes.decode("utf-8"))
+            require(all(curves.get(key) == value for key, value in curve_context.items()),
+                    "Saved probability curves no longer match their evidence")
+        else:
+            curves = build_probability_curves(classifications, labels, evidence, contract)
+            curves.update(curve_context)
+            curves_bytes = (json.dumps(curves, indent=2, sort_keys=True, ensure_ascii=False,
+                                       allow_nan=False) + "\n").encode()
+            immutable_bytes(curves_path, curves_bytes)
+        if policy_selection is not None:
+            policy = publish_probability_policy(
+                output_dir, policy_selection, experiment, review_manifest, curves_bytes,
+            )
+            snapshot_review(output_dir, labels, evidence, review_manifest)
+            saved_review = load_saved_review(output_dir, experiment)
+            labels, evidence, review_manifest = saved_review
+            review = saved_review
+    else:
+        labels, evidence, review_manifest, policy = None, None, None, None
+    if policy is not None:
+        for classification in classifications.values():
+            if classification["status"] != "ok":
+                continue
+            answers = {stream: row for stream, row in classification["streams"].items()}
+            objective = classification["objective"]
+            classification["resolution"] = resolve_decomposed_judgment(
+                objective, answers, policy["rules"], experiment["resolver_versions"][objective], contract,
+            )
+
+    starts = {(record["shop"], record["stream"]): record for record in records
+              if record["record_type"] == "group_start"}
+    ends = {(record["shop"], record["stream"]): record for record in records
+            if record["record_type"] == "group_end"}
+    batches = {(record["shop"], record["stream"], record["batch_id"]): record for record in records
+               if record["record_type"] == "batch"}
+    groups = {}
+    for shop, data in manifest["shops"].items():
+        for stream in decomposed_stream_names(contract, data["objective"]):
+            rows = [batches[shop, stream, batch["batch_id"]] for batch in data["batches"]]
+            groups[f"jev/{shop}/{stream}"] = summarize_group(
+                "jev", rows, data["batches"], ends.get((shop, stream)) if (shop, stream) in starts else None,
+                manifest["concurrency"], experiment["pricing"], MANIFEST_V3,
+            )
+    costs = [group["cost_estimate"]["total_usd"] for group in groups.values()]
+    total_cost = math.fsum(costs) if all(cost is not None for cost in costs) else None
+    gpt = {}
+    for answer in baseline["classifications"]:
+        gpt[answer["pair_id"]] = {
+            **answer, "resolution": resolve_basket_judgment(answer, manifest["contract"]["resolver_version"]),
+        }
+    visible_reviews = ([row for row in labels if policy is not None or row["split"] == "development"]
+                       if labels is not None else [])
+    review_by_pair = index_records(visible_reviews, "pair_id")
+    paired = []
+    for pair_id, classification in classifications.items():
+        baseline_row = gpt[pair_id]
+        data = manifest["shops"][classification["shop"]]
+        anchor = data["products"][classification["anchor_id"]]
+        candidate = data["products"][classification["candidate_id"]]
+        resolution = classification["resolution"]
+        review_row = review_by_pair.get(pair_id)
+        row = {
+            "pair_id": pair_id, "shop": classification["shop"], "objective": classification["objective"],
+            "direction": classification["direction"], "anchor_id": classification["anchor_id"],
+            "candidate_id": classification["candidate_id"], "anchor_name": anchor["name"],
+            "anchor_category": anchor["category"], "anchor_description": anchor["description"],
+            "candidate_name": candidate["name"], "candidate_category": candidate["category"],
+            "candidate_description": candidate["description"], "jev_status": classification["status"],
+            "gpt_basket_label": baseline_row["resolution"]["basket_label"],
+            "jev_basket_label": resolution["basket_label"] if resolution else None,
+            "jev_resolution_status": resolution["resolution_status"] if resolution else None,
+            "jev_conflict": resolution["conflict"] if resolution else None,
+            "gpt_agreement": (baseline_row["resolution"]["basket_label"] == resolution["basket_label"]
+                              if resolution else None),
+            "review_split": review_row["split"] if review_row else None,
+            "human_final_label": review_row["final_label"] if review_row else None,
+            "human_agreement": (review_row["final_label"] == resolution["basket_label"]
+                                if review_row and resolution else None),
+        }
+        for stream, answer in classification["streams"].items():
+            flatten_relation_judgment(row, "jev", stream, answer if answer["status"] == "ok" else None)
+            decision = resolution["decisions"][stream] if resolution else None
+            row[f"jev_{stream}_policy_status"] = decision["status"] if decision else None
+            row[f"jev_{stream}_policy_margin"] = decision["margin"] if decision else None
+        paired.append(row)
+    agreement = {}
+    if policy is not None:
+        for shop in manifest["shops"]:
+            eligible = [row for row in paired if row["shop"] == shop and row["jev_basket_label"] is not None]
+            agreement[shop] = relation_agreement(
+                eligible, "gpt_basket_label", "jev_basket_label", BASKET_LABELS,
+            )
+    human_metrics = {"status": "unavailable"}
+    if review is not None and policy is None:
+        human_metrics = {"status": "awaiting_policy", "development_review_complete": True,
+                         "holdout_not_used_for_selection": True, "holdout_status": "sealed"}
+    elif review is not None:
+        development_count = sum(row["split"] == "development" for row in evidence)
+        holdout_count = sum(row["split"] == "holdout" for row in evidence)
+        development_cost = total_cost * development_count / len(classifications) if total_cost is not None else None
+        holdout_cost = total_cost * holdout_count / len(classifications) if total_cost is not None else None
+        development_metrics = evaluate_human_metrics(
+            classifications, labels, evidence, contract, "development", development_cost,
+        )
+        holdout_metrics = evaluate_human_metrics(
+            classifications, labels, evidence, contract, "holdout", holdout_cost,
+        )
+        human_metrics = {
+            "status": ("complete" if development_metrics["status"] == holdout_metrics["status"] == "complete"
+                       else "incomplete"),
+            "holdout_not_used_for_selection": True,
+            "development": development_metrics,
+            "holdout": holdout_metrics,
+        }
+    summary = {
+        "schema_version": DECOMPOSED_REPORT_V1, "manifest_sha256": sha256(raw_manifest),
+        "extraction": {
+            "version": experiment["decomposed_extraction_version"],
+            "probability_sum_tolerance": DECOMPOSED_PROBABILITY_SUM_TOLERANCE_V1,
+            "choice_max_tolerance": DECOMPOSED_CHOICE_MAX_TOLERANCE_V1,
+            "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes()),
+        },
+        "models": manifest["models"], "pricing": experiment["pricing"], "run_settings": records[0],
+        "truncated_final_line": truncated, "limitations": [
+            *manifest["limitations"],
+            "Probability curves use development review only; the sealed holdout never selects thresholds.",
+            "Review-split cost metrics allocate whole-run cost pro rata by pair count.",
+            "GPT agreement is a secondary comparison and is not ground truth.",
+        ],
+        "experiment": experiment,
+        "gpt_baseline": {
+            "fingerprint": baseline["fingerprint"], "cached": True,
+            "classifications": len(baseline["classifications"]), "accounting": baseline["accounting"],
+            "pricing": baseline["pricing"],
+            "note": "Historical measurements, not inference performed during this Jev experiment.",
+        },
+        "groups": groups,
+        "raw_stream_outputs": {
+            objective: {
+                stream: dict(sorted(Counter(
+                    classification["streams"][stream]["label"]
+                    for classification in classifications.values()
+                    if classification["objective"] == objective
+                    and classification["streams"][stream]["status"] == "ok"
+                ).items()))
+                for stream in decomposed_stream_names(contract, objective)
+            }
+            for objective in contract["objectives"]
+        },
+        "probability_curves": ({"status": "available", "sha256": sha256(curves_bytes),
+                                "selection_split": "development"} if curves_bytes else {"status": "unavailable"}),
+        "policy": ({"status": "selected", "policy": policy} if policy else {
+            "status": "not_selected", "auto_selection": False,
+        }),
+        "human_metrics": human_metrics, "agreement": agreement,
+        "run_complete": not truncated and records[-1]["record_type"] == "run_end"
+                        and all(group["complete"] for group in groups.values()),
+        "all_pairs_classified": all(row["status"] == "ok" for row in classifications.values()),
+        "new_inference": {
+            "gpt_http_attempts": 0, "gpt_cost_usd": 0.0,
+            "jev_http_attempts": sum(group["http_attempts"] for group in groups.values()),
+            "jev_cost_estimate_usd": total_cost,
+        },
+    }
+    (output_dir / "gpt_classifications.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in gpt.values()),
+        encoding="utf-8",
+    )
+    (output_dir / "jev_stream_classifications.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+                for row in classifications.values()), encoding="utf-8",
+    )
+    columns = list(dict.fromkeys(key for row in paired for key in row))
+    write_csv(output_dir / "paired_results.csv", paired, columns)
+    write_csv(output_dir / "disagreements.csv", [
+        row for row in paired if row["human_agreement"] is False or row["gpt_agreement"] is False
+    ], columns)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return summary
+
+
+def write_reports(manifest_path: Path, output_dir: Path, **kwargs) -> dict:
     manifest = strict_json(manifest_path.read_text(encoding="utf-8"))
-    if manifest_schema(manifest) == MANIFEST_V1:
+    schema = manifest_schema(manifest)
+    if schema == MANIFEST_V1:
         return write_legacy_reports(manifest_path, output_dir)
-    return write_relation_reports(manifest_path, output_dir)
+    if schema == MANIFEST_V2:
+        return write_relation_reports(manifest_path, output_dir)
+    return write_decomposed_reports(manifest_path, output_dir, **kwargs)
 
 
 def load_operator_environment(data_dir: Path) -> None:
@@ -2969,11 +3738,19 @@ def main() -> None:
     parser.add_argument("--baseline-root", type=Path, default=Path("results/baselines"))
     parser.add_argument("--adjudication-dir", type=Path,
                         default=Path("results/adjudication/jev-sbs-adjudication-v1"))
+    parser.add_argument("--review-revision", type=int,
+                        help="Completed append-only human-review revision used for decomposed offline reporting")
+    parser.add_argument("--policy-selection", type=Path,
+                        help="Boris-authored decomposed probability-policy selection JSON (report-only)")
     args = parser.parse_args()
     if args.import_run and not args.prepare_baseline:
         parser.error("--import-run requires --prepare-baseline")
     if args.prepare_baseline and args.report_only:
         parser.error("--prepare-baseline cannot be combined with --report-only")
+    if (args.review_revision is not None or args.policy_selection is not None) and not args.report_only:
+        parser.error("--review-revision and --policy-selection require --report-only")
+    if args.policy_selection is not None and args.review_revision is None:
+        parser.error("--policy-selection requires --review-revision")
     if args.jev_arm == "decomposed" and args.prepare_baseline and (args.execute or args.import_run):
         parser.error("The decomposed arm only reuses an already completed GPT baseline")
     if args.execute:
@@ -2983,7 +3760,12 @@ def main() -> None:
         manifest_path = args.manifest or (directory / "manifest.json" if (directory / "experiment.json").exists()
                                           else Path("results/manifest.json"))
         try:
-            summary = write_reports(manifest_path, directory)
+            selection = (strict_json(args.policy_selection.read_text(encoding="utf-8"))
+                         if args.policy_selection is not None else None)
+            summary = write_reports(
+                manifest_path, directory, adjudication_dir=args.adjudication_dir,
+                review_revision=args.review_revision, policy_selection=selection,
+            )
         except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as error:
             parser.exit(1, f"Reporting failed: {error}\n")
         print(f"Reports rebuilt offline in {directory}; run_complete={summary['run_complete']}, "
@@ -3056,8 +3838,8 @@ def main() -> None:
     if manifest_schema(manifest) in {MANIFEST_V1, MANIFEST_V2}:
         print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
     else:
-        print(f"All decomposed streams completed and snapshotted in {directory}. "
-              "Offline policy/report generation follows in the next approved step.")
+        print(f"All decomposed streams completed and raw reports written in {directory}. "
+              "Select a reviewed policy offline; no threshold was chosen automatically.")
 
 
 if __name__ == "__main__":
