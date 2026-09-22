@@ -292,6 +292,11 @@ def relation_prepared(catalogs):
     return manifest, compare.prepare_requests(manifest)
 
 
+@pytest.fixture
+def decomposed_manifest(catalogs):
+    return compare.build_decomposed_manifest(catalogs)
+
+
 def response_for(provider, payload):
     if provider == "gpt":
         # The fixture's user message has a standalone JSON candidate array.
@@ -442,6 +447,213 @@ def test_v2_manifest_preserves_v1_frozen_workload(catalogs, relation_prepared):
         for provider in ("gpt", "jev"):
             assert jobs[provider][shop][0][0] == data["batches"][0]
         assert len(jobs["jev"][shop][0][1]["questions"]) == len(data["batches"][0]["candidates"]) * 4
+
+
+def test_v3_decomposed_manifest_preserves_workload_and_gpt_identity(catalogs, decomposed_manifest):
+    relation = compare.build_relation_manifest(catalogs)
+    manifest = decomposed_manifest
+
+    assert manifest["schema_version"] == compare.MANIFEST_V3
+    assert manifest["arm"] == "decomposed"
+    assert manifest["contract"] == relation["contract"]
+    assert manifest["shops"] == relation["shops"]
+    assert manifest["models"] == relation["models"]
+    assert manifest["selection"] == relation["selection"]
+    assert manifest["decomposed_contract"] == compare.decomposed_contract_snapshot()
+    assert compare.baseline_spec(manifest) == compare.baseline_spec(relation)
+
+    changed = copy.deepcopy(manifest)
+    changed["decomposed_contract"]["objectives"]["complements"]["together_use"]["instruction"] += " Changed."
+    assert compare.baseline_spec(changed) == compare.baseline_spec(manifest)
+    with pytest.raises(ValueError, match="prepare_decomposed_requests"):
+        compare.prepare_requests(manifest)
+
+
+def test_decomposed_requests_are_narrow_objective_streams_for_all_pairs(decomposed_manifest):
+    manifest = decomposed_manifest
+    jobs = compare.prepare_decomposed_requests(manifest)["jev"]
+    expected_streams = {
+        "furniture.co.uk": {"identity", "construction_finish", "design_language", "placement_context"},
+        "themeatboys.nl": {"identity", "together_use", "substitute", "incompatibility"},
+    }
+
+    for shop, streams in jobs.items():
+        data = manifest["shops"][shop]
+        assert set(streams) == expected_streams[shop]
+        for stream, work in streams.items():
+            assert sum(len(batch["candidates"]) for batch, _ in work) == 400
+            assert [batch for batch, _ in work] == data["batches"]
+            batch, payload = work[0]
+            assert payload["state"]["objective"] == data["objective"]
+            assert payload["state"]["stream"] == stream
+            assert payload["state"]["contract_version"] == compare.DECOMPOSED_CONTRACT_VERSION
+            assert len(payload["questions"]) == len(batch["candidates"])
+            assert all(set(question) == {"type", "instructions", "criteria"}
+                       and question["type"] == "choice" for question in payload["questions"].values())
+            assert all(f"candidates[{index}]" in payload["questions"][f"candidate_{index}"]["instructions"]
+                       for index in range(len(batch["candidates"])))
+            if stream == "identity":
+                assert set(payload["questions"]["candidate_0"]["criteria"]) == set(compare.IDENTITY_LABELS)
+            else:
+                definition = manifest["decomposed_contract"]["objectives"][data["objective"]][stream]
+                assert payload["questions"]["candidate_0"]["criteria"] == definition["criteria"]
+                assert not any(other in json.dumps(payload) for other in set(streams) - {"identity", stream})
+
+    furniture = jobs["furniture.co.uk"]
+    assert "Same role is not automatically negative" in furniture["placement_context"][0][1]["questions"]["candidate_0"]["instructions"]
+    assert "plausible joint purchase" in jobs["themeatboys.nl"]["together_use"][0][1]["questions"]["candidate_0"]["instructions"]
+
+
+def write_adjudication_sources(manifest, first_path, second_path):
+    fields = [
+        "pair_id", "shop", "direction", "gpt_identity", "jev_identity", "gpt_basket_label",
+        "jev_basket_label", "jev_co_purchase", "jev_alternative", "jev_incompatible",
+    ]
+    first_rows, second_rows = [], []
+    for data in manifest["shops"].values():
+        counters = {"forward": 0, "reverse": 0}
+        for batch in data["batches"]:
+            for candidate in batch["candidates"]:
+                index = counters[batch["direction"]]
+                counters[batch["direction"]] += 1
+                kind = index % 4
+                first = {
+                    "pair_id": candidate["pair_id"], "shop": json.loads(candidate["pair_id"])[0],
+                    "direction": batch["direction"], "gpt_identity": "distinct", "jev_identity": "distinct",
+                    "gpt_basket_label": "skip", "jev_basket_label": "skip",
+                    "jev_co_purchase": "no", "jev_alternative": "no", "jev_incompatible": "no",
+                }
+                second = dict(first)
+                if kind == 0:
+                    first.update(gpt_identity="variant", gpt_basket_label="skip")
+                elif kind == 1:
+                    first.update(gpt_basket_label="positive", jev_basket_label="skip")
+                    second.update(gpt_basket_label="positive", jev_basket_label="skip")
+                elif kind == 2:
+                    first["jev_co_purchase"] = "yes"
+                    second["jev_co_purchase"] = "uncertain"
+                else:
+                    first.update(gpt_basket_label="positive", jev_basket_label="positive")
+                    second.update(gpt_basket_label="positive", jev_basket_label="positive")
+                first_rows.append(first)
+                second_rows.append(second)
+    for path, rows in ((first_path, first_rows), (second_path, second_rows)):
+        path.parent.mkdir()
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def test_adjudication_artifact_is_deterministic_balanced_blind_and_immutable(decomposed_manifest, tmp_path):
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(decomposed_manifest, first, second)
+    directory = tmp_path / "results/adjudication/jev-sbs-adjudication-v1"
+
+    artifact = compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory)
+    snapshot = {path.name: path.read_bytes() for path in directory.iterdir()}
+    assert compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory) == artifact
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == snapshot
+    assert artifact["pair_counts"] == {"development": 48, "holdout": 96}
+    assert artifact["reviewer"] == "Boris"
+    evidence = [json.loads(line) for line in (directory / "evidence.jsonl").read_text().splitlines()]
+    labels = [json.loads(line) for line in (directory / "labels-template.jsonl").read_text().splitlines()]
+    assignments = [json.loads(line) for line in
+                   (directory / "group-assignments-admin.jsonl").read_text().splitlines()]
+    assert len(evidence) == len(labels) == 144
+    for split, per_cell in (("development", 12), ("holdout", 24)):
+        selected = [row for row in evidence if row["split"] == split]
+        for shop in compare.SHOPS:
+            for direction in ("forward", "reverse"):
+                assert sum(row["shop"] == shop and row["direction"] == direction for row in selected) == per_cell
+    groups = {split: {row["pair_group_id"] for row in evidence if row["split"] == split}
+              for split in ("development", "holdout")}
+    assert groups["development"].isdisjoint(groups["holdout"])
+    assigned_splits = {}
+    for row in assignments:
+        assigned_splits.setdefault(row["pair_group_id"], set()).add(row["split"])
+    assert all(len(splits) == 1 for splits in assigned_splits.values())
+    reciprocal_groups = {}
+    for row in assignments:
+        reciprocal_groups.setdefault(row["pair_group_id"], set()).add(json.loads(row["pair_id"])[1])
+    assert any(directions == {"forward", "reverse"} for directions in reciprocal_groups.values())
+    manifest_pairs = compare.review_pair_index(decomposed_manifest)
+    expected_assigned_pairs = {
+        pair_id for pair_id, pair in manifest_pairs.items()
+        if compare.review_group_id(pair) in assigned_splits
+    }
+    assert {row["pair_id"] for row in assignments} == expected_assigned_pairs
+    assert all(not row["prompt_example_allowed"] and row["manual_product_family_overlap_review_required"]
+               for row in evidence)
+    assert all("stratum" not in row and "gpt" not in row and "jev" not in row for row in evidence)
+    assert artifact["policy"]["reviewer_files"] == ["evidence.jsonl", "labels-template.jsonl"]
+    assert all(row["reviewer"] == "Boris" and row["reviewed_at"] is None for row in labels)
+    evidence_by_pair = {row["pair_id"]: row for row in evidence}
+    for row in labels:
+        objective = evidence_by_pair[row["pair_id"]]["objective"]
+        expected = set(compare.decomposed_stream_names(decomposed_manifest["decomposed_contract"], objective))
+        assert set(row["mechanisms"]) == expected - {"identity"}
+    with pytest.raises(ValueError, match="approved initial reviewer"):
+        compare.prepare_adjudication_artifact(decomposed_manifest, first, second, tmp_path / "wrong", "Someone else")
+    (directory / "labels-template.jsonl").write_bytes(snapshot["labels-template.jsonl"] + b"\n")
+    with pytest.raises(ValueError, match="Refusing to replace immutable adjudication"):
+        compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory)
+
+
+def test_adjudication_label_revisions_are_validated_immutable_and_hash_chained(decomposed_manifest, tmp_path):
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(decomposed_manifest, first, second)
+    directory = tmp_path / "artifact"
+    compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory)
+    evidence = {row["pair_id"]: row for row in compare.jsonl_records(directory / "evidence.jsonl")}
+    completed = compare.jsonl_records(directory / "labels-template.jsonl")
+    for row in completed:
+        objective = evidence[row["pair_id"]]["objective"]
+        row.update(
+            reviewed_at="2026-09-22T12:00:00+00:00", identity="distinct",
+            final_label="skip", ambiguity=False, review_notes="Reviewed synthetic evidence",
+        )
+        for stream in row["mechanisms"]:
+            row["mechanisms"][stream] = next(iter(
+                decomposed_manifest["decomposed_contract"]["objectives"][objective][stream]["criteria"]
+            ))
+
+    first_revision = compare.publish_adjudication_labels(directory, completed, 1)
+    first_bytes = (directory / "labels-v1.jsonl").read_bytes()
+    assert first_revision["previous_labels_sha256"] == hashlib.sha256(
+        (directory / "labels-template.jsonl").read_bytes()
+    ).hexdigest()
+    assert compare.publish_adjudication_labels(directory, completed, 1) == first_revision
+    revised = copy.deepcopy(completed)
+    revised[0]["review_notes"] = "Reviewed again"
+    second_revision = compare.publish_adjudication_labels(directory, revised, 2)
+    assert second_revision["previous_labels_sha256"] == hashlib.sha256(first_bytes).hexdigest()
+    assert (directory / "labels-v1.jsonl").read_bytes() == first_bytes
+    assert json.loads((directory / "labels-v2.manifest.json").read_text()) == second_revision
+
+    tampered_directory = tmp_path / "tampered"
+    compare.prepare_adjudication_artifact(decomposed_manifest, first, second, tampered_directory)
+    evidence_path = tampered_directory / "evidence.jsonl"
+    evidence_path.write_bytes(evidence_path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="Adjudication base file changed"):
+        compare.publish_adjudication_labels(tampered_directory, completed, 1)
+
+    transplanted_directory = tmp_path / "transplanted"
+    changed_manifest = copy.deepcopy(decomposed_manifest)
+    changed_manifest["concurrency"] += 1
+    compare.prepare_adjudication_artifact(changed_manifest, first, second, transplanted_directory)
+    (transplanted_directory / "labels-v1.jsonl").write_bytes((directory / "labels-v1.jsonl").read_bytes())
+    (transplanted_directory / "labels-v1.manifest.json").write_bytes(
+        (directory / "labels-v1.manifest.json").read_bytes()
+    )
+    with pytest.raises(ValueError, match="revision 1 manifest mismatch"):
+        compare.publish_adjudication_labels(transplanted_directory, revised, 2)
+
+    (directory / "labels-v2.jsonl").write_bytes((directory / "labels-v2.jsonl").read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="revision 2 manifest mismatch"):
+        compare.publish_adjudication_labels(directory, revised, 3)
 
 
 @pytest.mark.parametrize("provider", ["gpt", "jev"])
