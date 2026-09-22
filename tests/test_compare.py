@@ -1,8 +1,11 @@
 import copy
+from collections import Counter
 import csv
 import fcntl
 import hashlib
+import itertools
 import json
+import os
 import socket
 import threading
 
@@ -284,6 +287,17 @@ def prepared(catalogs):
     return manifest, compare.prepare_requests(manifest)
 
 
+@pytest.fixture
+def relation_prepared(catalogs):
+    manifest = compare.build_relation_manifest(catalogs)
+    return manifest, compare.prepare_requests(manifest)
+
+
+@pytest.fixture
+def decomposed_manifest(catalogs):
+    return compare.build_decomposed_manifest(catalogs)
+
+
 def response_for(provider, payload):
     if provider == "gpt":
         # The fixture's user message has a standalone JSON candidate array.
@@ -335,6 +349,699 @@ def test_provider_payload_parity(prepared):
                 assert set(question["criteria"]) == set(compare.LABELS)
                 assert question["type"] == "choice"
     assert manifest == original
+
+
+def relation_response_for(provider, payload, batch):
+    if provider == "gpt":
+        judgments = [{
+            "id": item["candidate_id"],
+            "identity": {"label": "distinct", "reason": "different products"},
+            "relations": {
+                "co_purchase": {"label": "yes", "reason": "used together"},
+                "alternative": {"label": "no", "reason": "different roles"},
+                "incompatible": {"label": "no", "reason": "compatible context"},
+            },
+        } for item in reversed(batch["candidates"])]
+        return {
+            "model": payload["model"],
+            "choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"judgments": judgments})}}],
+        }
+    answers = {}
+    for key in payload["questions"]:
+        if key.endswith("_identity"):
+            labels, choice = compare.IDENTITY_LABELS, "distinct"
+            probabilities = {label: (0.8 if label == choice else 0.05) for label in labels}
+        else:
+            labels = compare.RELATION_LABELS
+            choice = "yes" if key.endswith("_co_purchase") else "no"
+            probabilities = {label: (0.8 if label == choice else 0.1) for label in labels}
+        answers[key] = {
+            "type": "choice", "choice": choice, "confidence": 0.7, "probabilities": probabilities,
+        }
+    return {"model": payload["model"], "answers": answers}
+
+
+def decomposed_response_for(payload, *, missing: str | None = None):
+    answers = {}
+    for key, question in payload["questions"].items():
+        labels = list(question["criteria"])
+        choice = "distinct" if payload["state"]["stream"] == "identity" else labels[-1]
+        remainder = 0.2 / (len(labels) - 1)
+        answers[key] = {
+            "type": "choice",
+            "choice": choice,
+            "confidence": 0.8,
+            "probabilities": {label: (0.8 if label == choice else remainder) for label in labels},
+        }
+    if missing is not None:
+        del answers[missing]
+    return {"model": payload["model"], "answers": answers, "usage": {"input_tokens": 100, "output_tokens": 0}}
+
+
+def decomposed_policy_rules(contract, probability=0.7, margin=0.1):
+    rule = {"min_probability": probability, "min_margin": margin}
+    return {
+        "identity": dict(rule),
+        "objectives": {
+            objective: {stream: dict(rule) for stream in streams}
+            for objective, streams in contract["objectives"].items()
+        },
+    }
+
+
+def decomposed_answer(label, labels, probability=0.8):
+    remainder = (1 - probability) / (len(labels) - 1)
+    return {
+        "label": label, "probabilities": {choice: probability if choice == label else remainder for choice in labels},
+        "confidence": probability, "probability_sum": 1.0,
+        "probability_rounding_warning": False, "choice_probability_warning": False,
+    }
+
+
+def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    gpt = compare.render_relation_request("gpt", manifest["models"]["gpt"], data, batch)
+    jev = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch)
+
+    anchor = data["products"][batch["anchor_id"]]
+    candidates = [{key: data["products"][item["candidate_id"]][key]
+                   for key in ("id", "name", "category", "description")}
+                  for item in batch["candidates"]]
+    assert jev["state"]["base"] == {"id": anchor["id"], "text": anchor["text"]}
+    assert jev["state"]["candidates"] == candidates
+    assert jev["state"]["contract_version"] == compare.RELATION_CONTRACT_VERSION
+    assert len(jev["questions"]) == len(candidates) * 4
+    for index in range(len(candidates)):
+        assert set(jev["questions"][f"candidate_{index}_identity"]["criteria"]) == set(compare.IDENTITY_LABELS)
+        assert (jev["questions"][f"candidate_{index}_identity"]["instructions"]
+                == compare.IDENTITY_INSTRUCTION.format(index=index))
+        for head in compare.RELATION_HEADS:
+            question = jev["questions"][f"candidate_{index}_{head}"]
+            assert set(question["criteria"]) == set(compare.RELATION_LABELS)
+            assert f"candidates[{index}]" in question["instructions"]
+            assert compare.RELATION_UNCERTAINTY_INSTRUCTION in question["instructions"]
+    assert "plausible joint purchase is insufficient" in jev["questions"]["candidate_0_co_purchase"]["instructions"]
+    assert "same immediate purchasing role" in jev["questions"]["candidate_0_alternative"]["instructions"]
+    assert "concrete mismatch" in jev["questions"]["candidate_0_incompatible"]["instructions"]
+    assert "shared brand, collection, colour, or category" in jev["questions"]["candidate_0_identity"]["instructions"]
+    schema = gpt["response_format"]["json_schema"]["schema"]
+    judgment = schema["properties"]["judgments"]["items"]
+    assert judgment["properties"]["identity"]["properties"]["label"]["enum"] == list(compare.IDENTITY_LABELS)
+    assert set(judgment["properties"]["relations"]["properties"]) == set(compare.RELATION_HEADS)
+    assert all(head in gpt["messages"][0]["content"] for head in compare.RELATION_HEADS)
+    assert all(candidate["id"] in gpt["messages"][1]["content"] for candidate in candidates)
+    assert "temperature" not in gpt and "max_completion_tokens" not in gpt
+
+
+def test_relation_request_uses_saved_contract_version_and_identity_instruction(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    contract = compare.relation_contract_snapshot()
+    contract["version"] = "saved-contract-version"
+    contract["identity_instruction"] = "Saved identity instruction for candidates[{index}]."
+
+    payload = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch, contract)
+    assert payload["state"]["contract_version"] == "saved-contract-version"
+    for index in range(len(batch["candidates"])):
+        assert (payload["questions"][f"candidate_{index}_identity"]["instructions"]
+                == f"Saved identity instruction for candidates[{index}].")
+
+
+def test_v2_manifest_preserves_v1_frozen_workload(catalogs, relation_prepared):
+    legacy = compare.build_manifest(catalogs)
+    manifest, jobs = relation_prepared
+    comparable = copy.deepcopy(manifest)
+    assert comparable.pop("contract")["resolver_version"] == compare.RESOLVER_VERSION
+    comparable["schema_version"] = compare.MANIFEST_V1
+    assert comparable == legacy
+    assert manifest["schema_version"] == compare.MANIFEST_V2
+    assert manifest["contract"] == compare.relation_contract_snapshot()
+    assert manifest["limitations"] == legacy["limitations"]
+    for shop, data in manifest["shops"].items():
+        assert len({item["pair_id"] for batch in data["batches"] for item in batch["candidates"]}) == 400
+        for provider in ("gpt", "jev"):
+            assert jobs[provider][shop][0][0] == data["batches"][0]
+        assert len(jobs["jev"][shop][0][1]["questions"]) == len(data["batches"][0]["candidates"]) * 4
+
+
+def test_v3_decomposed_manifest_preserves_workload_and_gpt_identity(catalogs, decomposed_manifest):
+    relation = compare.build_relation_manifest(catalogs)
+    manifest = decomposed_manifest
+
+    assert manifest["schema_version"] == compare.MANIFEST_V3
+    assert manifest["arm"] == "decomposed"
+    assert manifest["contract"] == relation["contract"]
+    assert manifest["shops"] == relation["shops"]
+    assert manifest["models"] == relation["models"]
+    assert manifest["selection"] == relation["selection"]
+    assert manifest["decomposed_contract"] == compare.decomposed_contract_snapshot()
+    assert compare.baseline_spec(manifest) == compare.baseline_spec(relation)
+
+    changed = copy.deepcopy(manifest)
+    changed["decomposed_contract"]["objectives"]["complements"]["together_use"]["instruction"] += " Changed."
+    assert compare.baseline_spec(changed) == compare.baseline_spec(manifest)
+    with pytest.raises(ValueError, match="prepare_decomposed_requests"):
+        compare.prepare_requests(manifest)
+
+
+def test_decomposed_requests_are_narrow_objective_streams_for_all_pairs(decomposed_manifest):
+    manifest = decomposed_manifest
+    jobs = compare.prepare_decomposed_requests(manifest)["jev"]
+    expected_streams = {
+        "furniture.co.uk": {"identity", "construction_finish", "design_language", "placement_context"},
+        "themeatboys.nl": {"identity", "together_use", "substitute", "incompatibility"},
+    }
+
+    for shop, streams in jobs.items():
+        data = manifest["shops"][shop]
+        assert set(streams) == expected_streams[shop]
+        for stream, work in streams.items():
+            assert sum(len(batch["candidates"]) for batch, _ in work) == 400
+            assert [batch for batch, _ in work] == data["batches"]
+            batch, payload = work[0]
+            assert payload["state"]["objective"] == data["objective"]
+            assert payload["state"]["stream"] == stream
+            assert payload["state"]["contract_version"] == compare.DECOMPOSED_CONTRACT_VERSION
+            assert len(payload["questions"]) == len(batch["candidates"])
+            assert all(set(question) == {"type", "instructions", "criteria"}
+                       and question["type"] == "choice" for question in payload["questions"].values())
+            assert all(f"candidates[{index}]" in payload["questions"][f"candidate_{index}"]["instructions"]
+                       for index in range(len(batch["candidates"])))
+            if stream == "identity":
+                assert set(payload["questions"]["candidate_0"]["criteria"]) == set(compare.IDENTITY_LABELS)
+            else:
+                definition = manifest["decomposed_contract"]["objectives"][data["objective"]][stream]
+                assert payload["questions"]["candidate_0"]["criteria"] == definition["criteria"]
+                assert not any(other in json.dumps(payload) for other in set(streams) - {"identity", stream})
+
+    furniture = jobs["furniture.co.uk"]
+    assert "Same role is not automatically negative" in furniture["placement_context"][0][1]["questions"]["candidate_0"]["instructions"]
+    assert "plausible joint purchase" in jobs["themeatboys.nl"]["together_use"][0][1]["questions"]["candidate_0"]["instructions"]
+
+
+def test_decomposed_answers_are_strict_and_normalized(decomposed_manifest):
+    batch, payload = compare.prepare_decomposed_requests(decomposed_manifest)["jev"]["themeatboys.nl"]["together_use"][0]
+    labels = compare.decomposed_payload_labels(payload)
+    answers = compare.parse_provider_answers(
+        compare.MANIFEST_V3, "jev", decomposed_response_for(payload), batch, labels,
+    )
+    assert [answer["pair_id"] for answer in answers] == [item["pair_id"] for item in batch["candidates"]]
+    assert all(answer["label"] == "no_concrete_mechanism" for answer in answers)
+    assert all(answer["probability_sum"] == pytest.approx(1) for answer in answers)
+
+    with pytest.raises(ValueError, match="Missing or unknown question answers"):
+        compare.parse_provider_answers(
+            compare.MANIFEST_V3, "jev",
+            decomposed_response_for(payload, missing="candidate_0"), batch, labels,
+        )
+
+
+def test_decomposed_batch_retries_transport_failures_and_rejects_partial_choice_sets(
+        decomposed_manifest, monkeypatch):
+    batch, payload = compare.prepare_decomposed_requests(decomposed_manifest)["jev"]["furniture.co.uk"]["identity"][0]
+    calls = []
+    monkeypatch.setattr(compare.time, "sleep", lambda delay: None)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json=decomposed_response_for(payload))
+
+    request_id = compare.decomposed_request_id(batch, "identity")
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        record = compare.run_batch(
+            client, "jev", "furniture.co.uk", batch, payload, "dummy",
+            schema_version=compare.MANIFEST_V3, stream="identity", request_id=request_id,
+            choice_labels=compare.decomposed_payload_labels(payload),
+            extraction_version=compare.DECOMPOSED_EXTRACTION_VERSION,
+        )
+    assert record["status"] == "ok" and record["retries"] == 1
+    assert record["stream"] == "identity" and record["request_id"] == request_id
+    assert len(record["answers"]) == len(batch["candidates"])
+
+    partial = decomposed_response_for(payload, missing="candidate_0")
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=partial))) as client:
+        failed = compare.run_batch(
+            client, "jev", "furniture.co.uk", batch, payload, "dummy",
+            schema_version=compare.MANIFEST_V3, stream="identity", request_id=request_id,
+            choice_labels=compare.decomposed_payload_labels(payload),
+            extraction_version=compare.DECOMPOSED_EXTRACTION_VERSION,
+        )
+    assert failed["status"] == "error" and failed["error"] == "invalid_response"
+    assert failed["answers"] == [] and failed["retries"] == 0
+
+
+def test_probability_policy_boundaries_are_inclusive_and_never_auto_selected():
+    answer = decomposed_answer("distinct", compare.IDENTITY_LABELS, probability=0.6)
+    accepted = compare.apply_probability_policy(answer, {"min_probability": 0.6, "min_margin": 0.5})
+    assert accepted["accepted"] and accepted["probability"] == pytest.approx(0.6)
+    assert accepted["margin"] == pytest.approx(0.5)
+    assert not compare.apply_probability_policy(
+        answer, {"min_probability": 0.600001, "min_margin": 0.5},
+    )["accepted"]
+    assert not compare.apply_probability_policy(
+        answer, {"min_probability": 0.6, "min_margin": 0.500001},
+    )["accepted"]
+
+
+def test_objective_specific_resolvers_gate_identity_and_preserve_conflicts():
+    contract = compare.decomposed_contract_snapshot()
+    rules = decomposed_policy_rules(contract, probability=0, margin=0)
+    complements = {
+        "identity": decomposed_answer("distinct", compare.IDENTITY_LABELS),
+        "together_use": decomposed_answer(
+            "accessory_component", tuple(contract["objectives"]["complements"]["together_use"]["criteria"]),
+        ),
+        "substitute": decomposed_answer(
+            "no_concrete_substitute", tuple(contract["objectives"]["complements"]["substitute"]["criteria"]),
+        ),
+        "incompatibility": decomposed_answer(
+            "no_explicit_mismatch", tuple(contract["objectives"]["complements"]["incompatibility"]["criteria"]),
+        ),
+    }
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", complements, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "positive" and not resolved["conflict"]
+
+    conflicting = copy.deepcopy(complements)
+    conflicting["substitute"] = decomposed_answer(
+        "same_immediate_purchasing_role",
+        tuple(contract["objectives"]["complements"]["substitute"]["criteria"]),
+    )
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", conflicting, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "conflict" and resolved["conflict"]
+    assert len(resolved["accepted_signals"]) == 2
+
+    hard_negative = copy.deepcopy(complements)
+    hard_negative["together_use"] = decomposed_answer(
+        "no_concrete_mechanism",
+        tuple(contract["objectives"]["complements"]["together_use"]["criteria"]),
+    )
+    hard_negative["substitute"] = conflicting["substitute"]
+    hard_negative["incompatibility"] = decomposed_answer(
+        "size_interface_mismatch",
+        tuple(contract["objectives"]["complements"]["incompatibility"]["criteria"]),
+    )
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", hard_negative, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "hard_negative" and len(resolved["accepted_signals"]) == 2
+
+    filtered = copy.deepcopy(complements)
+    filtered["identity"] = decomposed_answer("variant", compare.IDENTITY_LABELS)
+    resolved = compare.resolve_decomposed_judgment(
+        "complements", filtered, rules, compare.DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "skip" and resolved["identity_action"] == "filter"
+
+    style = {
+        "identity": decomposed_answer("distinct", compare.IDENTITY_LABELS),
+        "construction_finish": decomposed_answer(
+            "concrete_coordination",
+            tuple(contract["objectives"]["style_compatibility"]["construction_finish"]["criteria"]),
+        ),
+        "design_language": decomposed_answer(
+            "concrete_coordination",
+            tuple(contract["objectives"]["style_compatibility"]["design_language"]["criteria"]),
+        ),
+        "placement_context": decomposed_answer(
+            "no_concrete_evidence",
+            tuple(contract["objectives"]["style_compatibility"]["placement_context"]["criteria"]),
+        ),
+    }
+    resolved = compare.resolve_decomposed_judgment(
+        "style_compatibility", style, rules, compare.DECOMPOSED_STYLE_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "positive" and len(resolved["accepted_signals"]) == 2
+    style["placement_context"] = decomposed_answer(
+        "explicit_context_mismatch",
+        tuple(contract["objectives"]["style_compatibility"]["placement_context"]["criteria"]),
+    )
+    resolved = compare.resolve_decomposed_judgment(
+        "style_compatibility", style, rules, compare.DECOMPOSED_STYLE_RESOLVER_V1,
+    )
+    assert resolved["basket_label"] == "conflict" and resolved["conflict"]
+
+
+def test_incomplete_review_and_cross_split_groups_cannot_drive_policy_curves():
+    contract = compare.decomposed_contract_snapshot()
+    evidence = [
+        {"pair_id": "development", "pair_group_id": "same", "split": "development",
+         "objective": "complements"},
+        {"pair_id": "holdout", "pair_group_id": "same", "split": "holdout",
+         "objective": "complements"},
+    ]
+    labels = [{"pair_id": "development", "split": "development", "identity": None,
+               "mechanisms": {}, "final_label": None}]
+    with pytest.raises(ValueError, match="cross development and holdout"):
+        compare.build_probability_curves({}, labels, evidence, contract)
+
+    evidence[1]["pair_group_id"] = "other"
+    with pytest.raises(ValueError, match="complete development review"):
+        compare.build_probability_curves({}, labels, evidence, contract)
+
+
+def test_human_metrics_keep_abstentions_in_coverage_and_use_human_labels_as_truth():
+    def classification(label, status="resolved", probability=0.8):
+        return {"resolution": {
+            "basket_label": label, "resolution_status": status, "conflict": label == "conflict",
+            "identity_action": "continue", "decision_probability": probability,
+        }}
+
+    rows = [
+        ({"final_label": "positive"}, classification("positive", probability=0.9)),
+        ({"final_label": "hard_negative"}, classification("hard_negative", probability=0.8)),
+        ({"final_label": "positive"}, classification("hard_negative", probability=0.7)),
+        ({"final_label": "skip"}, classification("skip", status="abstained", probability=None)),
+    ]
+    metrics = compare.metric_block(rows, allocated_cost=0.6)
+    assert metrics["precision"] == pytest.approx(2 / 3)
+    assert metrics["hard_negative_precision"] == pytest.approx(0.5)
+    assert metrics["coverage"] == pytest.approx(0.75)
+    assert metrics["abstentions"] == 1
+    assert metrics["cost_per_accepted_correct_label_usd"] == pytest.approx(0.3)
+    assert metrics["confusion_human_rows_jev_columns"]["positive"]["hard_negative"] == 1
+
+
+def write_adjudication_sources(manifest, first_path, second_path):
+    fields = [
+        "pair_id", "shop", "direction", "gpt_identity", "jev_identity", "gpt_basket_label",
+        "jev_basket_label", "jev_co_purchase", "jev_alternative", "jev_incompatible",
+    ]
+    first_rows, second_rows = [], []
+    for data in manifest["shops"].values():
+        counters = {"forward": 0, "reverse": 0}
+        for batch in data["batches"]:
+            for candidate in batch["candidates"]:
+                index = counters[batch["direction"]]
+                counters[batch["direction"]] += 1
+                kind = index % 4
+                first = {
+                    "pair_id": candidate["pair_id"], "shop": json.loads(candidate["pair_id"])[0],
+                    "direction": batch["direction"], "gpt_identity": "distinct", "jev_identity": "distinct",
+                    "gpt_basket_label": "skip", "jev_basket_label": "skip",
+                    "jev_co_purchase": "no", "jev_alternative": "no", "jev_incompatible": "no",
+                }
+                second = dict(first)
+                if kind == 0:
+                    first.update(gpt_identity="variant", gpt_basket_label="skip")
+                elif kind == 1:
+                    first.update(gpt_basket_label="positive", jev_basket_label="skip")
+                    second.update(gpt_basket_label="positive", jev_basket_label="skip")
+                elif kind == 2:
+                    first["jev_co_purchase"] = "yes"
+                    second["jev_co_purchase"] = "uncertain"
+                else:
+                    first.update(gpt_basket_label="positive", jev_basket_label="positive")
+                    second.update(gpt_basket_label="positive", jev_basket_label="positive")
+                first_rows.append(first)
+                second_rows.append(second)
+    for path, rows in ((first_path, first_rows), (second_path, second_rows)):
+        path.parent.mkdir()
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def test_adjudication_artifact_is_deterministic_balanced_blind_and_immutable(decomposed_manifest, tmp_path):
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(decomposed_manifest, first, second)
+    directory = tmp_path / "results/adjudication/jev-sbs-adjudication-v1"
+
+    artifact = compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory)
+    snapshot = {path.name: path.read_bytes() for path in directory.iterdir()}
+    assert compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory) == artifact
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == snapshot
+    assert artifact["pair_counts"] == {"development": 48, "holdout": 96}
+    assert artifact["reviewer"] == "Boris"
+    evidence = [json.loads(line) for line in (directory / "evidence.jsonl").read_text().splitlines()]
+    labels = [json.loads(line) for line in (directory / "labels-template.jsonl").read_text().splitlines()]
+    assignments = [json.loads(line) for line in
+                   (directory / "group-assignments-admin.jsonl").read_text().splitlines()]
+    assert len(evidence) == len(labels) == 144
+    for split, per_cell in (("development", 12), ("holdout", 24)):
+        selected = [row for row in evidence if row["split"] == split]
+        for shop in compare.SHOPS:
+            for direction in ("forward", "reverse"):
+                assert sum(row["shop"] == shop and row["direction"] == direction for row in selected) == per_cell
+    groups = {split: {row["pair_group_id"] for row in evidence if row["split"] == split}
+              for split in ("development", "holdout")}
+    assert groups["development"].isdisjoint(groups["holdout"])
+    assigned_splits = {}
+    for row in assignments:
+        assigned_splits.setdefault(row["pair_group_id"], set()).add(row["split"])
+    assert all(len(splits) == 1 for splits in assigned_splits.values())
+    reciprocal_groups = {}
+    for row in assignments:
+        reciprocal_groups.setdefault(row["pair_group_id"], set()).add(json.loads(row["pair_id"])[1])
+    assert any(directions == {"forward", "reverse"} for directions in reciprocal_groups.values())
+    manifest_pairs = compare.review_pair_index(decomposed_manifest)
+    expected_assigned_pairs = {
+        pair_id for pair_id, pair in manifest_pairs.items()
+        if compare.review_group_id(pair) in assigned_splits
+    }
+    assert {row["pair_id"] for row in assignments} == expected_assigned_pairs
+    assert all(not row["prompt_example_allowed"] and row["manual_product_family_overlap_review_required"]
+               for row in evidence)
+    assert all("stratum" not in row and "gpt" not in row and "jev" not in row for row in evidence)
+    assert artifact["policy"]["reviewer_files"] == ["evidence.jsonl", "labels-template.jsonl"]
+    assert all(row["reviewer"] == "Boris" and row["reviewed_at"] is None for row in labels)
+    evidence_by_pair = {row["pair_id"]: row for row in evidence}
+    for row in labels:
+        objective = evidence_by_pair[row["pair_id"]]["objective"]
+        expected = set(compare.decomposed_stream_names(decomposed_manifest["decomposed_contract"], objective))
+        assert set(row["mechanisms"]) == expected - {"identity"}
+    with pytest.raises(ValueError, match="approved initial reviewer"):
+        compare.prepare_adjudication_artifact(decomposed_manifest, first, second, tmp_path / "wrong", "Someone else")
+    (directory / "labels-template.jsonl").write_bytes(snapshot["labels-template.jsonl"] + b"\n")
+    with pytest.raises(ValueError, match="Refusing to replace immutable adjudication"):
+        compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory)
+
+
+def test_adjudication_label_revisions_are_validated_immutable_and_hash_chained(decomposed_manifest, tmp_path):
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(decomposed_manifest, first, second)
+    directory = tmp_path / "artifact"
+    compare.prepare_adjudication_artifact(decomposed_manifest, first, second, directory)
+    evidence = {row["pair_id"]: row for row in compare.jsonl_records(directory / "evidence.jsonl")}
+    completed = compare.jsonl_records(directory / "labels-template.jsonl")
+    for row in completed:
+        objective = evidence[row["pair_id"]]["objective"]
+        row.update(
+            reviewed_at="2026-09-22T12:00:00+00:00", identity="distinct",
+            final_label="skip", ambiguity=False, review_notes="Reviewed synthetic evidence",
+        )
+        for stream in row["mechanisms"]:
+            row["mechanisms"][stream] = next(iter(
+                decomposed_manifest["decomposed_contract"]["objectives"][objective][stream]["criteria"]
+            ))
+
+    first_revision = compare.publish_adjudication_labels(directory, completed, 1)
+    first_bytes = (directory / "labels-v1.jsonl").read_bytes()
+    assert first_revision["previous_labels_sha256"] == hashlib.sha256(
+        (directory / "labels-template.jsonl").read_bytes()
+    ).hexdigest()
+    assert compare.publish_adjudication_labels(directory, completed, 1) == first_revision
+    revised = copy.deepcopy(completed)
+    revised[0]["review_notes"] = "Reviewed again"
+    second_revision = compare.publish_adjudication_labels(directory, revised, 2)
+    assert second_revision["previous_labels_sha256"] == hashlib.sha256(first_bytes).hexdigest()
+    assert (directory / "labels-v1.jsonl").read_bytes() == first_bytes
+    assert json.loads((directory / "labels-v2.manifest.json").read_text()) == second_revision
+
+    tampered_directory = tmp_path / "tampered"
+    compare.prepare_adjudication_artifact(decomposed_manifest, first, second, tampered_directory)
+    evidence_path = tampered_directory / "evidence.jsonl"
+    evidence_path.write_bytes(evidence_path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="Adjudication base file changed"):
+        compare.publish_adjudication_labels(tampered_directory, completed, 1)
+
+    transplanted_directory = tmp_path / "transplanted"
+    changed_manifest = copy.deepcopy(decomposed_manifest)
+    changed_manifest["concurrency"] += 1
+    compare.prepare_adjudication_artifact(changed_manifest, first, second, transplanted_directory)
+    (transplanted_directory / "labels-v1.jsonl").write_bytes((directory / "labels-v1.jsonl").read_bytes())
+    (transplanted_directory / "labels-v1.manifest.json").write_bytes(
+        (directory / "labels-v1.manifest.json").read_bytes()
+    )
+    with pytest.raises(ValueError, match="revision 1 manifest mismatch"):
+        compare.publish_adjudication_labels(transplanted_directory, revised, 2)
+
+    (directory / "labels-v2.jsonl").write_bytes((directory / "labels-v2.jsonl").read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="revision 2 manifest mismatch"):
+        compare.publish_adjudication_labels(directory, revised, 3)
+
+
+@pytest.mark.parametrize("provider", ["gpt", "jev"])
+def test_combined_relation_answers_are_normalized_in_pair_order(prepared, provider):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request(provider, manifest["models"][provider], data, batch)
+    answers = compare.parse_relation_answers(provider, relation_response_for(provider, payload, batch), batch)
+
+    assert [answer["pair_id"] for answer in answers] == [item["pair_id"] for item in batch["candidates"]]
+    assert all(answer["identity"]["label"] == "distinct" for answer in answers)
+    assert all(answer["relations"]["co_purchase"]["label"] == "yes" for answer in answers)
+    assert all(answer["relations"]["alternative"]["label"] == "no" for answer in answers)
+    if provider == "gpt":
+        assert all(answer["identity"]["reason"] == "different products" for answer in answers)
+        assert all(answer["relations"]["co_purchase"]["probabilities"] is None for answer in answers)
+    else:
+        assert all(answer["identity"]["reason"] is None for answer in answers)
+        assert all(answer["identity"]["probability_sum"] == pytest.approx(1) for answer in answers)
+
+
+def test_jev_relation_choice_accepts_one_point_rounding_mismatch(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch)
+    body = relation_response_for("jev", payload, batch)
+    answer = body["answers"]["candidate_0_co_purchase"]
+    answer.update(choice="yes", probabilities={"yes": 0.49, "no": 0.50, "uncertain": 0.01})
+
+    parsed = compare.parse_relation_answers("jev", body, batch)
+
+    judgment = parsed[0]["relations"]["co_purchase"]
+    assert judgment["label"] == "yes"
+    assert judgment["probabilities"] == answer["probabilities"]
+    assert judgment["choice_probability_warning"] is True
+
+
+def test_jev_relation_choice_rejects_larger_probability_mismatch(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch)
+    body = relation_response_for("jev", payload, batch)
+    body["answers"]["candidate_0_co_purchase"].update(
+        choice="yes", probabilities={"yes": 0.489, "no": 0.501, "uncertain": 0.01}
+    )
+
+    with pytest.raises(ValueError, match="beyond rounding tolerance"):
+        compare.parse_relation_answers("jev", body, batch)
+
+
+@pytest.mark.parametrize("provider", ["gpt", "jev"])
+def test_combined_relation_answers_reject_missing_heads(prepared, provider):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request(provider, manifest["models"][provider], data, batch)
+    body = relation_response_for(provider, payload, batch)
+    if provider == "gpt":
+        parsed = json.loads(body["choices"][0]["message"]["content"])
+        del parsed["judgments"][0]["relations"]["alternative"]
+        body["choices"][0]["message"]["content"] = json.dumps(parsed)
+    else:
+        del body["answers"]["candidate_0_alternative"]
+    with pytest.raises(ValueError):
+        compare.parse_relation_answers(provider, body, batch)
+
+
+def test_v2_run_batch_retains_partial_gpt_judgments(relation_prepared, monkeypatch):
+    manifest, jobs = relation_prepared
+    batch, payload = jobs["gpt"]["furniture.co.uk"][0]
+    body = relation_response_for("gpt", payload, batch)
+    parsed = json.loads(body["choices"][0]["message"]["content"])
+    parsed["judgments"] = parsed["judgments"][:-2]
+    body["choices"][0]["message"]["content"] = json.dumps(parsed)
+    calls = []
+    monkeypatch.setattr(compare.time, "sleep", lambda delay: None)
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = compare.run_batch(
+            client, "gpt", "furniture.co.uk", batch, payload, "dummy",
+            schema_version=compare.MANIFEST_V2,
+        )
+    assert result["status"] == "partial" and result["error"] == "missing_candidate_answers"
+    assert len(result["answers"]) == len(batch["candidates"]) - 2
+    assert result["retries"] == compare.MAX_RETRIES
+    assert calls == [payload] * (compare.MAX_RETRIES + 1)
+    assert all("identity" in answer and set(answer["relations"]) == set(compare.RELATION_HEADS)
+               for answer in result["answers"])
+
+
+@pytest.mark.parametrize(("identity", "relations", "basket", "status", "resolution"), [
+    ("duplicate", ("yes", "yes", "yes"), "skip", "filtered", "identity_filtered_duplicate"),
+    ("variant", ("no", "yes", "no"), "skip", "filtered", "identity_filtered_variant"),
+    ("redundant", ("yes", "no", "no"), "skip", "filtered", "identity_filtered_redundant"),
+    ("distinct", ("yes", "no", "no"), "positive", "resolved", "co_purchase_positive"),
+    ("distinct", ("no", "yes", "no"), "hard_negative", "resolved", "alternative_only"),
+    ("distinct", ("no", "no", "yes"), "hard_negative", "resolved", "incompatible_only"),
+    ("distinct", ("no", "no", "no"), "skip", "resolved", "unrelated_skip"),
+    ("uncertain", ("uncertain", "no", "no"), "skip", "uncertain", "uncertain_skip"),
+    ("distinct", ("yes", "yes", "no"), "conflict", "conflict", "conflicting_positive_relations"),
+    ("distinct", ("yes", "no", "yes"), "conflict", "conflict", "conflicting_positive_relations"),
+    ("distinct", ("no", "yes", "yes"), "conflict", "conflict", "conflicting_positive_relations"),
+])
+def test_basket_resolver(identity, relations, basket, status, resolution):
+    answer = {
+        "identity": {"label": identity},
+        "relations": {
+            head: {"label": label} for head, label in zip(compare.RELATION_HEADS, relations, strict=True)
+        },
+    }
+    result = compare.resolve_basket_judgment(answer)
+    assert result["basket_label"] == basket
+    assert result["resolution_status"] == status
+    assert result["resolution"] == resolution
+    assert result["resolver_version"] == compare.RESOLVER_VERSION
+    assert result["identity_action"] == (
+        "filter" if identity in {"duplicate", "variant", "redundant"}
+        else "continue_uncertain" if identity == "uncertain" else "continue"
+    )
+
+
+@pytest.mark.parametrize("identity", compare.IDENTITY_LABELS)
+@pytest.mark.parametrize("relations", itertools.product(compare.RELATION_LABELS, repeat=3))
+def test_basket_resolver_covers_complete_decision_matrix(identity, relations):
+    answer = {
+        "identity": {"label": identity},
+        "relations": {
+            head: {"label": label} for head, label in zip(compare.RELATION_HEADS, relations, strict=True)
+        },
+    }
+    result = compare.resolve_basket_judgment(answer, compare.RESOLVER_VERSION)
+    yes_count = relations.count("yes")
+    assert result["conflict"] == (yes_count > 1)
+    if identity in {"duplicate", "variant", "redundant"}:
+        assert result["basket_label"] == "skip" and result["resolution_status"] == "filtered"
+    elif yes_count > 1:
+        assert result["basket_label"] == "conflict" and result["resolution_status"] == "conflict"
+    elif relations == ("yes", "no", "no"):
+        assert result["basket_label"] == "positive" and result["resolution_status"] == "resolved"
+    elif relations in {("no", "yes", "no"), ("no", "no", "yes")}:
+        assert result["basket_label"] == "hard_negative" and result["resolution_status"] == "resolved"
+    elif "uncertain" in relations:
+        assert result["basket_label"] == "skip" and result["resolution_status"] == "uncertain"
+    else:
+        assert relations == ("no", "no", "no")
+        assert result["basket_label"] == "skip" and result["resolution_status"] == "resolved"
+
+
+def test_basket_resolver_rejects_unknown_saved_version():
+    answer = {
+        "identity": {"label": "distinct"},
+        "relations": {head: {"label": "no"} for head in compare.RELATION_HEADS},
+    }
+    with pytest.raises(ValueError, match="Unsupported saved resolver version"):
+        compare.resolve_basket_judgment(answer, "future-unknown-resolver")
 
 
 def test_jev_payload_preserves_recommendation_direction(prepared):
@@ -580,6 +1287,7 @@ def test_completed_batch_is_flushed_before_group_finishes(prepared, tmp_path):
 def test_execute_flag_requires_completed_baseline_before_network(catalogs, tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr(compare, "load_operator_environment", lambda *args: None)
     output = tmp_path / "run"
     monkeypatch.setattr("sys.argv", ["compare.py", "--data-dir", str(catalogs),
                                     "--manifest", str(tmp_path / "manifest.json"),
@@ -996,6 +1704,75 @@ def test_baseline_offline_import_and_incomplete_loader(baseline_seed, tmp_path, 
         compare.load_completed_baseline(manifest, root)
 
 
+def test_v2_baseline_starts_fresh_and_rejects_v1_import(relation_prepared, completed_run, tmp_path, monkeypatch):
+    manifest, _ = relation_prepared
+    legacy_manifest_path, legacy_run = completed_run
+    legacy_manifest = json.loads(legacy_manifest_path.read_text())
+    root = tmp_path / "relation-baselines"
+    monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Offline preparation made HTTP call"))
+
+    directory, state = compare.prepare_gpt_baseline(manifest, root)
+    spec = compare.baseline_spec(manifest)
+    assert spec["schema_version"] == compare.GPT_INPUT_V2
+    assert spec["manifest_schema_version"] == compare.MANIFEST_V2
+    assert state["schema_version"] == compare.GPT_BASELINE_V2
+    assert not state["complete"] and state["classifications"] == []
+    assert len(state["missing_pair_ids"]) == 800
+    assert json.loads((directory / "spec.json").read_text()) == spec
+    assert compare.baseline_spec(legacy_manifest)["schema_version"] == compare.GPT_INPUT_V1
+    assert compare.baseline_spec(legacy_manifest) != spec
+    with pytest.raises(ValueError, match="request mismatch"):
+        compare.prepare_gpt_baseline(manifest, root, import_run=legacy_run)
+    assert not (directory / "imported.jsonl").exists()
+
+
+def test_v2_gpt_fingerprint_tracks_only_gpt_relation_inputs(relation_prepared):
+    manifest, _ = relation_prepared
+    original = compare.baseline_spec(manifest)
+    changed = copy.deepcopy(manifest)
+    changed["contract"]["gpt_system_prompt"] += " Changed."
+    assert compare.baseline_spec(changed) != original
+    changed = copy.deepcopy(manifest)
+    changed["contract"]["relation_criteria"]["co_purchase"]["yes"] += " Jev-only change."
+    assert compare.baseline_spec(changed) == original
+    changed = copy.deepcopy(manifest)
+    changed["contract"]["relation_instructions"]["alternative"] += " Jev-only change."
+    changed["contract"]["identity_instruction"] += " Jev-only change."
+    assert compare.baseline_spec(changed) == original
+    changed = copy.deepcopy(manifest)
+    changed["shops"]["furniture.co.uk"]["batches"][0]["candidates"].reverse()
+    assert compare.baseline_spec(changed) != original
+
+
+@pytest.fixture
+def relation_baseline_ready(relation_prepared, tmp_path, monkeypatch):
+    manifest, jobs = relation_prepared
+    root = tmp_path / "relation-baselines"
+    lookup = {
+        compare.canonical_json(payload): (batch, payload)
+        for batch, payload in [job for work in jobs["gpt"].values() for job in work]
+    }
+    calls = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        batch, expected_payload = lookup[compare.canonical_json(payload)]
+        return httpx.Response(200, json=relation_response_for("gpt", expected_payload, batch))
+
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy-relation-baseline-key")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    directory, state = compare.prepare_gpt_baseline(
+        manifest, root, paid=True, transport=httpx.MockTransport(handler)
+    )
+    assert state["complete"] and state["schema_version"] == compare.GPT_BASELINE_V2
+    assert len(calls) == 40 and len(state["classifications"]) == 800
+    assert all(row["identity"]["label"] == "distinct" for row in state["classifications"])
+    assert all(row["relations"]["co_purchase"]["label"] == "yes" for row in state["classifications"])
+    assert compare.load_completed_baseline(manifest, root) == state
+    return manifest, root, directory, state
+
+
 def test_baseline_completes_only_missing_batches_and_reuses_without_keys(baseline_seed, tmp_path, monkeypatch):
     manifest, source, missing = baseline_seed
     root = tmp_path / "baselines"
@@ -1173,7 +1950,7 @@ def test_baseline_lock_prevents_concurrent_paid_preparation(prepared, tmp_path, 
 
 def test_baseline_cli_import_needs_no_credentials(baseline_seed, tmp_path, monkeypatch, capsys):
     manifest, source, _ = baseline_seed
-    monkeypatch.setattr(compare, "build_manifest", lambda *args: manifest)
+    monkeypatch.setattr(compare, "build_relation_manifest", lambda *args: manifest)
     monkeypatch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Offline CLI import made HTTP call"))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
@@ -1248,6 +2025,392 @@ def test_baseline_recovers_checkpoint_before_interrupted_tail(baseline_seed, tmp
     assert interrupted.read_bytes() == snapshot
     assert complete["accounting"]["repair"]["cost_estimate_usd"] is None
     assert compare.load_completed_baseline(manifest, root) == complete
+
+
+def test_v3_jev_experiment_uses_stream_qualified_immutable_snapshots(
+        relation_baseline_ready, tmp_path, monkeypatch, capsys):
+    relation_manifest, baseline_root, baseline_directory, baseline = relation_baseline_ready
+    manifest = compare.decompose_relation_manifest(relation_manifest)
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(manifest, first, second)
+    adjudication_dir = tmp_path / "adjudication"
+    artifact = compare.prepare_adjudication_artifact(manifest, first, second, adjudication_dir)
+    baseline_files = {str(path.relative_to(baseline_directory)): path.read_bytes()
+                      for path in baseline_directory.rglob("*") if path.is_file()}
+    calls = []
+
+    def handler(request):
+        assert request.url.host == "api.typesafe.ai"
+        payload = json.loads(request.content)
+        calls.append(payload)
+        return httpx.Response(200, json=decomposed_response_for(payload))
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "dummy-decomposed-jev-key")
+    directory, failures = compare.run_jev_experiment(
+        manifest, baseline_root, experiments_root=tmp_path / "decomposed-experiments",
+        adjudication_dir=adjudication_dir, transport=httpx.MockTransport(handler),
+    )
+
+    assert failures == 0 and len(calls) == 160
+    raw_summary = json.loads((directory / "summary.json").read_text())
+    assert raw_summary["schema_version"] == compare.DECOMPOSED_REPORT_V1
+    assert raw_summary["run_complete"] and raw_summary["all_pairs_classified"]
+    assert raw_summary["policy"] == {"status": "not_selected", "auto_selection": False}
+    assert raw_summary["human_metrics"] == {"status": "unavailable"}
+    assert {path.name for path in directory.iterdir()} == {
+        "manifest.json", "baseline.json", "adjudication.json", "experiment.json", "requests.jsonl",
+        "gpt_classifications.jsonl", "jev_stream_classifications.jsonl", "paired_results.csv",
+        "disagreements.csv", "summary.json",
+    }
+    experiment = json.loads((directory / "experiment.json").read_text())
+    assert experiment["schema_version"] == compare.JEV_EXPERIMENT_V3
+    assert experiment["manifest_schema_version"] == compare.MANIFEST_V3
+    assert experiment["decomposed_contract"] == manifest["decomposed_contract"]
+    assert experiment["resolver_versions"] == manifest["decomposed_contract"]["resolver_versions"]
+    assert experiment["adjudication"]["artifact_id"] == artifact["artifact_id"]
+    assert len(experiment["jev_request_hashes"]) == 160
+    assert all(request_id.rsplit("/", 1)[-1] in {
+        "identity", "construction_finish", "design_language", "placement_context",
+        "together_use", "substitute", "incompatibility",
+    } for request_id in experiment["jev_request_hashes"])
+    validated_experiment, validated_baseline = compare.validate_v3_experiment_log(directory)
+    assert validated_experiment == experiment and validated_baseline == baseline
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "MAX_RETRIES", 0)
+        patch.setattr(compare, "DECOMPOSED_EXTRACTION_VERSION", "future-live-extraction")
+        patch.setattr(compare, "PROBABILITY_SUM_TOLERANCE", 0)
+        patch.setattr(compare, "CHOICE_MAX_TOLERANCE", 0)
+        assert compare.validate_v3_experiment_log(directory) == (experiment, baseline)
+    records, _ = compare.read_request_log(directory / "requests.jsonl")
+    starts = [record for record in records if record["record_type"] == "group_start"]
+    batches = [record for record in records if record["record_type"] == "batch"]
+    assert len(starts) == 8 and len(batches) == 160
+    assert len({record["request_id"] for record in batches}) == 160
+    assert all(record["stream"] == record["request"]["state"]["stream"] for record in batches)
+    assert {record["extraction_version"] for record in batches} == {compare.DECOMPOSED_EXTRACTION_V1}
+    assert {str(path.relative_to(baseline_directory)): path.read_bytes()
+            for path in baseline_directory.rglob("*") if path.is_file()} == baseline_files
+
+    reviewed = compare.jsonl_records(adjudication_dir / "labels-template.jsonl")
+    no_evidence = {
+        "together_use": "no_concrete_mechanism", "substitute": "no_concrete_substitute",
+        "incompatibility": "no_explicit_mismatch", "construction_finish": "no_concrete_evidence",
+        "design_language": "no_concrete_evidence", "placement_context": "no_concrete_evidence",
+    }
+    for row in reviewed:
+        row.update(
+            reviewed_at="2026-09-22T12:00:00+00:00", identity="distinct", final_label="skip",
+            ambiguity=False, review_notes="Synthetic complete review",
+        )
+        row["mechanisms"] = {stream: no_evidence[stream] for stream in row["mechanisms"]}
+    revision = compare.publish_adjudication_labels(adjudication_dir, reviewed, 1)
+    pre_policy = compare.write_decomposed_reports(
+        directory / "manifest.json", directory, adjudication_dir=adjudication_dir, review_revision=1,
+    )
+    assert pre_policy["human_metrics"]["holdout_status"] == "sealed"
+    assert not (directory / "review-labels.jsonl").exists()
+    curves = json.loads((directory / "probability-curves.json").read_text())
+    assert curves["streams"]["identity"]["reviewed_pairs"] == 48
+    pre_policy_rows = list(csv.DictReader((directory / "paired_results.csv").open()))
+    assert sum(bool(row["human_final_label"]) for row in pre_policy_rows) == 48
+    assert all(not row["human_final_label"] for row in pre_policy_rows if row["review_split"] != "development")
+    selection = {
+        "schema_version": compare.DECOMPOSED_POLICY_SELECTION_V1,
+        "chosen_by": "Boris", "chosen_at": "2026-09-22T13:00:00+00:00",
+        "rules": decomposed_policy_rules(manifest["decomposed_contract"]),
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "POLICY_THRESHOLD_GRID", (0.0,))
+        summary = compare.write_decomposed_reports(
+            directory / "manifest.json", directory, adjudication_dir=adjudication_dir,
+            review_revision=1, policy_selection=selection,
+        )
+    assert summary["policy"]["status"] == "selected"
+    assert summary["policy"]["policy"]["chosen_by"] == "Boris"
+    assert summary["probability_curves"]["selection_split"] == "development"
+    assert summary["human_metrics"]["development"]["reviewed"] == 48
+    assert summary["human_metrics"]["holdout"]["reviewed"] == 96
+    assert summary["human_metrics"]["holdout_not_used_for_selection"]
+    assert json.loads((directory / "probability-curves.json").read_text())["auto_selected_policy"] is None
+    assert json.loads((directory / "review-labels.manifest.json").read_text()) == revision
+    assert len(compare.jsonl_records(directory / "jev_stream_classifications.jsonl")) == 800
+    assert compare.write_decomposed_reports(directory / "manifest.json", directory) == summary
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "POLICY_THRESHOLD_GRID", (0.0,))
+        assert compare.write_decomposed_reports(directory / "manifest.json", directory) == summary
+    with monkeypatch.context() as patch:
+        patch.setattr(compare.httpx, "Client", lambda *args, **kwargs: pytest.fail("Report-only used network"))
+        patch.setattr("sys.argv", ["compare.py", "--report-only", "--output-dir", str(directory)])
+        compare.main()
+    assert "Reports rebuilt offline" in capsys.readouterr().out
+
+    changed_selection = copy.deepcopy(selection)
+    changed_selection["rules"]["identity"]["min_probability"] = 0.8
+    with pytest.raises(ValueError, match="Refusing to replace immutable baseline file"):
+        compare.write_decomposed_reports(
+            directory / "manifest.json", directory, adjudication_dir=adjudication_dir,
+            review_revision=1, policy_selection=changed_selection,
+        )
+
+    log_path = directory / "requests.jsonl"
+    original_log = log_path.read_bytes()
+
+    def rejects(mutator, message):
+        changed = copy.deepcopy(records)
+        mutator(changed)
+        write_blocks(log_path, changed)
+        with pytest.raises(ValueError, match=message):
+            compare.validate_v3_experiment_log(directory)
+        log_path.write_bytes(original_log)
+
+    rejects(lambda changed: changed[0].update(concurrency=99), "concurrency mismatch")
+    rejects(lambda changed: changed[-1].update(failed_batches=1), "failure count mismatch")
+    rejects(lambda changed: changed.insert(-1, copy.deepcopy(changed[-1])), "after run_end")
+
+    def tamper_probability(changed):
+        record = next(row for row in changed if row["record_type"] == "batch")
+        probabilities = record["answers"][0]["probabilities"]
+        choice = record["answers"][0]["label"]
+        other = next(label for label in probabilities if label != choice)
+        probabilities[choice] -= 0.01
+        probabilities[other] += 0.01
+
+    rejects(tamper_probability, "differ from attempt evidence")
+
+    def tamper_candidate(changed):
+        record = next(row for row in changed if row["record_type"] == "batch")
+        record["answers"][0]["candidate_id"] = "tampered"
+
+    rejects(tamper_candidate, "differ from attempt evidence")
+
+    def tamper_request(changed):
+        record = next(row for row in changed if row["record_type"] == "batch")
+        record["request"]["state"]["stream"] = "tampered"
+
+    rejects(tamper_request, "differs from experiment snapshot")
+
+    failed_once = False
+    failure_lock = threading.Lock()
+
+    def mixed_handler(request):
+        nonlocal failed_once
+        payload = json.loads(request.content)
+        with failure_lock:
+            if not failed_once:
+                failed_once = True
+                return httpx.Response(200, json=decomposed_response_for(payload, missing="candidate_0"))
+        return httpx.Response(200, json=decomposed_response_for(payload))
+
+    mixed_directory, mixed_failures = compare.run_jev_experiment(
+        manifest, baseline_root, experiments_root=tmp_path / "mixed-experiments",
+        adjudication_dir=adjudication_dir, transport=httpx.MockTransport(mixed_handler),
+    )
+    assert mixed_failures == 1
+    compare.validate_v3_experiment_log(mixed_directory)
+    mixed_records, _ = compare.read_request_log(mixed_directory / "requests.jsonl")
+    statuses = Counter(record["status"] for record in mixed_records if record["record_type"] == "batch")
+    assert statuses == {"ok": 159, "error": 1}
+
+
+def test_decomposed_cli_preflight_is_offline(catalogs, tmp_path, monkeypatch, capsys):
+    manifest = compare.build_decomposed_manifest(catalogs)
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(manifest, first, second)
+    adjudication_dir = tmp_path / "adjudication"
+    compare.prepare_adjudication_artifact(manifest, first, second, adjudication_dir)
+    monkeypatch.setattr(compare.httpx, "Client", lambda *args, **kwargs: pytest.fail("Preflight used network"))
+    monkeypatch.setattr("sys.argv", [
+        "compare.py", "--jev-arm", "decomposed", "--data-dir", str(catalogs),
+        "--manifest", str(tmp_path / "decomposed-manifest.json"),
+        "--adjudication-dir", str(adjudication_dir),
+    ])
+
+    compare.main()
+
+    output = capsys.readouterr().out
+    assert "No API requests made" in output
+    assert "Decomposed contract" in output
+    assert output.count("40 Jev requests across 4 stream(s)") == 4
+
+
+def test_decomposed_baseline_cli_only_reuses_completed_gpt_baseline(
+        relation_baseline_ready, tmp_path, monkeypatch, capsys):
+    relation_manifest, baseline_root, _, baseline = relation_baseline_ready
+    manifest = compare.decompose_relation_manifest(relation_manifest)
+    monkeypatch.setattr(compare, "build_decomposed_manifest", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(compare.httpx, "Client", lambda *args, **kwargs: pytest.fail("Decomposed baseline used network"))
+    monkeypatch.setattr("sys.argv", [
+        "compare.py", "--jev-arm", "decomposed", "--prepare-baseline",
+        "--manifest", str(tmp_path / "manifest.json"), "--baseline-root", str(baseline_root),
+    ])
+
+    compare.main()
+
+    output = capsys.readouterr().out
+    assert f"Retained {len(baseline['classifications'])} judgments; 0 missing" in output
+    monkeypatch.setattr(compare, "load_operator_environment", lambda *args: pytest.fail("Read operator environment"))
+    monkeypatch.setattr("sys.argv", [
+        "compare.py", "--jev-arm", "decomposed", "--prepare-baseline", "--execute",
+    ])
+    with pytest.raises(SystemExit) as error:
+        compare.main()
+    assert error.value.code == 2
+
+
+def test_v2_jev_experiment_uses_immutable_relation_snapshots(
+        relation_baseline_ready, tmp_path, monkeypatch, capsys):
+    manifest, root, baseline_directory, baseline = relation_baseline_ready
+    baseline_files = {str(path.relative_to(baseline_directory)): path.read_bytes()
+                      for path in baseline_directory.rglob("*") if path.is_file()}
+    calls = []
+
+    def handler(request):
+        assert request.url.host == "api.typesafe.ai"
+        payload = json.loads(request.content)
+        calls.append(payload)
+        return httpx.Response(200, json=relation_response_for("jev", payload, None))
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "dummy-relation-jev-key")
+    directory, failures = compare.run_jev_experiment(
+        manifest, root, experiments_root=tmp_path / "relation-experiments",
+        transport=httpx.MockTransport(handler),
+    )
+    assert failures == 0 and len(calls) == 40
+    summary = json.loads((directory / "summary.json").read_text())
+    assert summary["schema_version"] == "jev-sbs-relation-report-v1"
+    assert summary["run_complete"] and summary["all_pairs_classified"]
+    assert summary["new_inference"]["gpt_http_attempts"] == 0
+    assert summary["new_inference"]["jev_http_attempts"] == 40
+    assert summary["gpt_baseline"]["classifications"] == 800
+    for shop in compare.SHOPS:
+        agreement = summary["agreement"][shop]
+        assert agreement["paired_success"] == 400 and agreement["pairs_with_any_disagreement"] == 0
+        assert all(head["agreements"] == 400 and head["agreement_rate"] == 1
+                   for head in agreement["heads"].values())
+        for provider in ("gpt", "jev"):
+            distribution = summary["classifications"][provider][shop]
+            assert distribution["identity_counts"]["distinct"] == 400
+            assert distribution["relation_counts"]["co_purchase"]["yes"] == 400
+            assert distribution["basket_label_counts"]["positive"] == 400
+    paired = list(csv.DictReader((directory / "paired_results.csv").open()))
+    assert len(paired) == 800
+    assert {"gpt_identity", "jev_identity", "gpt_co_purchase", "jev_co_purchase",
+            "gpt_basket_label", "jev_basket_label", "any_disagreement"} <= set(paired[0])
+    assert (directory / "disagreements.csv").read_text().count("\n") == 1
+    experiment = json.loads((directory / "experiment.json").read_text())
+    assert experiment["schema_version"] == compare.JEV_EXPERIMENT_V2
+    assert experiment["manifest_schema_version"] == compare.MANIFEST_V2
+    assert experiment["relation_contract_version"] == manifest["contract"]["version"]
+    assert experiment["resolver_version"] == compare.RESOLVER_VERSION
+    assert experiment["jev_identity_instruction"] == manifest["contract"]["identity_instruction"]
+    assert experiment["jev_identity_criteria"] == manifest["contract"]["identity_criteria"]
+    assert json.loads((directory / "baseline.json").read_text()) == baseline
+    validated_experiment, validated_baseline = compare.validate_v2_experiment_log(directory)
+    assert validated_experiment == experiment and validated_baseline == baseline
+    assert {str(path.relative_to(baseline_directory)): path.read_bytes()
+            for path in baseline_directory.rglob("*") if path.is_file()} == baseline_files
+    report_files = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+    assert compare.write_reports(directory / "manifest.json", directory) == summary
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == report_files
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "build_relation_manifest", lambda *a, **k: pytest.fail("Report-only prepared data"))
+        patch.setattr(compare.httpx, "Client", lambda *a, **k: pytest.fail("Report-only used network"))
+        patch.setattr("sys.argv", ["compare.py", "--report-only", "--output-dir", str(directory)])
+        compare.main()
+    assert "Reports rebuilt offline" in capsys.readouterr().out
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == report_files
+
+    def future_resolver(answer):
+        result = compare.resolve_basket_judgment_v1(answer)
+        return {**result, "resolver_version": "future-resolver", "basket_label": "skip",
+                "resolution_status": "future", "resolution": "future_resolution"}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "GPT_RELATION_SYSTEM_PROMPT", "future GPT prompt")
+        patch.setattr(compare, "IDENTITY_INSTRUCTION", "future identity instruction")
+        patch.setattr(compare, "RELATION_CRITERIA", {"future": "Jev criteria"})
+        patch.setattr(compare, "RESOLVER_VERSION", "future-resolver")
+        patch.setattr(compare, "RESOLVERS", {
+            compare.RESOLVER_VERSION: future_resolver,
+            experiment["resolver_version"]: compare.resolve_basket_judgment_v1,
+        })
+        assert compare.validate_v2_experiment_log(directory) == (experiment, baseline)
+        assert compare.write_reports(directory / "manifest.json", directory) == summary
+        for provider in ("gpt", "jev"):
+            classifications = [
+                json.loads(line)
+                for line in (directory / f"{provider}_classifications.jsonl").read_text().splitlines()
+            ]
+            assert {
+                row["resolution"]["resolver_version"]
+                for row in classifications
+                if row["resolution"] is not None
+            } == {experiment["resolver_version"]}
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "RESOLVERS", {"future-resolver": future_resolver})
+        with pytest.raises(ValueError, match="Unsupported saved resolver version"):
+            compare.write_reports(directory / "manifest.json", directory)
+
+    log_path = directory / "requests.jsonl"
+    original_log = log_path.read_bytes()
+    records, _ = compare.read_request_log(log_path)
+    rounded = next(record for record in records if record["record_type"] == "batch")
+    rounded_choice = rounded["raw_response"]["answers"]["candidate_0_incompatible"]
+    rounded_choice.update(choice="yes", probabilities={"yes": 0.49, "no": 0.50, "uncertain": 0.01})
+    rounded.update(status="error", error="invalid_response", answers=[])
+    rounded["attempts"][-1]["error"] = "invalid_response"
+    write_blocks(log_path, records)
+    recovered = compare.write_reports(directory / "manifest.json", directory)
+    shop = rounded["shop"]
+    group = recovered["groups"][f"jev/{shop}"]
+    assert recovered["all_pairs_classified"]
+    assert recovered["extraction"]["version"] == compare.RELATION_EXTRACTION_VERSION
+    assert recovered["extraction"]["choice_max_tolerance"] == compare.CHOICE_MAX_TOLERANCE
+    assert group["choice_probability_warnings"] == 1
+    assert group["reextracted_batches"] == group["recorded_failed_attempts"] == 1
+    assert group["failed_attempts"] == group["failed_pairs"] == 0
+    recovered_row = next(
+        json.loads(line)
+        for line in (directory / "jev_classifications.jsonl").read_text().splitlines()
+        if json.loads(line)["pair_id"] == rounded["pair_ids"][0]
+    )
+    assert recovered_row["relations"]["incompatible"]["choice_probability_warning"] is True
+    paired_row = next(
+        row for row in csv.DictReader((directory / "paired_results.csv").open())
+        if row["pair_id"] == rounded["pair_ids"][0]
+    )
+    assert paired_row["jev_incompatible_choice_probability_warning"] == "True"
+    log_path.write_bytes(original_log)
+    assert compare.write_reports(directory / "manifest.json", directory) == summary
+
+    records, _ = compare.read_request_log(log_path)
+    failed = next(record for record in records if record["record_type"] == "batch")
+    failed.update(status="error", error="http_422", answers=[], raw_response=None)
+    failed["attempts"][-1].update(error="http_422", answers=[], raw_response=None, http_status=422)
+    write_blocks(log_path, records)
+    partial = compare.write_reports(directory / "manifest.json", directory)
+    shop = failed["shop"]
+    assert not partial["all_pairs_classified"] and partial["agreement"][shop]["unpaired"] == failed["batch_size"]
+    failed_rows = [json.loads(line) for line in (directory / "jev_classifications.jsonl").read_text().splitlines()
+                   if json.loads(line)["status"] != "ok"]
+    assert len(failed_rows) == failed["batch_size"]
+    assert all(row["error"] == "http_422" and row["identity"] is None and row["resolution"] is None
+               for row in failed_rows)
+    log_path.write_bytes(original_log)
+    assert compare.write_reports(directory / "manifest.json", directory) == summary
+
+    records, _ = compare.read_request_log(log_path)
+    batch = next(record for record in records if record["record_type"] == "batch")
+    batch["request"]["questions"]["candidate_0_identity"]["criteria"]["distinct"] = "tampered"
+    write_blocks(log_path, records)
+    with pytest.raises(ValueError, match="differs from experiment snapshot"):
+        compare.validate_v2_experiment_log(directory)
+    with pytest.raises(ValueError, match="differs from experiment snapshot"):
+        compare.write_reports(directory / "manifest.json", directory)
 
 
 @pytest.fixture
@@ -1428,6 +2591,31 @@ def test_ready_experiment_requires_only_jev_credential_before_directory_creation
     assert not output.exists()
 
 
+def test_operator_environment_loads_dotenv_without_overriding_process_values(tmp_path, monkeypatch):
+    worktree = tmp_path / "worktree"
+    source = tmp_path / "source"
+    worktree.mkdir()
+    (source / "data").mkdir(parents=True)
+    (worktree / ".env").write_text(
+        "OPENAI_API_KEY=dotenv-openai\nWORKTREE_DOTENV_MARKER=loaded\n",
+        encoding="utf-8",
+    )
+    (source / ".env").write_text(
+        "TYPESAFE_API_KEY=source-typesafe\nWORKTREE_DOTENV_MARKER=source\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("OPENAI_API_KEY", "process-openai")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("WORKTREE_DOTENV_MARKER", raising=False)
+
+    compare.load_operator_environment(source / "data")
+
+    assert os.environ["OPENAI_API_KEY"] == "process-openai"
+    assert os.environ["WORKTREE_DOTENV_MARKER"] == "loaded"
+    assert os.environ["TYPESAFE_API_KEY"] == "source-typesafe"
+
+
 def test_default_execute_cli_calls_only_jev(experiment_ready, tmp_path, monkeypatch, capsys):
     manifest, root, _ = experiment_ready
     execute = compare.execute
@@ -1439,7 +2627,8 @@ def test_default_execute_cli_calls_only_jev(experiment_ready, tmp_path, monkeypa
         return execute(*args, **kwargs)
 
     monkeypatch.setattr(compare, "execute", mocked_execute)
-    monkeypatch.setattr(compare, "build_manifest", lambda *a: manifest)
+    monkeypatch.setattr(compare, "build_relation_manifest", lambda *a: manifest)
+    monkeypatch.setattr(compare, "load_operator_environment", lambda *args: None)
     output = tmp_path / "cli-experiment"
     monkeypatch.setattr("sys.argv", ["compare.py", "--execute", "--baseline-root", str(root),
                                     "--manifest", str(tmp_path / "frozen.json"), "--output-dir", str(output)])

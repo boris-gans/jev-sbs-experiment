@@ -20,6 +20,7 @@ import time
 import uuid
 
 import httpx
+from dotenv import load_dotenv
 
 
 SHOPS = {
@@ -42,6 +43,36 @@ GPT_SETTINGS = {
     "max_completion_tokens": None,
 }
 LABELS = ("hard_negative", "positive", "skip")
+IDENTITY_LABELS = ("duplicate", "variant", "redundant", "distinct", "uncertain")
+RELATION_LABELS = ("yes", "no", "uncertain")
+RELATION_HEADS = ("co_purchase", "alternative", "incompatible")
+BASKET_LABELS = ("positive", "hard_negative", "skip", "conflict")
+RELATION_CONTRACT_VERSION = "universal-relations-v1"
+RESOLVER_V1 = "basket-projection-v1"
+RESOLVER_VERSION = RESOLVER_V1
+MANIFEST_V1 = "jev-sbs-manifest-v1"
+MANIFEST_V2 = "jev-sbs-manifest-v2"
+MANIFEST_V3 = "jev-sbs-decomposed-manifest-v1"
+DECOMPOSED_CONTRACT_VERSION = "objective-mechanisms-v1"
+DECOMPOSED_COMPLEMENTS_RESOLVER_V1 = "decomposed-complements-v1"
+DECOMPOSED_STYLE_RESOLVER_V1 = "decomposed-style-compatibility-v1"
+DECOMPOSED_EXTRACTION_V1 = "decomposed-choice-extraction-v1"
+DECOMPOSED_EXTRACTION_VERSION = DECOMPOSED_EXTRACTION_V1
+DECOMPOSED_PROBABILITY_SUM_TOLERANCE_V1 = 0.015
+DECOMPOSED_CHOICE_MAX_TOLERANCE_V1 = 0.01
+DECOMPOSED_POLICY_SELECTION_V1 = "decomposed-probability-policy-selection-v1"
+DECOMPOSED_POLICY_V1 = "decomposed-probability-policy-v1"
+DECOMPOSED_REPORT_V1 = "jev-sbs-decomposed-report-v1"
+POLICY_THRESHOLD_GRID = tuple(value / 20 for value in range(21))
+ADJUDICATION_SCHEMA_VERSION = "jev-sbs-adjudication-v1"
+ADJUDICATION_SEED = "FERODEV-8283-adjudication-v1"
+GPT_INPUT_V1 = "gpt-input-v1"
+GPT_INPUT_V2 = "gpt-input-v2"
+GPT_BASELINE_V1 = "gpt-baseline-v1"
+GPT_BASELINE_V2 = "gpt-baseline-v2"
+JEV_EXPERIMENT_V1 = "jev-experiment-v1"
+JEV_EXPERIMENT_V2 = "jev-experiment-v2"
+JEV_EXPERIMENT_V3 = "jev-decomposed-experiment-v1"
 ENDPOINTS = {
     "gpt": "https://api.openai.com/v1/chat/completions",
     "jev": "https://api.typesafe.ai/v1/systemone",
@@ -50,7 +81,9 @@ MAX_RETRIES = 2
 TIMEOUT_SECONDS = 120.0
 MAX_RETRY_DELAY = 60.0
 PROBABILITY_SUM_TOLERANCE = 0.015  # Three probabilities rounded to two decimal places.
+CHOICE_MAX_TOLERANCE = 0.01  # Selected choice may differ from rounded maximum by one percentage point.
 EXTRACTION_VERSION = "partial-answers-v2"
+RELATION_EXTRACTION_VERSION = "relation-heads-v2"
 JEV_PROMPT_VERSION = "objective-boundaries-v3"
 JEV_INSTRUCTIONS = {
     "style_compatibility": (
@@ -130,6 +163,193 @@ JEV_CRITERIA = {
         ),
     },
 }
+IDENTITY_CRITERIA = {
+    "duplicate": "The two listings describe the same product, not merely similar products.",
+    "variant": (
+        "The same named model or clearly established product family differs only on a variant axis such as size, "
+        "colour, finish, scent, origin, grade, or pack size. Shared brand, collection, colour, or category without "
+        "the same named model or clearly established family is not enough."
+    ),
+    "redundant": (
+        "In this direction the base already includes or integrates the candidate, so buying the candidate repeats "
+        "something supplied by the base."
+    ),
+    "distinct": "The candidate is a genuinely distinct product from the base.",
+    "uncertain": (
+        "The supplied product evidence cannot safely distinguish a true identity/family relationship from merely "
+        "related products, or cannot establish directional redundancy."
+    ),
+}
+RELATION_CRITERIA = {
+    "co_purchase": {
+        "yes": (
+            "The supplied text establishes a specific together-use relationship after selecting the base: an "
+            "accessory or component, compatible part, refill or consumable dependency, setup requirement, explicit "
+            "serving or recipe pairing, coordinated-use pairing, or bundle with directly complementary contents."
+        ),
+        "no": (
+            "The supplied text establishes that the candidate is not useful to buy with the selected base, including "
+            "a competing single-item role without multi-unit or bundle context, or an explicitly unrelated use context."
+        ),
+        "uncertain": (
+            "The supplied text establishes neither a concrete together-use relationship nor that the products should "
+            "not be bought together. Plausible joint purchase alone is uncertain."
+        ),
+    },
+    "alternative": {
+        "yes": (
+            "The distinct candidate has the same immediate purchasing role and compatible use context, so the "
+            "supplied text supports choosing it instead of the base."
+        ),
+        "no": (
+            "The supplied text establishes a different primary role or use context, or identifies the candidate as an "
+            "accessory, component, sauce, seasoning, side item, or other related product rather than a replacement."
+        ),
+        "uncertain": (
+            "The supplied text does not establish whether the distinct candidate fills the same immediate purchasing "
+            "role. Shared category or broad use alone is uncertain."
+        ),
+    },
+    "incompatible": {
+        "yes": (
+            "The supplied text explicitly establishes that the candidate is unusable with the base because of size, "
+            "interface, system, specification, use context, dietary constraint, or another concrete incompatibility."
+        ),
+        "no": "The supplied text affirmatively establishes compatibility or rules out the relevant mismatch.",
+        "uncertain": (
+            "The supplied text establishes neither compatibility nor a concrete incompatibility. Different product "
+            "types, flavours, or missing fit information are uncertain, not incompatible."
+        ),
+    },
+}
+IDENTITY_INSTRUCTION = (
+    "Classify the IDENTITY of candidates[{index}] relative to base in this direction. Identity is separate from "
+    "whether the products complement, replace, or conflict with each other. Do not infer a variant from shared "
+    "brand, collection, colour, or category without the same named model or a clearly established product family."
+)
+RELATION_UNCERTAINTY_INSTRUCTION = (
+    "Use uncertain whenever the supplied listing text establishes neither yes nor no. Absence of evidence is not no, "
+    "and a merely plausible relationship is not yes."
+)
+RELATION_INSTRUCTIONS = {
+    "co_purchase": (
+        "Judge candidates[{index}] independently for CO-PURCHASE in this direction: after selecting base, would the "
+        "shopper reasonably add the candidate to the same purchase? Require a concrete accessory, dependency, "
+        "serving or recipe, bundle, or coordinated-use relationship. Shared category, brand, collection, colour, "
+        "style, cuisine, or plausible joint purchase is insufficient. Do not suppress this answer because of identity. "
+        + RELATION_UNCERTAINTY_INSTRUCTION
+    ),
+    "alternative": (
+        "Judge candidates[{index}] independently as an ALTERNATIVE in this direction: before selecting base, would "
+        "the shopper reasonably buy the candidate instead? Require the same immediate purchasing role and compatible "
+        "use context, not merely the same broad category. Variants, line extensions, accessories, components, sauces, "
+        "seasonings, and side items are not alternatives. Do not suppress this answer because of identity. "
+        + RELATION_UNCERTAINTY_INSTRUCTION
+    ),
+    "incompatible": (
+        "Judge candidates[{index}] independently for INCOMPATIBILITY in this direction: is the candidate strongly "
+        "related but explicitly unusable with base? Require a stated size, interface, system, specification, context, "
+        "dietary, or other concrete mismatch. Different product types, flavours, or missing fit information are not "
+        "evidence of incompatibility. Do not suppress this answer because of identity. "
+        + RELATION_UNCERTAINTY_INSTRUCTION
+    ),
+}
+GPT_RELATION_SYSTEM_PROMPT = """You evaluate directed product pairs for four separate SBS decisions.
+
+IDENTITY
+- duplicate: the same product appears as two listings.
+- variant: the same named model or family differs only by size, colour, finish, scent, origin, grade, pack size, or another variant axis.
+- redundant: in this direction, the base already includes or integrates the candidate.
+- distinct: genuinely different products.
+- uncertain: the supplied evidence cannot safely establish identity.
+
+RELATIONS
+- co_purchase: after selecting the base, would the shopper reasonably add the candidate to the same purchase?
+- alternative: before selecting the base, would the shopper reasonably buy the candidate instead?
+- incompatible: is the candidate strongly related but explicitly unusable, wrong-context, or incompatible?
+
+Answer each relation independently with yes, no, or uncertain. Do not omit or change relation answers because of the identity answer. Require concrete evidence from the supplied name, category, and description. Broad category, brand, colour, or thematic similarity alone is insufficient. Missing evidence is uncertain, not no. Preserve direction and do not invent product facts.
+"""
+DECOMPOSED_STREAMS = {
+    "complements": {
+        "together_use": {
+            "instruction": (
+                "Identify the concrete TOGETHER-USE mechanism for candidates[{index}] after selecting base. "
+                "Use only supplied listing evidence; broad relatedness or a plausible joint purchase is not a mechanism."
+            ),
+            "criteria": {
+                "accessory_component": "The candidate is an accessory, attachment, or component used with base.",
+                "compatible_part": "The listing explicitly establishes that the candidate is a compatible part for base.",
+                "refill_consumable": "The candidate is a refill or consumable dependency used by base.",
+                "explicit_bundle_set": "The listings explicitly establish a bundle or set relationship.",
+                "serving_recipe_pairing": "The listings explicitly establish a serving or recipe pairing.",
+                "coordinated_use_pairing": "The listings establish a concrete coordinated-use relationship.",
+                "no_concrete_mechanism": "The supplied evidence establishes none of the listed together-use mechanisms.",
+            },
+        },
+        "substitute": {
+            "instruction": (
+                "Identify the SUBSTITUTE mechanism for candidates[{index}] before selecting base. "
+                "Distinguish the same immediate purchasing role from related products, variants, and components."
+            ),
+            "criteria": {
+                "same_immediate_purchasing_role": "The distinct candidate can be bought instead of base for the same immediate role.",
+                "related_different_role": "The candidate is related but serves a different primary purchasing role.",
+                "same_model_variant": "The candidate is a same-model or clearly established family variant.",
+                "accessory_component_not_replacement": "The candidate is an accessory or component rather than a replacement.",
+                "no_concrete_substitute": "The supplied evidence establishes no concrete substitute mechanism.",
+            },
+        },
+        "incompatibility": {
+            "instruction": (
+                "Identify the explicit INCOMPATIBILITY mechanism for candidates[{index}] with base. "
+                "Missing compatibility facts or merely different products are not incompatibility evidence."
+            ),
+            "criteria": {
+                "size_interface_mismatch": "The listings explicitly establish an incompatible size or interface.",
+                "system_specification_mismatch": "The listings explicitly establish an incompatible system or specification.",
+                "use_context_mismatch": "The listings explicitly establish an incompatible use context.",
+                "dietary_allergen_mismatch": "The listings explicitly establish an incompatible dietary or allergen constraint.",
+                "no_explicit_mismatch": "The supplied evidence establishes no explicit incompatibility mechanism.",
+            },
+        },
+    },
+    "style_compatibility": {
+        "construction_finish": {
+            "instruction": (
+                "Judge only CONSTRUCTION, MATERIAL, AND FINISH evidence for candidates[{index}] with base. "
+                "Shared brand, collection, colour, or generic material alone is not concrete coordination."
+            ),
+            "criteria": {
+                "concrete_coordination": "The listings establish coordinating construction, material, or finish details.",
+                "explicit_mismatch": "The listings establish contradictory construction, material, or finish details.",
+                "no_concrete_evidence": "The supplied evidence establishes neither coordination nor mismatch in this family.",
+            },
+        },
+        "design_language": {
+            "instruction": (
+                "Judge only concrete DESIGN-LANGUAGE evidence for candidates[{index}] with base. "
+                "Category, collection, brand, or broad stylistic similarity alone is insufficient."
+            ),
+            "criteria": {
+                "concrete_coordination": "The listings establish coordinating shape, detailing, or design-era language.",
+                "explicit_mismatch": "The listings establish contradictory shape, detailing, or design-era language.",
+                "no_concrete_evidence": "The supplied evidence establishes neither coordination nor mismatch in this family.",
+            },
+        },
+        "placement_context": {
+            "instruction": (
+                "Judge only PLACEMENT OR USE-CONTEXT evidence for candidates[{index}] with base. "
+                "Same role is not automatically negative and plausible co-placement is not concrete evidence."
+            ),
+            "criteria": {
+                "compatible_context": "The listings establish compatible placement or coordinated use in one context.",
+                "explicit_context_mismatch": "The listings establish a wrong functional role, placement, or use context.",
+                "no_concrete_evidence": "The supplied evidence establishes neither compatible nor incompatible context.",
+            },
+        },
+    },
+}
 PRICING = {
     "as_of": "2026-09-17", "currency": "USD", "unit": "per million tokens",
     "gpt": {"input": 0.05, "cached_input": 0.005, "output": 0.40,
@@ -150,6 +370,12 @@ def canonical_json(value: object) -> bytes:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def manifest_schema(manifest: dict) -> str:
+    schema = manifest.get("schema_version")
+    require(schema in {MANIFEST_V1, MANIFEST_V2, MANIFEST_V3}, "Unsupported manifest schema")
+    return schema
 
 
 def index_records(records: list, key: str) -> dict:
@@ -315,7 +541,7 @@ def select_batches(shop: str, version: str, direction: str, anchors: dict, count
 def build_manifest(data_dir: Path, concurrency: int = 8) -> dict:
     require(concurrency > 0, "Concurrency must be positive")
     manifest = {
-        "schema_version": "jev-sbs-manifest-v1",
+        "schema_version": MANIFEST_V1,
         "selection": {
             "algorithm": "sha256-anchor-blocks-v1",
             "rows_per_direction": ROWS_PER_DIRECTION,
@@ -353,6 +579,82 @@ def build_manifest(data_dir: Path, concurrency: int = 8) -> dict:
             "diagnostics": loaded["diagnostics"],
         }
     return manifest
+
+
+def build_relation_manifest(data_dir: Path, concurrency: int = 8) -> dict:
+    manifest = build_manifest(data_dir, concurrency)
+    manifest["schema_version"] = MANIFEST_V2
+    manifest["contract"] = relation_contract_snapshot()
+    return manifest
+
+
+def build_decomposed_manifest(data_dir: Path, concurrency: int = 8) -> dict:
+    return decompose_relation_manifest(build_relation_manifest(data_dir, concurrency))
+
+
+def decompose_relation_manifest(relation_manifest: dict) -> dict:
+    require(manifest_schema(relation_manifest) == MANIFEST_V2, "Expected v2 relation manifest")
+    manifest = copy.deepcopy(relation_manifest)
+    manifest["schema_version"] = MANIFEST_V3
+    manifest["arm"] = "decomposed"
+    manifest["decomposed_contract"] = decomposed_contract_snapshot()
+    manifest["limitations"].append(
+        "Independent Jev streams repeat product evidence and measure semantic decomposition, not a production cascade."
+    )
+    return manifest
+
+
+def relation_contract_snapshot() -> dict:
+    return {
+        "type": "universal-relations",
+        "version": RELATION_CONTRACT_VERSION,
+        "identity_labels": list(IDENTITY_LABELS),
+        "relation_heads": list(RELATION_HEADS),
+        "relation_labels": list(RELATION_LABELS),
+        "basket_labels": list(BASKET_LABELS),
+        "resolver_version": RESOLVER_VERSION,
+        "gpt_system_prompt": GPT_RELATION_SYSTEM_PROMPT,
+        "identity_instruction": IDENTITY_INSTRUCTION,
+        "identity_criteria": copy.deepcopy(IDENTITY_CRITERIA),
+        "relation_criteria": copy.deepcopy(RELATION_CRITERIA),
+        "relation_instructions": copy.deepcopy(RELATION_INSTRUCTIONS),
+    }
+
+
+def decomposed_contract_snapshot() -> dict:
+    return {
+        "type": "objective-mechanisms",
+        "version": DECOMPOSED_CONTRACT_VERSION,
+        "identity": {
+            "instruction": IDENTITY_INSTRUCTION,
+            "criteria": copy.deepcopy(IDENTITY_CRITERIA),
+        },
+        "objectives": copy.deepcopy(DECOMPOSED_STREAMS),
+        "stream_order": {
+            objective: ["identity", *streams]
+            for objective, streams in DECOMPOSED_STREAMS.items()
+        },
+        "request_policy": {
+            "all_pairs": True,
+            "identity_gated_cascade": False,
+            "batch_size": BATCH_SIZE,
+            "direction_is_semantic": True,
+        },
+        "resolver_versions": {
+            "complements": DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+            "style_compatibility": DECOMPOSED_STYLE_RESOLVER_V1,
+        },
+    }
+
+
+def decomposed_stream_names(contract: dict, objective: str) -> tuple[str, ...]:
+    require(contract.get("type") == "objective-mechanisms", "Invalid decomposed contract")
+    require(isinstance(contract.get("version"), str) and bool(contract["version"]), "Invalid decomposed contract")
+    require(objective in contract["objectives"], "Unsupported decomposed objective")
+    order = tuple(contract["stream_order"][objective])
+    require(order[0] == "identity" and set(order[1:]) == set(contract["objectives"][objective]),
+            "Invalid decomposed stream order")
+    return order
 
 
 def write_manifest(path: Path, manifest: dict) -> str:
@@ -425,11 +727,189 @@ def render_request(provider: str, settings: dict, data: dict, batch: dict) -> di
     }
 
 
+def relation_products(data: dict, batch: dict) -> tuple[dict, list]:
+    product = data["products"][batch["anchor_id"]]
+    base = {"id": product["id"], "text": product["text"]}
+    candidates = [
+        {key: data["products"][item["candidate_id"]][key] for key in ("id", "name", "category", "description")}
+        for item in batch["candidates"]
+    ]
+    return base, candidates
+
+
+def relation_result_schema(labels: tuple[str, ...]) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["label", "reason"],
+        "properties": {
+            "label": {"type": "string", "enum": list(labels)},
+            "reason": {"type": "string", "maxLength": 80},
+        },
+    }
+
+
+def render_relation_request(provider: str, settings: dict, data: dict, batch: dict,
+                            contract: dict | None = None) -> dict:
+    contract = relation_contract_snapshot() if contract is None else contract
+    require(contract.get("type") == "universal-relations" and isinstance(contract.get("version"), str),
+            "Invalid relation contract")
+    identity_labels = tuple(contract["identity_labels"])
+    relation_heads = tuple(contract["relation_heads"])
+    relation_labels = tuple(contract["relation_labels"])
+    require(identity_labels == IDENTITY_LABELS and relation_heads == RELATION_HEADS
+            and relation_labels == RELATION_LABELS, "Unsupported relation labels")
+    base, candidates = relation_products(data, batch)
+    if provider == "gpt":
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["judgments"],
+            "properties": {
+                "judgments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["id", "identity", "relations"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "identity": relation_result_schema(identity_labels),
+                            "relations": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": list(relation_heads),
+                                "properties": {
+                                    head: relation_result_schema(relation_labels) for head in relation_heads
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        user_prompt = (
+            "Base product:\n"
+            f"{json.dumps(base, indent=2, ensure_ascii=False)}\n\n"
+            "Candidates, in request order:\n"
+            f"{json.dumps(candidates, indent=2, ensure_ascii=False)}\n\n"
+            "Return exactly one judgment per candidate ID. Give identity and all three independent relation heads. "
+            "Keep every reason to one short phrase of at most 80 characters."
+        )
+        return {
+            "model": settings["model"],
+            "reasoning_effort": settings["reasoning_effort"],
+            "messages": [
+                {"role": "system", "content": contract["gpt_system_prompt"]},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "relation_classification", "strict": True, "schema": schema},
+            },
+        }
+
+    require(provider == "jev", "Unknown provider")
+    questions = {}
+    for index in range(len(candidates)):
+        questions[f"candidate_{index}_identity"] = {
+            "type": "choice",
+            "instructions": contract["identity_instruction"].format(index=index),
+            "criteria": contract["identity_criteria"],
+        }
+        for head in relation_heads:
+            questions[f"candidate_{index}_{head}"] = {
+                "type": "choice",
+                "instructions": contract["relation_instructions"][head].format(index=index),
+                "criteria": contract["relation_criteria"][head],
+            }
+    return {
+        "model": settings["model"],
+        "state": {
+            "contract_version": contract["version"],
+            "base": base,
+            "candidates": candidates,
+        },
+        "questions": questions,
+    }
+
+
+def render_decomposed_request(settings: dict, data: dict, batch: dict, stream: str,
+                              contract: dict | None = None) -> dict:
+    contract = decomposed_contract_snapshot() if contract is None else contract
+    objective = data["objective"]
+    require(stream in decomposed_stream_names(contract, objective), "Unsupported decomposed stream")
+    base, candidates = relation_products(data, batch)
+    definition = contract["identity"] if stream == "identity" else contract["objectives"][objective][stream]
+    require(bool(definition["criteria"]), "Decomposed stream requires choices")
+    return {
+        "model": settings["model"],
+        "state": {
+            "contract_version": contract["version"],
+            "objective": objective,
+            "stream": stream,
+            "base": base,
+            "candidates": candidates,
+        },
+        "questions": {
+            f"candidate_{index}": {
+                "type": "choice",
+                "instructions": definition["instruction"].format(index=index),
+                "criteria": definition["criteria"],
+            }
+            for index in range(len(candidates))
+        },
+    }
+
+
+def render_provider_request(schema: str, provider: str, settings: dict, data: dict, batch: dict,
+                            contract: dict | None = None) -> dict:
+    if schema == MANIFEST_V1:
+        return render_request(provider, settings, data, batch)
+    if schema == MANIFEST_V3:
+        require(provider == "gpt", "Use decomposed stream rendering for v3 Jev requests")
+    else:
+        require(schema == MANIFEST_V2, "Unsupported manifest schema")
+    return render_relation_request(provider, settings, data, batch, contract)
+
+
 def prepare_requests(manifest: dict) -> dict:
+    schema = manifest_schema(manifest)
+    require(schema != MANIFEST_V3, "Use prepare_decomposed_requests for a decomposed manifest")
     return {provider: {
-        shop: [(batch, render_request(provider, settings, data, batch)) for batch in data["batches"]]
+        shop: [(batch, render_provider_request(schema, provider, settings, data, batch, manifest.get("contract")))
+               for batch in data["batches"]]
         for shop, data in manifest["shops"].items()
     } for provider, settings in manifest["models"].items()}
+
+
+def prepare_decomposed_requests(manifest: dict) -> dict:
+    require(manifest_schema(manifest) == MANIFEST_V3, "Expected decomposed manifest")
+    contract = manifest["decomposed_contract"]
+    settings = manifest["models"]["jev"]
+    return {
+        "jev": {
+            shop: {
+                stream: [
+                    (batch, render_decomposed_request(settings, data, batch, stream, contract))
+                    for batch in data["batches"]
+                ]
+                for stream in decomposed_stream_names(contract, data["objective"])
+            }
+            for shop, data in manifest["shops"].items()
+        }
+    }
+
+
+def decomposed_request_id(batch: dict, stream: str) -> str:
+    return f"{batch['batch_id']}/{stream}"
+
+
+def decomposed_payload_labels(payload: dict) -> tuple[str, ...]:
+    choices = [tuple(question["criteria"]) for question in payload["questions"].values()]
+    require(bool(choices) and all(labels == choices[0] for labels in choices),
+            "Inconsistent decomposed Choice labels")
+    return choices[0]
 
 
 def strict_json(text: str) -> object:
@@ -496,6 +976,344 @@ def parse_answers(provider: str, body: dict, batch: dict) -> list:
             for item, answer in zip(items, normalized, strict=True)]
 
 
+def validate_relation_result(result: object, labels: tuple[str, ...]) -> dict:
+    require(isinstance(result, dict) and set(result) == {"label", "reason"}, "Invalid judgment result")
+    require(result["label"] in labels, "Invalid judgment label")
+    require(isinstance(result["reason"], str) and len(result["reason"]) <= 80, "Invalid judgment reason")
+    return {
+        "label": result["label"],
+        "reason": result["reason"],
+        "probabilities": None,
+        "confidence": None,
+    }
+
+
+def parse_jev_choice_with_tolerances(answer: object, labels: tuple[str, ...],
+                                     probability_sum_tolerance: float, choice_max_tolerance: float) -> dict:
+    require(isinstance(answer, dict), "Invalid Choice answer")
+    require(answer.get("type") == "choice" and answer.get("choice") in labels, "Invalid Choice answer")
+    probabilities = answer.get("probabilities")
+    require(isinstance(probabilities, dict) and set(probabilities) == set(labels), "Incomplete probability distribution")
+    confidence = answer.get("confidence")
+    values = [*probabilities.values(), confidence]
+    require(all(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1 for value in values),
+            "Invalid probability or confidence")
+    probability_sum = sum(probabilities.values())
+    tolerance = max(probability_sum_tolerance, 0.005 * len(labels))
+    require(math.isclose(probability_sum, 1, rel_tol=0, abs_tol=tolerance + 1e-12),
+            "Probabilities do not sum to one within rounding tolerance")
+    choice_probability = probabilities[answer["choice"]]
+    max_probability = max(probabilities.values())
+    require(choice_probability >= max_probability - choice_max_tolerance - 1e-12,
+            "Choice differs from maximum probability beyond rounding tolerance")
+    return {
+        "label": answer["choice"],
+        "reason": None,
+        "probabilities": probabilities,
+        "confidence": confidence,
+        "probability_sum": probability_sum,
+        "probability_rounding_warning": not math.isclose(probability_sum, 1, abs_tol=1e-6),
+        "choice_probability_warning": choice_probability < max_probability - 1e-6,
+    }
+
+
+def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
+    return parse_jev_choice_with_tolerances(
+        answer, labels, PROBABILITY_SUM_TOLERANCE, CHOICE_MAX_TOLERANCE,
+    )
+
+
+def parse_relation_answers(provider: str, body: dict, batch: dict) -> list:
+    require(isinstance(body.get("model"), str) and bool(body["model"]), "Missing served model")
+    items = batch["candidates"]
+    ids = [item["candidate_id"] for item in items]
+    normalized = []
+    if provider == "gpt":
+        require(len(body["choices"]) == 1, "Expected one completion")
+        choice = body["choices"][0]
+        require(choice["finish_reason"] == "stop", "Incomplete completion")
+        require(not choice["message"].get("refusal"), "Provider refusal")
+        parsed = strict_json(choice["message"]["content"])
+        require(set(parsed) == {"judgments"}, "Invalid completion object")
+        answers = index_records(parsed["judgments"], "id")
+        require(set(answers) <= set(ids), "Unknown candidate answers")
+        items = [item for item in items if item["candidate_id"] in answers]
+        for item in items:
+            answer = answers[item["candidate_id"]]
+            require(set(answer) == {"id", "identity", "relations"}, "Invalid judgment fields")
+            relations = answer["relations"]
+            require(isinstance(relations, dict) and set(relations) == set(RELATION_HEADS),
+                    "Invalid relation fields")
+            normalized.append({
+                "identity": validate_relation_result(answer["identity"], IDENTITY_LABELS),
+                "relations": {
+                    head: validate_relation_result(relations[head], RELATION_LABELS) for head in RELATION_HEADS
+                },
+            })
+    else:
+        require(provider == "jev", "Unknown provider")
+        answers = body["answers"]
+        expected = {
+            f"candidate_{index}_{head}"
+            for index in range(len(ids))
+            for head in ("identity", *RELATION_HEADS)
+        }
+        require(set(answers) == expected, "Missing or unknown question answers")
+        for index in range(len(ids)):
+            normalized.append({
+                "identity": parse_jev_choice(answers[f"candidate_{index}_identity"], IDENTITY_LABELS),
+                "relations": {
+                    head: parse_jev_choice(answers[f"candidate_{index}_{head}"], RELATION_LABELS)
+                    for head in RELATION_HEADS
+                },
+            })
+    return [
+        {"pair_id": item["pair_id"], "candidate_id": item["candidate_id"], **answer}
+        for item, answer in zip(items, normalized, strict=True)
+    ]
+
+
+def parse_decomposed_answers_v1(body: dict, batch: dict, labels: tuple[str, ...]) -> list:
+    require(isinstance(body.get("model"), str) and bool(body["model"]), "Missing served model")
+    require(bool(labels), "Missing decomposed Choice labels")
+    answers = body["answers"]
+    expected = {f"candidate_{index}" for index in range(len(batch["candidates"]))}
+    require(set(answers) == expected, "Missing or unknown question answers")
+    return [
+        {
+            "pair_id": item["pair_id"],
+            "candidate_id": item["candidate_id"],
+            **parse_jev_choice_with_tolerances(
+                answers[f"candidate_{index}"], labels,
+                DECOMPOSED_PROBABILITY_SUM_TOLERANCE_V1,
+                DECOMPOSED_CHOICE_MAX_TOLERANCE_V1,
+            ),
+        }
+        for index, item in enumerate(batch["candidates"])
+    ]
+
+
+DECOMPOSED_EXTRACTORS = {DECOMPOSED_EXTRACTION_V1: parse_decomposed_answers_v1}
+
+
+def parse_provider_answers(schema: str, provider: str, body: dict, batch: dict,
+                           choice_labels: tuple[str, ...] | None = None,
+                           extraction_version: str | None = None) -> list:
+    if schema == MANIFEST_V1:
+        return parse_answers(provider, body, batch)
+    if schema == MANIFEST_V2:
+        return parse_relation_answers(provider, body, batch)
+    require(schema == MANIFEST_V3 and provider == "jev" and choice_labels is not None,
+            "Unsupported manifest schema")
+    version = DECOMPOSED_EXTRACTION_VERSION if extraction_version is None else extraction_version
+    require(version in DECOMPOSED_EXTRACTORS, f"Unsupported decomposed extraction version: {version}")
+    return DECOMPOSED_EXTRACTORS[version](body, batch, choice_labels)
+
+
+def resolve_basket_judgment_v1(answer: dict) -> dict:
+    identity = answer["identity"]["label"]
+    require(identity in IDENTITY_LABELS, "Invalid identity label")
+    relations = {head: answer["relations"][head]["label"] for head in RELATION_HEADS}
+    require(all(label in RELATION_LABELS for label in relations.values()), "Invalid relation label")
+    yes = {head for head, label in relations.items() if label == "yes"}
+    raw_conflict = len(yes) > 1
+    result = {
+        "resolver_version": RESOLVER_V1,
+        "identity_action": "continue_uncertain" if identity == "uncertain" else "continue",
+        "basket_label": None,
+        "resolution_status": None,
+        "resolution": None,
+        "conflict": raw_conflict,
+    }
+    if identity in {"duplicate", "variant", "redundant"}:
+        result.update(
+            identity_action="filter",
+            basket_label="skip",
+            resolution_status="filtered",
+            resolution=f"identity_filtered_{identity}",
+        )
+        return result
+    if raw_conflict:
+        result.update(
+            basket_label="conflict",
+            resolution_status="conflict",
+            resolution="conflicting_positive_relations",
+        )
+        return result
+    labels = tuple(relations[head] for head in RELATION_HEADS)
+    if labels == ("yes", "no", "no"):
+        result.update(basket_label="positive", resolution_status="resolved", resolution="co_purchase_positive")
+    elif labels == ("no", "yes", "no"):
+        result.update(basket_label="hard_negative", resolution_status="resolved", resolution="alternative_only")
+    elif labels == ("no", "no", "yes"):
+        result.update(basket_label="hard_negative", resolution_status="resolved", resolution="incompatible_only")
+    elif "uncertain" in labels:
+        result.update(basket_label="skip", resolution_status="uncertain", resolution="uncertain_skip")
+    else:
+        result.update(basket_label="skip", resolution_status="resolved", resolution="unrelated_skip")
+    require(result["basket_label"] in BASKET_LABELS, "Invalid basket label")
+    return result
+
+
+RESOLVERS = {RESOLVER_V1: resolve_basket_judgment_v1}
+
+
+def resolve_basket_judgment(answer: dict, resolver_version: str = RESOLVER_VERSION) -> dict:
+    require(resolver_version in RESOLVERS, f"Unsupported saved resolver version: {resolver_version}")
+    return RESOLVERS[resolver_version](answer)
+
+
+def validate_probability_rule(rule: object) -> dict:
+    require(isinstance(rule, dict) and set(rule) == {"min_probability", "min_margin"},
+            "Probability rules require min_probability and min_margin")
+    for field in ("min_probability", "min_margin"):
+        value = rule[field]
+        require(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1,
+                f"Invalid probability-policy threshold: {field}")
+    return {field: float(rule[field]) for field in ("min_probability", "min_margin")}
+
+
+def validate_probability_rules(rules: object, contract: dict) -> dict:
+    require(isinstance(rules, dict) and set(rules) == {"identity", "objectives"},
+            "Probability policy requires identity and objectives rules")
+    objectives = rules["objectives"]
+    require(isinstance(objectives, dict) and set(objectives) == set(contract["objectives"]),
+            "Probability-policy objective coverage mismatch")
+    normalized = {"identity": validate_probability_rule(rules["identity"]), "objectives": {}}
+    for objective, streams in contract["objectives"].items():
+        supplied = objectives[objective]
+        require(isinstance(supplied, dict) and set(supplied) == set(streams),
+                f"Probability-policy stream coverage mismatch: {objective}")
+        normalized["objectives"][objective] = {
+            stream: validate_probability_rule(supplied[stream]) for stream in streams
+        }
+    return normalized
+
+
+def probability_margin(answer: dict) -> tuple[float, float]:
+    label = answer["label"]
+    probabilities = answer["probabilities"]
+    require(isinstance(probabilities, dict) and label in probabilities, "Missing selected-label probability")
+    selected = probabilities[label]
+    alternatives = [value for choice, value in probabilities.items() if choice != label]
+    require(bool(alternatives), "Probability policy requires at least two choices")
+    return selected, selected - max(alternatives)
+
+
+def apply_probability_policy(answer: dict, rule: dict) -> dict:
+    normalized = validate_probability_rule(rule)
+    probability, margin = probability_margin(answer)
+    accepted = (probability >= normalized["min_probability"] - 1e-12
+                and margin >= normalized["min_margin"] - 1e-12)
+    return {
+        "label": answer["label"],
+        "accepted": accepted,
+        "status": "accepted" if accepted else "abstained",
+        "probability": probability,
+        "margin": margin,
+        "min_probability": normalized["min_probability"],
+        "min_margin": normalized["min_margin"],
+        "confidence": answer["confidence"],
+        "probability_rounding_warning": answer.get("probability_rounding_warning", False),
+        "choice_probability_warning": answer.get("choice_probability_warning", False),
+    }
+
+
+def resolve_decomposed_v1(objective: str, answers: dict, rules: dict, contract: dict) -> dict:
+    require(objective in contract["objectives"], "Unsupported decomposed objective")
+    require(set(answers) == set(decomposed_stream_names(contract, objective)),
+            "Incomplete decomposed resolver inputs")
+    normalized_rules = validate_probability_rules(rules, contract)
+    decisions = {
+        "identity": apply_probability_policy(answers["identity"], normalized_rules["identity"]),
+        **{
+            stream: apply_probability_policy(answer, normalized_rules["objectives"][objective][stream])
+            for stream, answer in answers.items() if stream != "identity"
+        },
+    }
+    identity = decisions["identity"]
+    result = {
+        "resolver_version": contract["resolver_versions"][objective],
+        "identity_action": None,
+        "basket_label": "skip",
+        "resolution_status": None,
+        "resolution": None,
+        "conflict": False,
+        "accepted_signals": [],
+        "abstentions": [stream for stream, decision in decisions.items() if not decision["accepted"]],
+        "decisions": decisions,
+        "decision_probability": None,
+    }
+    if not identity["accepted"]:
+        result.update(identity_action="abstain", resolution_status="abstained",
+                      resolution="identity_probability_abstention")
+        return result
+    if identity["label"] != "distinct":
+        status = "abstained" if identity["label"] == "uncertain" else "filtered"
+        action = "abstain" if identity["label"] == "uncertain" else "filter"
+        result.update(identity_action=action, resolution_status=status,
+                      resolution=f"identity_{status}_{identity['label']}")
+        return result
+    result["identity_action"] = "continue"
+    positive, negative = [], []
+    accepted = {stream: decision["label"] for stream, decision in decisions.items()
+                if stream != "identity" and decision["accepted"]}
+    if objective == "complements":
+        together = accepted.get("together_use")
+        if together is not None and together != "no_concrete_mechanism":
+            positive.append(f"together_use:{together}")
+        if accepted.get("substitute") == "same_immediate_purchasing_role":
+            negative.append("substitute:same_immediate_purchasing_role")
+        mismatch = accepted.get("incompatibility")
+        if mismatch is not None and mismatch != "no_explicit_mismatch":
+            negative.append(f"incompatibility:{mismatch}")
+    else:
+        require(objective == "style_compatibility", "Unsupported decomposed objective")
+        for stream, label in accepted.items():
+            if label in {"concrete_coordination", "compatible_context"}:
+                positive.append(f"{stream}:{label}")
+            elif label in {"explicit_mismatch", "explicit_context_mismatch"}:
+                negative.append(f"{stream}:{label}")
+    result["accepted_signals"] = [*positive, *negative]
+    signal_decisions = [decisions[signal.split(":", 1)[0]] for signal in result["accepted_signals"]]
+    if signal_decisions:
+        result["decision_probability"] = min([identity["probability"],
+                                               *(decision["probability"] for decision in signal_decisions)])
+    if positive and negative:
+        result.update(basket_label="conflict", resolution_status="conflict",
+                      resolution="conflicting_objective_signals", conflict=True)
+    elif positive:
+        result.update(basket_label="positive", resolution_status="resolved",
+                      resolution="objective_positive")
+    elif negative:
+        result.update(basket_label="hard_negative", resolution_status="resolved",
+                      resolution="objective_hard_negative")
+    elif result["abstentions"]:
+        result.update(resolution_status="abstained", resolution="no_accepted_objective_signal")
+    else:
+        result.update(resolution_status="resolved", resolution="no_objective_signal")
+    return result
+
+
+DECOMPOSED_RESOLVERS = {
+    DECOMPOSED_COMPLEMENTS_RESOLVER_V1: lambda answers, rules, contract: resolve_decomposed_v1(
+        "complements", answers, rules, contract,
+    ),
+    DECOMPOSED_STYLE_RESOLVER_V1: lambda answers, rules, contract: resolve_decomposed_v1(
+        "style_compatibility", answers, rules, contract,
+    ),
+}
+
+
+def resolve_decomposed_judgment(objective: str, answers: dict, rules: dict, resolver_version: str,
+                                contract: dict | None = None) -> dict:
+    contract = decomposed_contract_snapshot() if contract is None else contract
+    require(contract["resolver_versions"].get(objective) == resolver_version
+            and resolver_version in DECOMPOSED_RESOLVERS,
+            f"Unsupported saved decomposed resolver version: {resolver_version}")
+    return DECOMPOSED_RESOLVERS[resolver_version](answers, rules, contract)
+
+
 def extraction_status(answers: list, expected_count: int) -> tuple[str, str | None]:
     if len(answers) == expected_count:
         return "ok", None
@@ -535,7 +1353,14 @@ def retry_delay(header: str | None, attempt: int) -> float | None:
 
 
 def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, payload: dict, key: str,
-              *, initial_answers: list | None = None, on_attempt=None) -> dict:
+              *, initial_answers: list | None = None, on_attempt=None, schema_version: str = MANIFEST_V1,
+              stream: str | None = None, request_id: str | None = None,
+              choice_labels: tuple[str, ...] | None = None,
+              extraction_version: str | None = None) -> dict:
+    require(schema_version in {MANIFEST_V1, MANIFEST_V2, MANIFEST_V3}, "Unsupported manifest schema")
+    require((schema_version == MANIFEST_V3) == (stream is not None and request_id is not None
+                                                and choice_labels is not None and extraction_version is not None),
+            "Decomposed execution metadata mismatch")
     started = time.perf_counter()
     record = {
         "record_type": "batch", "provider": provider, "shop": shop,
@@ -544,6 +1369,8 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
         "requested_model": payload["model"], "served_model": None, "request": payload,
         "status": "error", "error": None, "answers": [], "raw_response": None, "attempts": [],
     }
+    if stream is not None:
+        record.update(stream=stream, request_id=request_id, extraction_version=extraction_version)
     collected = index_records(initial_answers or [], "pair_id")
     require(set(collected) <= set(record["pair_ids"]), "Unexpected initial answers")
     if len(collected) == record["batch_size"]:
@@ -579,7 +1406,9 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
                 attempt["raw_usage"] = body.get("usage")
                 attempt["usage"] = normalize_usage(provider, attempt["raw_usage"])
                 if status == 200:
-                    attempt["answers"] = parse_answers(provider, body, batch)
+                    attempt["answers"] = parse_provider_answers(
+                        schema_version, provider, body, batch, choice_labels, extraction_version,
+                    )
                     _, attempt["error"] = extraction_status(attempt["answers"], record["batch_size"])
                     for answer in attempt["answers"]:
                         collected.setdefault(answer["pair_id"], answer)
@@ -632,19 +1461,29 @@ def execute(manifest: dict, jobs: dict, output_dir: Path, manifest_digest: str, 
               "concurrency": manifest["concurrency"], "timeout_seconds": TIMEOUT_SECONDS,
               "max_retries": MAX_RETRIES, "max_retry_delay_seconds": MAX_RETRY_DELAY, **(run_metadata or {})})
         for provider, shops in jobs.items():
-            for shop, work in shops.items():
-                emit({"record_type": "group_start", "provider": provider, "shop": shop,
+            for group, work in shops.items():
+                shop, stream = group if isinstance(group, tuple) else (group, None)
+                group_record = {"provider": provider, "shop": shop}
+                if stream is not None:
+                    group_record["stream"] = stream
+                emit({"record_type": "group_start", **group_record,
                       "requested_model": manifest["models"][provider]["model"], "batches": len(work)})
                 started = time.perf_counter()
                 with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, transport=transport) as client:
                     with ThreadPoolExecutor(max_workers=manifest["concurrency"]) as pool:
-                        futures = [pool.submit(run_batch, client, provider, shop, batch, payload, credentials[provider])
-                                   for batch, payload in work]
+                        futures = [pool.submit(
+                            run_batch, client, provider, shop, batch, payload, credentials[provider],
+                            schema_version=manifest_schema(manifest),
+                            stream=stream,
+                            request_id=decomposed_request_id(batch, stream) if stream is not None else None,
+                            choice_labels=decomposed_payload_labels(payload) if stream is not None else None,
+                            extraction_version=DECOMPOSED_EXTRACTION_VERSION if stream is not None else None,
+                        ) for batch, payload in work]
                         for future in as_completed(futures):
                             record = future.result()
                             emit(record)
                             failures += record["status"] != "ok"
-                emit({"record_type": "group_end", "provider": provider, "shop": shop,
+                emit({"record_type": "group_end", **group_record,
                       "wall_seconds": time.perf_counter() - started})
         emit({"record_type": "run_end", "failed_batches": failures})
     return failures
@@ -683,13 +1522,17 @@ def attempt_cost(provider: str, usage: dict, pricing: dict | None = None) -> flo
     return ((inputs - cached) * rates["input"] + cached * rates["cached_input"] + outputs * rates["output"]) / 1_000_000
 
 
-def reextract_record(record: dict, batch: dict) -> dict:
+def reextract_record(record: dict, batch: dict, schema_version: str = MANIFEST_V1) -> dict:
     if (record["status"] != "error" or record["answers"] or record["error"] != "invalid_response" or record["raw_response"] is None
             or record["attempts"][-1]["http_status"] != 200):
         return record
     try:
         normalize_usage(record["provider"], record["raw_response"].get("usage"))
-        answers = parse_answers(record["provider"], record["raw_response"], batch)
+        choice_labels = decomposed_payload_labels(record["request"]) if schema_version == MANIFEST_V3 else None
+        answers = parse_provider_answers(
+            schema_version, record["provider"], record["raw_response"], batch, choice_labels,
+            record.get("extraction_version"),
+        )
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         return record
     result = copy.deepcopy(record)
@@ -702,15 +1545,26 @@ def reextract_record(record: dict, batch: dict) -> dict:
 
 
 def baseline_spec(manifest: dict) -> dict:
+    schema = manifest_schema(manifest)
     requests = []
     for shop, data in sorted(manifest["shops"].items()):
         for batch in sorted(data["batches"], key=lambda item: item["batch_id"]):
             identity = {key: batch[key] for key in ("batch_id", "direction", "anchor_id")}
             identity["candidates"] = [{key: item[key] for key in ("pair_id", "candidate_id")}
                                       for item in batch["candidates"]]
-            requests.append({"shop": shop, "batch": identity,
-                             "request": render_request("gpt", manifest["models"]["gpt"], data, batch)})
-    return {"schema_version": "gpt-input-v1", "requests": requests}
+            requests.append({
+                "shop": shop,
+                "batch": identity,
+                "request": render_provider_request(
+                    schema, "gpt", manifest["models"]["gpt"], data, batch, manifest.get("contract")
+                ),
+            })
+    spec = {"schema_version": GPT_INPUT_V1 if schema == MANIFEST_V1 else GPT_INPUT_V2, "requests": requests}
+    if schema in {MANIFEST_V2, MANIFEST_V3}:
+        # A decomposed Jev arm intentionally reuses the exact v2 GPT input identity.
+        spec["manifest_schema_version"] = MANIFEST_V2
+        spec["relation_contract_version"] = manifest["contract"]["version"]
+    return spec
 
 
 def immutable_bytes(path: Path, content: bytes) -> None:
@@ -729,6 +1583,460 @@ def immutable_bytes(path: Path, content: bytes) -> None:
             temporary.unlink()
 
 
+def paired_result_rows(path: Path) -> dict:
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    require(bool(rows), f"No paired results in {path}")
+    return index_records(rows, "pair_id")
+
+
+def review_stratum(first: dict, second: dict) -> str:
+    identity_fields = ("gpt_identity", "jev_identity")
+    filtered = {"duplicate", "variant", "redundant"}
+    if (any(first[field] != second[field] for field in identity_fields)
+            or first["gpt_identity"] != first["jev_identity"]
+            or second["gpt_identity"] != second["jev_identity"]
+            or any(row[field] in filtered for row in (first, second) for field in identity_fields)):
+        return "identity_filter"
+    actionable = {"positive", "hard_negative", "conflict"}
+    if any(row["gpt_basket_label"] != row["jev_basket_label"]
+           and bool({row["gpt_basket_label"], row["jev_basket_label"]} & actionable)
+           for row in (first, second)):
+        return "actionable_disagreement"
+    jev_fields = ("jev_co_purchase", "jev_alternative", "jev_incompatible", "jev_basket_label")
+    if (any(first[field] != second[field] for field in jev_fields)
+            or any(row["jev_basket_label"] == "skip" or "uncertain" in {row[field] for field in jev_fields[:-1]}
+                   for row in (first, second))):
+        return "uncertainty_or_run_shift"
+    return "agreement_control"
+
+
+def review_pair_index(manifest: dict) -> dict:
+    result = {}
+    for shop, data in manifest["shops"].items():
+        for batch in data["batches"]:
+            for candidate in batch["candidates"]:
+                pair_id = candidate["pair_id"]
+                require(pair_id not in result, "Duplicate review pair identity")
+                result[pair_id] = {
+                    "shop": shop,
+                    "objective": data["objective"],
+                    "direction": batch["direction"],
+                    "anchor_id": batch["anchor_id"],
+                    "candidate_id": candidate["candidate_id"],
+                    "retrieved_forward_rank": candidate["retrieved_forward_rank"],
+                    "retrieval_source": candidate["retrieval_source"],
+                    "anchor": copy.deepcopy(data["products"][batch["anchor_id"]]),
+                    "candidate": copy.deepcopy(data["products"][candidate["candidate_id"]]),
+                    "examples_sha256": data["sources"]["examples"]["sha256"],
+                }
+    return result
+
+
+def review_group_id(pair: dict) -> str:
+    return json.dumps(
+        [pair["shop"], *sorted((pair["anchor_id"], pair["candidate_id"]))],
+        separators=(",", ":"), ensure_ascii=False,
+    )
+
+
+def review_order(seed: str, split: str, pair_id: str) -> tuple[str, str]:
+    return sha256(canonical_json([seed, split, pair_id])), pair_id
+
+
+def select_review_split(candidates: list[dict], split: str, per_cell: int, per_stratum: int,
+                        used_groups: set[str], seed: str) -> tuple[list[dict], dict]:
+    strata = ("identity_filter", "actionable_disagreement", "uncertainty_or_run_shift", "agreement_control")
+    selected = []
+    counts = {}
+    for shop in SHOPS:
+        for direction in ("forward", "reverse"):
+            cell = [row for row in candidates if row["shop"] == shop and row["direction"] == direction
+                    and row["group_id"] not in used_groups]
+            # A product pair may occur more than once in one direction. Keep one deterministic representative.
+            representatives = {}
+            for row in sorted(cell, key=lambda item: review_order(seed, split, item["pair_id"])):
+                representatives.setdefault(row["group_id"], row)
+            cell = list(representatives.values())
+            chosen = []
+            for stratum in strata:
+                eligible = sorted(
+                    (row for row in cell if row["stratum"] == stratum and row["group_id"] not in used_groups),
+                    key=lambda item: review_order(seed, split, item["pair_id"]),
+                )
+                take = eligible[:per_stratum]
+                chosen.extend(take)
+                used_groups.update(row["group_id"] for row in take)
+            if len(chosen) < per_cell:
+                spillover = sorted(
+                    (row for row in cell if row["group_id"] not in used_groups),
+                    key=lambda item: review_order(seed, split, item["pair_id"]),
+                )
+                take = spillover[:per_cell - len(chosen)]
+                chosen.extend(take)
+                used_groups.update(row["group_id"] for row in take)
+            require(len(chosen) == per_cell, f"Insufficient {split} review pairs for {shop}/{direction}")
+            selected.extend(chosen)
+            counts[f"{shop}/{direction}"] = dict(Counter(row["stratum"] for row in chosen))
+    return selected, counts
+
+
+def prepare_adjudication_artifact(manifest: dict, first_results: Path, second_results: Path,
+                                  directory: Path, reviewer: str = "Boris") -> dict:
+    require(reviewer.strip() == "Boris", "The approved initial reviewer is Boris")
+    pairs = review_pair_index(manifest)
+    require(len(pairs) == 800, "Adjudication requires the frozen 800-pair workload")
+    first, second = paired_result_rows(first_results), paired_result_rows(second_results)
+    require(set(first) == set(second) == set(pairs), "Review source pair coverage mismatch")
+    candidates = []
+    for pair_id, pair in pairs.items():
+        for row in (first[pair_id], second[pair_id]):
+            require(row["shop"] == pair["shop"] and row["direction"] == pair["direction"],
+                    "Review source pair metadata mismatch")
+        candidates.append({
+            "pair_id": pair_id,
+            "shop": pair["shop"],
+            "direction": pair["direction"],
+            "group_id": review_group_id(pair),
+            "stratum": review_stratum(first[pair_id], second[pair_id]),
+        })
+    used_groups: set[str] = set()
+    holdout, holdout_counts = select_review_split(
+        candidates, "holdout", per_cell=24, per_stratum=6, used_groups=used_groups, seed=ADJUDICATION_SEED,
+    )
+    development, development_counts = select_review_split(
+        candidates, "development", per_cell=12, per_stratum=3, used_groups=used_groups, seed=ADJUDICATION_SEED,
+    )
+    selected = [("development", row) for row in development] + [("holdout", row) for row in holdout]
+    selected.sort(key=lambda item: (item[0], item[1]["shop"], item[1]["direction"],
+                                    review_order(ADJUDICATION_SEED, item[0], item[1]["pair_id"])))
+    evidence, labels = [], []
+    contract = decomposed_contract_snapshot()
+    for split, selected_row in selected:
+        pair = pairs[selected_row["pair_id"]]
+        frozen = {
+            "pair_id": selected_row["pair_id"],
+            "pair_group_id": selected_row["group_id"],
+            "split": split,
+            "shop": pair["shop"],
+            "objective": pair["objective"],
+            "direction": pair["direction"],
+            "anchor_id": pair["anchor_id"],
+            "candidate_id": pair["candidate_id"],
+            "retrieved_forward_rank": pair["retrieved_forward_rank"],
+            "retrieval_source": pair["retrieval_source"],
+            "anchor": pair["anchor"],
+            "candidate": pair["candidate"],
+            "prompt_example_allowed": False,
+            "prompt_examples_sha256": pair["examples_sha256"],
+            "manual_product_family_overlap_review_required": True,
+        }
+        frozen["evidence_sha256"] = sha256(canonical_json(frozen))
+        evidence.append(frozen)
+        labels.append({
+            "pair_id": selected_row["pair_id"],
+            "split": split,
+            "review_schema_version": "human-mechanism-review-v1",
+            "reviewer": "Boris",
+            "reviewed_at": None,
+            "identity": None,
+            "mechanisms": {stream: None for stream in decomposed_stream_names(contract, pair["objective"])
+                           if stream != "identity"},
+            "final_label": None,
+            "ambiguity": None,
+            "review_notes": None,
+            "second_reviews": [],
+            "adjudication": None,
+        })
+    evidence_bytes = b"".join(canonical_json(row) + b"\n" for row in evidence)
+    labels_template_bytes = b"".join(canonical_json(row) + b"\n" for row in labels)
+    selected_pairs = {row["pair_id"] for _, row in selected}
+    group_splits = {}
+    for split, row in selected:
+        require(group_splits.setdefault(row["group_id"], split) == split, "Review group crosses splits")
+    assignments = [{
+        "pair_id": row["pair_id"],
+        "pair_group_id": row["group_id"],
+        "split": group_splits[row["group_id"]],
+        "selected_for_review": row["pair_id"] in selected_pairs,
+        "stratum": row["stratum"],
+    } for row in sorted(candidates, key=lambda item: item["pair_id"]) if row["group_id"] in group_splits]
+    assignments_bytes = b"".join(canonical_json(row) + b"\n" for row in assignments)
+    selection = {
+        "algorithm": "stratified-sha256-v1",
+        "seed": ADJUDICATION_SEED,
+        "pair_group": "shop plus unordered anchor/candidate IDs",
+        "stratum_precedence": [
+            "identity_filter", "actionable_disagreement", "uncertainty_or_run_shift", "agreement_control",
+        ],
+        "requested": {
+            "holdout": {"total": 96, "per_shop_direction": 24, "per_stratum_cell": 6},
+            "development": {"total": 48, "per_shop_direction": 12, "per_stratum_cell": 3},
+        },
+        "actual_strata": {"holdout": holdout_counts, "development": development_counts},
+        "spillover": "Within-cell SHA-256 order fills quotas when a requested stratum is sparse.",
+    }
+    selection_bytes = (json.dumps(selection, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+    source_files = {
+        "first_paired_results": {"path": str(first_results), "sha256": sha256(first_results.read_bytes())},
+        "second_paired_results": {"path": str(second_results), "sha256": sha256(second_results.read_bytes())},
+    }
+    artifact_identity = {
+        "schema_version": ADJUDICATION_SCHEMA_VERSION,
+        "source_manifest_sha256": sha256(canonical_json(manifest)),
+        "sources": source_files,
+        "contract_sha256": sha256(canonical_json(contract)),
+        "selection_sha256": sha256(selection_bytes),
+        "group_assignments_sha256": sha256(assignments_bytes),
+        "evidence_sha256": sha256(evidence_bytes),
+        "labels_template_sha256": sha256(labels_template_bytes),
+        "reviewer": "Boris",
+    }
+    artifact = {
+        **artifact_identity,
+        "artifact_id": f"{ADJUDICATION_SCHEMA_VERSION}-{sha256(canonical_json(artifact_identity))[:12]}",
+        "contract_version": contract["version"],
+        "contract": contract,
+        "pair_counts": {"development": 48, "holdout": 96},
+        "policy": {
+            "reviewer_files": ["evidence.jsonl", "labels-template.jsonl"],
+            "provider_outputs_in_reviewer_files": False,
+            "provider_derived_sampling_metadata": "sealed-selection-admin.json and group-assignments-admin.jsonl",
+            "holdout_used_for_threshold_selection": False,
+            "label_revisions": "append-only labels-vN.jsonl",
+            "optional_second_review_and_adjudication": True,
+        },
+        "files": {
+            "evidence.jsonl": sha256(evidence_bytes),
+            "labels-template.jsonl": sha256(labels_template_bytes),
+            "sealed-selection-admin.json": sha256(selection_bytes),
+            "group-assignments-admin.jsonl": sha256(assignments_bytes),
+        },
+    }
+    manifest_bytes = (json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+    files = {
+        "evidence.jsonl": evidence_bytes,
+        "labels-template.jsonl": labels_template_bytes,
+        "sealed-selection-admin.json": selection_bytes,
+        "group-assignments-admin.jsonl": assignments_bytes,
+        "manifest.json": manifest_bytes,
+    }
+    for name, content in files.items():
+        path = directory / name
+        if path.exists():
+            require(path.read_bytes() == content, f"Refusing to replace immutable adjudication file: {path}")
+    for name, content in files.items():
+        immutable_bytes(directory / name, content)
+    return artifact
+
+
+def jsonl_records(path: Path) -> list[dict]:
+    records = [strict_json(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    require(all(isinstance(record, dict) for record in records), f"Invalid JSONL records: {path}")
+    return records
+
+
+def validate_adjudication_artifact(directory: Path) -> tuple[dict, list[dict], str]:
+    manifest_bytes = (directory / "manifest.json").read_bytes()
+    artifact = strict_json(manifest_bytes.decode("utf-8"))
+    require(artifact.get("schema_version") == ADJUDICATION_SCHEMA_VERSION, "Invalid adjudication artifact")
+    require(artifact.get("reviewer") == "Boris", "Unexpected initial reviewer")
+    for name, digest in artifact["files"].items():
+        path = directory / name
+        require(path.is_file() and sha256(path.read_bytes()) == digest, f"Adjudication base file changed: {name}")
+    require(artifact["selection_sha256"] == artifact["files"]["sealed-selection-admin.json"],
+            "Adjudication selection digest mismatch")
+    require(artifact["group_assignments_sha256"] == artifact["files"]["group-assignments-admin.jsonl"],
+            "Adjudication assignment digest mismatch")
+    require(artifact["evidence_sha256"] == artifact["files"]["evidence.jsonl"],
+            "Adjudication evidence digest mismatch")
+    require(artifact["labels_template_sha256"] == artifact["files"]["labels-template.jsonl"],
+            "Adjudication label template digest mismatch")
+    require(artifact["contract_sha256"] == sha256(canonical_json(artifact["contract"])),
+            "Adjudication contract digest mismatch")
+    identity = {
+        key: artifact[key]
+        for key in (
+            "schema_version", "source_manifest_sha256", "sources", "contract_sha256", "selection_sha256",
+            "group_assignments_sha256", "evidence_sha256", "labels_template_sha256", "reviewer",
+        )
+    }
+    require(artifact["artifact_id"] == f"{ADJUDICATION_SCHEMA_VERSION}-{sha256(canonical_json(identity))[:12]}",
+            "Adjudication artifact identity mismatch")
+    evidence = jsonl_records(directory / "evidence.jsonl")
+    for row in evidence:
+        recorded = row.get("evidence_sha256")
+        content = {key: value for key, value in row.items() if key != "evidence_sha256"}
+        require(recorded == sha256(canonical_json(content)), "Adjudication evidence row digest mismatch")
+    expected_count = artifact["pair_counts"]["development"] + artifact["pair_counts"]["holdout"]
+    require(len(evidence) == expected_count, "Adjudication evidence count mismatch")
+    return artifact, evidence, sha256(manifest_bytes)
+
+
+def previous_review_revision(directory: Path, artifact: dict, revision: int, manifest_digest: str) -> str:
+    digest = artifact["labels_template_sha256"]
+    require(sha256((directory / "labels-template.jsonl").read_bytes()) == digest,
+            "Adjudication labels template changed")
+    for number in range(1, revision):
+        labels_path = directory / f"labels-v{number}.jsonl"
+        revision_path = directory / f"labels-v{number}.manifest.json"
+        require(labels_path.is_file() and revision_path.is_file(), f"Missing label revision {number}")
+        saved = strict_json(revision_path.read_text(encoding="utf-8"))
+        labels_digest = sha256(labels_path.read_bytes())
+        require(saved == {
+            "schema_version": "human-mechanism-review-revision-v1",
+            "revision": number,
+            "previous_labels_sha256": digest,
+            "labels_sha256": labels_digest,
+            "pair_count": artifact["pair_counts"]["development"] + artifact["pair_counts"]["holdout"],
+            "reviewer": "Boris",
+            "artifact_id": artifact["artifact_id"],
+            "artifact_manifest_sha256": manifest_digest,
+            "evidence_sha256": artifact["evidence_sha256"],
+            "contract_sha256": artifact["contract_sha256"],
+        }, f"Label revision {number} manifest mismatch")
+        digest = labels_digest
+    return digest
+
+
+def publish_adjudication_labels(directory: Path, records: list[dict], revision: int) -> dict:
+    require(type(revision) is int and revision > 0, "Label revision must be positive")
+    artifact, evidence, manifest_digest = validate_adjudication_artifact(directory)
+    evidence_by_pair = index_records(evidence, "pair_id")
+    supplied = index_records(records, "pair_id")
+    require(set(supplied) == set(evidence_by_pair), "Label revision pair coverage mismatch")
+    contract = artifact["contract"]
+    normalized = []
+    for evidence_row in evidence:
+        row = supplied[evidence_row["pair_id"]]
+        require(row.get("review_schema_version") == "human-mechanism-review-v1", "Invalid review schema")
+        require(row.get("split") == evidence_row["split"], "Review split mismatch")
+        require(row.get("reviewer") == "Boris", "The approved initial reviewer is Boris")
+        reviewed_at = row.get("reviewed_at")
+        require(isinstance(reviewed_at, str) and bool(reviewed_at), "Completed review requires reviewed_at")
+        try:
+            parsed_at = datetime.fromisoformat(reviewed_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("Invalid reviewed_at timestamp") from None
+        require(parsed_at.tzinfo is not None, "reviewed_at must include a timezone")
+        require(row.get("identity") in IDENTITY_LABELS, "Invalid reviewed identity")
+        expected_streams = set(decomposed_stream_names(contract, evidence_row["objective"])) - {"identity"}
+        mechanisms = row.get("mechanisms")
+        require(isinstance(mechanisms, dict) and set(mechanisms) == expected_streams,
+                "Invalid reviewed mechanism coverage")
+        for stream, choice in mechanisms.items():
+            criteria = contract["objectives"][evidence_row["objective"]][stream]["criteria"]
+            require(choice in criteria, f"Invalid reviewed mechanism choice: {stream}")
+        require(row.get("final_label") in BASKET_LABELS, "Invalid reviewed final label")
+        require(type(row.get("ambiguity")) is bool, "Completed review requires ambiguity")
+        require(row.get("review_notes") is None or isinstance(row["review_notes"], str), "Invalid review notes")
+        require(isinstance(row.get("second_reviews"), list), "Invalid second reviews")
+        require(row.get("adjudication") is None or isinstance(row["adjudication"], dict), "Invalid adjudication")
+        normalized.append({
+            key: copy.deepcopy(row[key])
+            for key in (
+                "pair_id", "split", "review_schema_version", "reviewer", "reviewed_at", "identity",
+                "mechanisms", "final_label", "ambiguity", "review_notes", "second_reviews", "adjudication",
+            )
+        })
+    previous_digest = previous_review_revision(directory, artifact, revision, manifest_digest)
+    for row in normalized:
+        row["revision"] = revision
+        row["previous_labels_sha256"] = previous_digest
+        row["artifact_id"] = artifact["artifact_id"]
+    labels_bytes = b"".join(canonical_json(row) + b"\n" for row in normalized)
+    revision_manifest = {
+        "schema_version": "human-mechanism-review-revision-v1",
+        "revision": revision,
+        "previous_labels_sha256": previous_digest,
+        "labels_sha256": sha256(labels_bytes),
+        "pair_count": len(normalized),
+        "reviewer": "Boris",
+        "artifact_id": artifact["artifact_id"],
+        "artifact_manifest_sha256": manifest_digest,
+        "evidence_sha256": artifact["evidence_sha256"],
+        "contract_sha256": artifact["contract_sha256"],
+    }
+    revision_bytes = (json.dumps(revision_manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+    files = {
+        directory / f"labels-v{revision}.jsonl": labels_bytes,
+        directory / f"labels-v{revision}.manifest.json": revision_bytes,
+    }
+    for path, content in files.items():
+        if path.exists():
+            require(path.read_bytes() == content, f"Refusing to replace immutable label revision: {path}")
+    for path, content in files.items():
+        immutable_bytes(path, content)
+    return revision_manifest
+
+
+def load_adjudication_revision(directory: Path, revision: int) -> tuple[dict, list[dict], dict, bytes, bytes]:
+    require(type(revision) is int and revision > 0, "Label revision must be positive")
+    artifact, evidence, manifest_digest = validate_adjudication_artifact(directory)
+    labels_path = directory / f"labels-v{revision}.jsonl"
+    revision_path = directory / f"labels-v{revision}.manifest.json"
+    require(labels_path.is_file() and revision_path.is_file(), f"Missing label revision {revision}")
+    labels_bytes, revision_bytes = labels_path.read_bytes(), revision_path.read_bytes()
+    labels = [strict_json(line) for line in labels_bytes.decode("utf-8").splitlines() if line.strip()]
+    revision_manifest = strict_json(revision_bytes.decode("utf-8"))
+    require(previous_review_revision(directory, artifact, revision + 1, manifest_digest) == sha256(labels_bytes),
+            "Label revision chain mismatch")
+    require(revision_manifest["labels_sha256"] == sha256(labels_bytes), "Label revision digest mismatch")
+    require(set(index_records(labels, "pair_id")) == set(index_records(evidence, "pair_id")),
+            "Label revision pair coverage mismatch")
+    return artifact, evidence, revision_manifest, labels_bytes, revision_bytes
+
+
+def load_experiment_review_revision(directory: Path, revision: int,
+                                    experiment: dict) -> tuple[list[dict], list[dict], dict]:
+    artifact, evidence, revision_manifest, labels_bytes, _ = load_adjudication_revision(
+        directory, revision,
+    )
+    saved = experiment["adjudication"]
+    require(artifact["artifact_id"] == saved["artifact_id"], "Review artifact identity mismatch")
+    require(revision_manifest["artifact_manifest_sha256"] == saved["manifest_sha256"],
+            "Review artifact manifest mismatch")
+    require(artifact["evidence_sha256"] == saved["evidence_sha256"], "Review evidence mismatch")
+    return ([strict_json(line) for line in labels_bytes.decode("utf-8").splitlines() if line.strip()],
+            evidence, revision_manifest)
+
+
+def snapshot_review(output_dir: Path, labels: list[dict], evidence: list[dict],
+                    revision_manifest: dict) -> None:
+    labels_bytes = b"".join(canonical_json(row) + b"\n" for row in labels)
+    evidence_bytes = b"".join(canonical_json(row) + b"\n" for row in evidence)
+    require(sha256(labels_bytes) == revision_manifest["labels_sha256"], "Review snapshot labels mismatch")
+    require(sha256(evidence_bytes) == revision_manifest["evidence_sha256"], "Review snapshot evidence mismatch")
+    immutable_bytes(output_dir / "review-labels.jsonl", labels_bytes)
+    immutable_bytes(output_dir / "review-labels.manifest.json", (
+        json.dumps(revision_manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode())
+    immutable_bytes(output_dir / "review-evidence.jsonl", evidence_bytes)
+
+
+def load_saved_review(output_dir: Path, experiment: dict) -> tuple[list[dict], list[dict], dict] | None:
+    paths = tuple(output_dir / name for name in (
+        "review-labels.jsonl", "review-labels.manifest.json", "review-evidence.jsonl",
+    ))
+    if not any(path.exists() for path in paths):
+        return None
+    require(all(path.is_file() for path in paths), "Incomplete saved review snapshot")
+    labels, evidence = jsonl_records(paths[0]), jsonl_records(paths[2])
+    revision_manifest = strict_json(paths[1].read_text(encoding="utf-8"))
+    saved = experiment["adjudication"]
+    require(revision_manifest.get("artifact_id") == saved["artifact_id"], "Saved review identity mismatch")
+    require(revision_manifest.get("artifact_manifest_sha256") == saved["manifest_sha256"],
+            "Saved review manifest mismatch")
+    require(revision_manifest.get("labels_sha256") == sha256(paths[0].read_bytes()),
+            "Saved review labels changed")
+    require(revision_manifest.get("evidence_sha256") == saved["evidence_sha256"],
+            "Saved review evidence mismatch")
+    require(sha256(paths[2].read_bytes()) == saved["evidence_sha256"], "Saved review evidence changed")
+    require(set(index_records(labels, "pair_id")) == set(index_records(evidence, "pair_id")),
+            "Saved review pair coverage mismatch")
+    return labels, evidence, revision_manifest
+
+
 def check_baseline_record(record: dict, expected: dict) -> dict:
     key = (record["shop"], record["batch_id"])
     require(record["provider"] == "gpt" and key in expected, "Unknown GPT baseline batch")
@@ -742,7 +2050,19 @@ def check_baseline_record(record: dict, expected: dict) -> dict:
     return job
 
 
+def baseline_manifest_schema(spec: dict) -> str:
+    if spec.get("schema_version") == GPT_INPUT_V1:
+        require("manifest_schema_version" not in spec, "Invalid v1 GPT input spec")
+        return MANIFEST_V1
+    require(spec.get("schema_version") == GPT_INPUT_V2, "Unsupported GPT input schema")
+    require(spec.get("manifest_schema_version") == MANIFEST_V2, "GPT input manifest schema mismatch")
+    require(isinstance(spec.get("relation_contract_version"), str) and bool(spec["relation_contract_version"]),
+            "Missing GPT input relation contract")
+    return MANIFEST_V2
+
+
 def baseline_state(directory: Path, spec: dict, pricing: dict | None = None) -> dict:
+    schema = baseline_manifest_schema(spec)
     fingerprint = sha256(canonical_json(spec))
     pricing = copy.deepcopy({key: PRICING[key] for key in ("as_of", "currency", "unit", "gpt")}) if pricing is None else pricing
     expected = {(job["shop"], job["batch"]["batch_id"]): job for job in spec["requests"]}
@@ -781,7 +2101,7 @@ def baseline_state(directory: Path, spec: dict, pricing: dict | None = None) -> 
                     continue
                 try:
                     normalize_usage("gpt", body.get("usage"))
-                    parsed = parse_answers("gpt", body, job["batch"])
+                    parsed = parse_provider_answers(schema, "gpt", body, job["batch"])
                 except (ValueError, KeyError, TypeError, AttributeError, IndexError):
                     continue
                 for answer in parsed:
@@ -809,9 +2129,19 @@ def baseline_state(directory: Path, spec: dict, pricing: dict | None = None) -> 
             "cost_estimate_usd": subtotal if finished[kind] and len(priced) == len(calls) else None,
         }
     missing = [identity for identity in all_ids if identity not in answers]
-    return {"schema_version": "gpt-baseline-v1", "fingerprint": fingerprint, "complete": not missing,
-            "classifications": [answers[identity] for identity in all_ids if identity in answers],
-            "missing_pair_ids": missing, "sources": sources, "accounting": accounting, "pricing": pricing}
+    state = {
+        "schema_version": GPT_BASELINE_V1 if schema == MANIFEST_V1 else GPT_BASELINE_V2,
+        "fingerprint": fingerprint,
+        "complete": not missing,
+        "classifications": [answers[identity] for identity in all_ids if identity in answers],
+        "missing_pair_ids": missing,
+        "sources": sources,
+        "accounting": accounting,
+        "pricing": pricing,
+    }
+    if schema == MANIFEST_V2:
+        state["input_spec"] = copy.deepcopy(spec)
+    return state
 
 
 def load_completed_baseline(manifest: dict, root: Path) -> dict:
@@ -891,6 +2221,7 @@ def prepare_gpt_baseline(manifest: dict, root: Path, *, import_run: Path | None 
                                 run_batch, client, "gpt", shop, job["batch"], job["request"], key,
                                 initial_answers=[seed[item["pair_id"]] for item in job["batch"]["candidates"]
                                                  if item["pair_id"] in seed], on_attempt=checkpoint,
+                                schema_version=baseline_manifest_schema(spec),
                             ) for job in work]
                             for future in as_completed(futures):
                                 future.result()
@@ -905,26 +2236,103 @@ def prepare_gpt_baseline(manifest: dict, root: Path, *, import_run: Path | None 
 
 def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | None = None,
                        *, experiments_root: Path = Path("results/experiments"),
+                       adjudication_dir: Path = Path("results/adjudication/jev-sbs-adjudication-v1"),
                        transport: httpx.BaseTransport | None = None) -> tuple[Path, int]:
     baseline = load_completed_baseline(manifest, baseline_root)
     key = os.environ.get("TYPESAFE_API_KEY")
     require(bool(key), "Missing credential: TYPESAFE_API_KEY; no requests started")
-    jobs = {"jev": {shop: [(batch, render_request("jev", manifest["models"]["jev"], data, batch))
-                          for batch in data["batches"]] for shop, data in manifest["shops"].items()}}
+    schema = manifest_schema(manifest)
+    adjudication = None
+    if schema == MANIFEST_V3:
+        prepared = prepare_decomposed_requests(manifest)["jev"]
+        jobs = {"jev": {
+            (shop, stream): work
+            for shop, streams in prepared.items()
+            for stream, work in streams.items()
+        }}
+        artifact, _, artifact_manifest_digest = validate_adjudication_artifact(adjudication_dir)
+        require(artifact["source_manifest_sha256"] == sha256(canonical_json(manifest)),
+                "Adjudication artifact does not match the decomposed manifest")
+        adjudication_bytes = (adjudication_dir / "manifest.json").read_bytes()
+        require(sha256(adjudication_bytes) == artifact_manifest_digest, "Adjudication snapshot digest mismatch")
+        adjudication = {
+            "artifact_id": artifact["artifact_id"],
+            "manifest_sha256": artifact_manifest_digest,
+            "evidence_sha256": artifact["evidence_sha256"],
+            "contract_sha256": artifact["contract_sha256"],
+            "selection_sha256": artifact["selection_sha256"],
+            "group_assignments_sha256": artifact["group_assignments_sha256"],
+            "labels_template_sha256": artifact["labels_template_sha256"],
+        }
+    else:
+        jobs = {"jev": {shop: [(batch, render_provider_request(
+            schema, "jev", manifest["models"]["jev"], data, batch, manifest.get("contract")
+        )) for batch in data["batches"]] for shop, data in manifest["shops"].items()}}
     identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:12]
     directory = output_dir if output_dir is not None else experiments_root / identifier
     directory.mkdir(parents=True, exist_ok=False)
     manifest_digest = write_manifest(directory / "manifest.json", manifest)
     baseline_bytes = canonical_json(baseline)
     immutable_bytes(directory / "baseline.json", baseline_bytes)
+    if adjudication is not None:
+        immutable_bytes(directory / "adjudication.json", adjudication_bytes)
+    experiment_schema = {
+        MANIFEST_V1: JEV_EXPERIMENT_V1,
+        MANIFEST_V2: JEV_EXPERIMENT_V2,
+        MANIFEST_V3: JEV_EXPERIMENT_V3,
+    }[schema]
+    if schema == MANIFEST_V3:
+        request_hashes = {
+            decomposed_request_id(batch, stream): sha256(canonical_json(payload))
+            for (_, stream), work in jobs["jev"].items()
+            for batch, payload in work
+        }
+    else:
+        request_hashes = {batch["batch_id"]: sha256(canonical_json(payload))
+                          for work in jobs["jev"].values() for batch, payload in work}
     experiment = {
-        "schema_version": "jev-experiment-v1", "id": directory.name,
+        "schema_version": experiment_schema,
+        "id": directory.name,
         "manifest_sha256": manifest_digest, "baseline_fingerprint": baseline["fingerprint"],
-        "baseline_sha256": sha256(baseline_bytes), "jev_prompt_version": JEV_PROMPT_VERSION,
-        "jev_criteria": JEV_CRITERIA, "jev_instructions": JEV_INSTRUCTIONS, "pricing": PRICING,
-        "jev_request_hashes": {batch["batch_id"]: sha256(canonical_json(payload))
-                               for work in jobs["jev"].values() for batch, payload in work},
+        "baseline_sha256": sha256(baseline_bytes), "pricing": PRICING,
+        "jev_request_hashes": request_hashes,
     }
+    if schema == MANIFEST_V1:
+        experiment.update(
+            jev_prompt_version=JEV_PROMPT_VERSION,
+            jev_criteria=JEV_CRITERIA,
+            jev_instructions=JEV_INSTRUCTIONS,
+        )
+    elif schema == MANIFEST_V2:
+        contract = manifest["contract"]
+        experiment.update(
+            manifest_schema_version=MANIFEST_V2,
+            relation_contract_version=contract["version"],
+            resolver_version=contract["resolver_version"],
+            jev_identity_instruction=contract["identity_instruction"],
+            jev_identity_criteria=contract["identity_criteria"],
+            jev_relation_criteria=contract["relation_criteria"],
+            jev_relation_instructions=contract["relation_instructions"],
+        )
+    else:
+        contract = manifest["decomposed_contract"]
+        experiment.update(
+            manifest_schema_version=MANIFEST_V3,
+            relation_contract_version=manifest["contract"]["version"],
+            decomposed_contract_version=contract["version"],
+            decomposed_contract_sha256=sha256(canonical_json(contract)),
+            decomposed_contract=contract,
+            decomposed_extraction_version=DECOMPOSED_EXTRACTION_VERSION,
+            resolver_versions=contract["resolver_versions"],
+            adjudication=adjudication,
+            script_sha256=sha256(Path(__file__).read_bytes()),
+            execution_policy={
+                "concurrency": manifest["concurrency"],
+                "timeout_seconds": TIMEOUT_SECONDS,
+                "max_retries": MAX_RETRIES,
+                "max_retry_delay_seconds": MAX_RETRY_DELAY,
+            },
+        )
     experiment_bytes = canonical_json(experiment)
     immutable_bytes(directory / "experiment.json", experiment_bytes)
     print(f"Jev experiment: {directory}; reusing {len(baseline['classifications'])} GPT labels. "
@@ -932,7 +2340,10 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
     failures = execute(manifest, jobs, directory, manifest_digest, {"jev": key}, transport=transport,
                        run_metadata={"experiment_sha256": sha256(experiment_bytes),
                                      "baseline_fingerprint": baseline["fingerprint"]})
-    write_reports(directory / "manifest.json", directory)
+    if schema in {MANIFEST_V1, MANIFEST_V2}:
+        write_reports(directory / "manifest.json", directory)
+    else:
+        write_decomposed_reports(directory / "manifest.json", directory)
     return directory, failures
 
 
@@ -942,14 +2353,80 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
     require(start.get("experiment_sha256") == sha256(raw_experiment), "Experiment snapshot digest mismatch")
     experiment = strict_json(raw_experiment.decode("utf-8"))
     baseline = strict_json(raw_baseline.decode("utf-8"))
-    require(experiment["schema_version"] == "jev-experiment-v1", "Unsupported experiment schema")
+    schema = manifest_schema(manifest)
+    expected_experiment_schema = {
+        MANIFEST_V1: JEV_EXPERIMENT_V1,
+        MANIFEST_V2: JEV_EXPERIMENT_V2,
+        MANIFEST_V3: JEV_EXPERIMENT_V3,
+    }[schema]
+    expected_baseline_schema = GPT_BASELINE_V1 if schema == MANIFEST_V1 else GPT_BASELINE_V2
+    require(experiment["schema_version"] == expected_experiment_schema, "Experiment schema mismatch")
     require(experiment["manifest_sha256"] == sha256(raw_manifest), "Experiment manifest mismatch")
     require((directory / "manifest.json").read_bytes() == raw_manifest, "Experiment must use its saved manifest")
     require(experiment["baseline_sha256"] == sha256(raw_baseline), "Baseline snapshot digest mismatch")
-    fingerprint = sha256(canonical_json(baseline_spec(manifest)))
-    require(baseline["schema_version"] == "gpt-baseline-v1" and baseline["complete"], "Incomplete GPT snapshot")
+    if schema == MANIFEST_V1:
+        fingerprint = sha256(canonical_json(baseline_spec(manifest)))
+    else:
+        saved_spec = baseline.get("input_spec")
+        require(isinstance(saved_spec, dict) and baseline_manifest_schema(saved_spec) == MANIFEST_V2,
+                "Missing GPT input snapshot")
+        require(saved_spec["relation_contract_version"] == manifest["contract"]["version"],
+                "GPT input relation contract mismatch")
+        fingerprint = sha256(canonical_json(saved_spec))
+    require(baseline["schema_version"] == expected_baseline_schema and baseline["complete"],
+            "Incomplete GPT snapshot")
     require(start["baseline_fingerprint"] == experiment["baseline_fingerprint"] == baseline["fingerprint"] == fingerprint,
             "Experiment baseline fingerprint mismatch")
+    if schema == MANIFEST_V2:
+        contract = manifest["contract"]
+        require(experiment.get("manifest_schema_version") == MANIFEST_V2, "Experiment manifest schema mismatch")
+        require(experiment.get("relation_contract_version") == contract["version"],
+                "Experiment relation contract mismatch")
+        require(experiment.get("resolver_version") == contract["resolver_version"],
+                "Experiment resolver mismatch")
+        require(experiment.get("jev_identity_instruction") == contract["identity_instruction"],
+                "Experiment identity instruction mismatch")
+        require(experiment.get("jev_identity_criteria") == contract["identity_criteria"],
+                "Experiment identity criteria mismatch")
+        require(experiment.get("jev_relation_criteria") == contract["relation_criteria"],
+                "Experiment relation criteria mismatch")
+        require(experiment.get("jev_relation_instructions") == contract["relation_instructions"],
+                "Experiment relation instructions mismatch")
+    elif schema == MANIFEST_V3:
+        contract = manifest["decomposed_contract"]
+        require(experiment.get("manifest_schema_version") == MANIFEST_V3, "Experiment manifest schema mismatch")
+        require(experiment.get("relation_contract_version") == manifest["contract"]["version"],
+                "Experiment GPT relation contract mismatch")
+        require(experiment.get("decomposed_contract_version") == contract["version"],
+                "Experiment decomposed contract mismatch")
+        require(experiment.get("decomposed_contract_sha256") == sha256(canonical_json(contract)),
+                "Experiment decomposed contract digest mismatch")
+        require(experiment.get("decomposed_contract") == contract, "Experiment decomposed contract snapshot mismatch")
+        require(experiment.get("decomposed_extraction_version") in DECOMPOSED_EXTRACTORS,
+                "Unsupported saved decomposed extraction version")
+        require(experiment.get("resolver_versions") == contract["resolver_versions"],
+                "Experiment decomposed resolver mismatch")
+        require(start.get("script_sha256") == experiment.get("script_sha256"),
+                "Experiment script snapshot mismatch")
+        require(experiment.get("execution_policy") == {
+            "concurrency": manifest["concurrency"],
+            "timeout_seconds": start.get("timeout_seconds"),
+            "max_retries": start.get("max_retries"),
+            "max_retry_delay_seconds": start.get("max_retry_delay_seconds"),
+        }, "Experiment execution policy mismatch")
+        raw_adjudication = (directory / "adjudication.json").read_bytes()
+        saved_adjudication = strict_json(raw_adjudication.decode("utf-8"))
+        adjudication = experiment.get("adjudication")
+        require(isinstance(adjudication, dict), "Missing experiment adjudication snapshot")
+        require(adjudication == {
+            "artifact_id": saved_adjudication["artifact_id"],
+            "manifest_sha256": sha256(raw_adjudication),
+            "evidence_sha256": saved_adjudication["evidence_sha256"],
+            "contract_sha256": saved_adjudication["contract_sha256"],
+            "selection_sha256": saved_adjudication["selection_sha256"],
+            "group_assignments_sha256": saved_adjudication["group_assignments_sha256"],
+            "labels_template_sha256": saved_adjudication["labels_template_sha256"],
+        }, "Experiment adjudication snapshot mismatch")
     expected = {item["pair_id"]: (shop, batch, item) for shop, data in manifest["shops"].items()
                 for batch in data["batches"] for item in batch["candidates"]}
     answers = index_records(baseline["classifications"], "pair_id")
@@ -959,14 +2436,209 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
         require(answer["shop"] == shop and answer["candidate_id"] == item["candidate_id"]
                 and answer["anchor_id"] == batch["anchor_id"] and answer["direction"] == batch["direction"],
                 "Baseline snapshot pair mismatch")
-        require(answer["status"] == "ok" and answer["label"] in LABELS, "Invalid cached classification")
-    require(set(experiment["jev_request_hashes"]) == {batch["batch_id"] for data in manifest["shops"].values()
-                                                    for batch in data["batches"]}, "Experiment request coverage mismatch")
+        require(answer["status"] == "ok", "Invalid cached classification")
+        if schema == MANIFEST_V1:
+            require(answer["label"] in LABELS, "Invalid cached classification")
+        else:
+            require(answer["identity"]["label"] in IDENTITY_LABELS, "Invalid cached identity")
+            require(set(answer["relations"]) == set(RELATION_HEADS), "Invalid cached relation heads")
+            require(all(answer["relations"][head]["label"] in RELATION_LABELS for head in RELATION_HEADS),
+                    "Invalid cached relation label")
+    if schema == MANIFEST_V3:
+        expected_requests = {
+            decomposed_request_id(batch, stream)
+            for data in manifest["shops"].values()
+            for stream in decomposed_stream_names(manifest["decomposed_contract"], data["objective"])
+            for batch in data["batches"]
+        }
+    else:
+        expected_requests = {batch["batch_id"] for data in manifest["shops"].values() for batch in data["batches"]}
+    require(set(experiment["jev_request_hashes"]) == expected_requests, "Experiment request coverage mismatch")
     return experiment, baseline
 
 
+def validate_v2_experiment_log(directory: Path) -> tuple[dict, dict]:
+    raw_manifest = (directory / "manifest.json").read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V2, "Expected v2 experiment manifest")
+    records, truncated = read_request_log(directory / "requests.jsonl")
+    require(not truncated and records[-1].get("record_type") == "run_end", "Incomplete experiment log")
+    experiment, baseline = experiment_snapshot(directory, raw_manifest, manifest, records[0])
+    expected = {batch["batch_id"]: batch for data in manifest["shops"].values() for batch in data["batches"]}
+    observed = set()
+    for record in records[1:]:
+        if record["record_type"] in {"run_end", "group_start", "group_end"}:
+            if "provider" in record:
+                require(record["provider"] == "jev", "Unexpected provider in Jev experiment")
+            continue
+        require(record["record_type"] == "batch" and record["provider"] == "jev", "Invalid experiment record")
+        require(record["batch_id"] in expected and record["batch_id"] not in observed,
+                "Unknown or duplicate experiment batch")
+        observed.add(record["batch_id"])
+        batch = expected[record["batch_id"]]
+        require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]],
+                "Experiment pair mismatch")
+        require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][record["batch_id"]],
+                "Jev request differs from experiment snapshot")
+    require(observed == set(expected), "Experiment batch coverage mismatch")
+    return experiment, baseline
+
+
+def validate_decomposed_record_evidence(record: dict, batch: dict, extraction_version: str,
+                                        max_retries: int) -> None:
+    labels = decomposed_payload_labels(record["request"])
+    collected = {}
+    require(record.get("extraction_version") == extraction_version, "Decomposed extraction version mismatch")
+    require(record["retries"] == len(record["attempts"]) - 1, "Decomposed retry count mismatch")
+    require(1 <= len(record["attempts"]) <= max_retries + 1, "Invalid decomposed attempt count")
+    for attempt in record["attempts"]:
+        if attempt["raw_response"] is None:
+            require(attempt["answers"] == [], "Answers require a recorded raw response")
+            continue
+        require(attempt["http_status"] == 200, "Raw response requires HTTP 200")
+        try:
+            parsed = parse_provider_answers(
+                MANIFEST_V3, "jev", attempt["raw_response"], batch, labels, extraction_version,
+            )
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+            require(attempt["error"] == "invalid_response" and attempt["answers"] == [],
+                    "Invalid raw response normalization mismatch")
+            continue
+        require(attempt["answers"] == parsed and attempt["error"] is None,
+                "Normalized decomposed answers differ from raw response")
+        for answer in parsed:
+            collected.setdefault(answer["pair_id"], answer)
+    expected_answers = [collected[pair_id] for pair_id in record["pair_ids"] if pair_id in collected]
+    require(record["answers"] == expected_answers, "Recorded decomposed answers differ from attempt evidence")
+    expected_status, missing_error = extraction_status(expected_answers, record["batch_size"])
+    expected_error = (record["attempts"][-1]["error"] or missing_error) if missing_error else None
+    require(record["status"] == expected_status and record["error"] == expected_error,
+            "Decomposed batch completion status mismatch")
+    require(record["raw_response"] == record["attempts"][-1]["raw_response"],
+            "Decomposed final raw response mismatch")
+
+
+def validate_v3_experiment_log(directory: Path) -> tuple[dict, dict]:
+    raw_manifest = (directory / "manifest.json").read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V3, "Expected v3 experiment manifest")
+    records, truncated = read_request_log(directory / "requests.jsonl")
+    require(not truncated and records[-1].get("record_type") == "run_end", "Incomplete experiment log")
+    experiment, baseline = experiment_snapshot(directory, raw_manifest, manifest, records[0])
+    start = records[0]
+    require(start.get("manifest_sha256") == sha256(raw_manifest), "Run/manifest digest mismatch")
+    require(start.get("concurrency") == manifest["concurrency"], "Run/manifest concurrency mismatch")
+    execution_policy = experiment["execution_policy"]
+    extraction_version = experiment["decomposed_extraction_version"]
+    prepared = prepare_decomposed_requests(manifest)["jev"]
+    expected = {
+        decomposed_request_id(batch, stream): {
+            "shop": shop, "stream": stream, "batch": batch, "request": payload,
+        }
+        for shop, streams in prepared.items()
+        for stream, work in streams.items()
+        for batch, payload in work
+    }
+    require(experiment["jev_request_hashes"] == {
+        request_id: sha256(canonical_json(job["request"])) for request_id, job in expected.items()
+    }, "Experiment request snapshot mismatch")
+    expected_groups = {(job["shop"], job["stream"]) for job in expected.values()}
+    starts, ends, observed = set(), set(), set()
+    finished = False
+    run_end = None
+    for record in records[1:]:
+        require(not finished, "Unexpected records after run_end")
+        kind = record["record_type"]
+        if kind == "run_end":
+            require(run_end is None, "Duplicate run_end record")
+            run_end = record
+            finished = True
+            continue
+        require(record.get("provider") == "jev", "Unexpected provider in decomposed experiment")
+        group = (record.get("shop"), record.get("stream"))
+        require(group in expected_groups, "Unknown decomposed experiment group")
+        if kind in {"group_start", "group_end"}:
+            target = starts if kind == "group_start" else ends
+            require(group not in target, "Duplicate decomposed experiment group")
+            if kind == "group_start":
+                require(record["requested_model"] == manifest["models"]["jev"]["model"],
+                        "Decomposed group model mismatch")
+                require(record["batches"] == sum(job["shop"] == group[0] and job["stream"] == group[1]
+                                                  for job in expected.values()),
+                        "Decomposed group batch-count mismatch")
+            target.add(group)
+            continue
+        require(kind == "batch", "Invalid decomposed experiment record")
+        request_id = record.get("request_id")
+        require(request_id in expected and request_id not in observed, "Unknown or duplicate decomposed request")
+        observed.add(request_id)
+        job = expected[request_id]
+        batch = job["batch"]
+        require(group == (job["shop"], job["stream"]), "Decomposed request group mismatch")
+        require(record["batch_id"] == batch["batch_id"], "Decomposed batch identity mismatch")
+        require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]],
+                "Decomposed experiment pair mismatch")
+        require(record["batch_size"] == len(batch["candidates"]), "Decomposed experiment batch-size mismatch")
+        require(record["requested_model"] == record["request"]["model"] == manifest["models"]["jev"]["model"],
+                "Decomposed request model mismatch")
+        require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][request_id],
+                "Jev request differs from experiment snapshot")
+        require(record["status"] in {"ok", "partial", "error"} and bool(record["attempts"]),
+                "Invalid decomposed batch status")
+        answers = index_records(record["answers"], "pair_id")
+        if record["status"] == "partial":
+            require(bool(answers) and set(answers) < set(record["pair_ids"]), "Invalid partial answer coverage")
+        else:
+            required = set(record["pair_ids"]) if record["status"] == "ok" else set()
+            require(set(answers) == required, "Invalid decomposed answer coverage")
+        labels = set(decomposed_payload_labels(record["request"]))
+        require(all(answer["label"] in labels for answer in answers.values()), "Invalid decomposed answer choice")
+        validate_decomposed_record_evidence(
+            record, batch, extraction_version, execution_policy["max_retries"],
+        )
+    require(starts == ends == expected_groups, "Decomposed experiment group coverage mismatch")
+    require(observed == set(expected), "Decomposed experiment request coverage mismatch")
+    require(run_end is records[-1], "Missing final run_end record")
+    failed_batches = sum(record["record_type"] == "batch" and record["status"] != "ok" for record in records)
+    require(run_end.get("failed_batches") == failed_batches, "Decomposed run failure count mismatch")
+    return experiment, baseline
+
+
+def relation_distribution(answers: list, resolver_version: str = RESOLVER_VERSION) -> dict:
+    resolutions = [resolve_basket_judgment(answer, resolver_version) for answer in answers]
+    return {
+        "identity_counts": {
+            label: sum(answer["identity"]["label"] == label for answer in answers) for label in IDENTITY_LABELS
+        },
+        "relation_counts": {
+            head: {
+                label: sum(answer["relations"][head]["label"] == label for answer in answers)
+                for label in RELATION_LABELS
+            }
+            for head in RELATION_HEADS
+        },
+        "basket_label_counts": {
+            label: sum(resolution["basket_label"] == label for resolution in resolutions) for label in BASKET_LABELS
+        },
+        "resolution_status_counts": dict(sorted(Counter(
+            resolution["resolution_status"] for resolution in resolutions
+        ).items())),
+    }
+
+
+def relation_probability_warnings(answer: dict) -> int:
+    judgments = [answer["identity"], *(answer["relations"][head] for head in RELATION_HEADS)]
+    return sum(judgment.get("probability_rounding_warning", False) for judgment in judgments)
+
+
+def relation_choice_probability_warnings(answer: dict) -> int:
+    judgments = [answer["identity"], *(answer["relations"][head] for head in RELATION_HEADS)]
+    return sum(judgment.get("choice_probability_warning", False) for judgment in judgments)
+
+
 def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int,
-                    pricing: dict | None = None) -> dict:
+                    pricing: dict | None = None, schema_version: str = MANIFEST_V1,
+                    resolver_version: str = RESOLVER_VERSION) -> dict:
     attempts = [attempt for record in records for attempt in record["attempts"]]
     complete = end is not None and len(records) == len(expected)
     wall = end["wall_seconds"] if complete else None
@@ -992,7 +2664,7 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
     successes = [answer for record in records if record["status"] in ("ok", "partial") for answer in record["answers"]]
     expected_pairs = sum(len(batch["candidates"]) for batch in expected)
     recorded_pairs = sum(record["batch_size"] for record in records)
-    return {
+    result = {
         "complete": complete, "wall_seconds": wall, "concurrency": concurrency,
         "expected_batches": len(expected), "batch_requests": len(records), "http_attempts": len(attempts),
         "retries": sum(len(record["attempts"]) - 1 for record in records),
@@ -1001,14 +2673,17 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
         "failed_batches": sum(record["status"] == "error" for record in records),
         "partial_batches": sum(record["status"] == "partial" for record in records),
         "reextracted_batches": sum("recorded_status" in record for record in records),
-        "probability_rounding_warnings": sum(answer.get("probability_rounding_warning", False) for answer in successes),
+        "probability_rounding_warnings": sum(
+            relation_probability_warnings(answer) if schema_version == MANIFEST_V2
+            else answer.get("probability_rounding_warning", False)
+            for answer in successes
+        ),
         "successful_pairs": len(successes), "failed_pairs": recorded_pairs - len(successes),
         "missing_pairs": expected_pairs - recorded_pairs,
         "pairs_per_second": len(successes) / wall if wall else None,
         "served_models": sorted({attempt["served_model"] for attempt in attempts
                                  if isinstance(attempt["served_model"], str)}),
         "batch_sizes": dict(sorted(Counter(str(record["batch_size"]) for record in records).items())),
-        "label_counts": {label: sum(answer["label"] == label for answer in successes) for label in LABELS},
         "request_latency_seconds": {
             "count": len(latencies), "min": min(latencies) if latencies else None,
             "max": max(latencies) if latencies else None,
@@ -1023,6 +2698,20 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
             "complete_usage_coverage": cost_complete,
         },
     }
+    if schema_version == MANIFEST_V1:
+        result["label_counts"] = {label: sum(answer["label"] == label for answer in successes) for label in LABELS}
+    elif schema_version == MANIFEST_V2:
+        result["choice_probability_warnings"] = sum(
+            relation_choice_probability_warnings(answer) for answer in successes
+        )
+        result.update(relation_distribution(successes, resolver_version))
+    else:
+        require(schema_version == MANIFEST_V3, "Unsupported manifest schema")
+        result["choice_probability_warnings"] = sum(
+            answer.get("choice_probability_warning", False) for answer in successes
+        )
+        result["choice_counts"] = dict(sorted(Counter(answer["label"] for answer in successes).items()))
+    return result
 
 
 def write_csv(path: Path, rows: list, columns: list) -> None:
@@ -1038,9 +2727,10 @@ def write_csv(path: Path, rows: list, columns: list) -> None:
         writer.writerows({key: cell(value) for key, value in row.items()} for row in rows)
 
 
-def write_reports(manifest_path: Path, output_dir: Path) -> dict:
+def write_legacy_reports(manifest_path: Path, output_dir: Path) -> dict:
     raw_manifest = manifest_path.read_bytes()
     manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V1, "Expected v1 report manifest")
     records, truncated = read_request_log(output_dir / "requests.jsonl")
     start = records[0]
     require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
@@ -1094,7 +2784,7 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
                 required_ids = set(record["pair_ids"]) if record["status"] == "ok" else set()
                 require(set(answers) == required_ids, "Invalid batch answer coverage")
             require(all(answer["label"] in LABELS for answer in answers.values()), "Invalid recorded label")
-            observed[key] = reextract_record(record, batch)
+            observed[key] = reextract_record(record, batch, MANIFEST_V1)
 
     classifications = {provider: {} for provider in manifest["models"]}
     summary = {
@@ -1190,11 +2880,855 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
     return summary
 
 
+def validate_normalized_relation_answer(answer: dict, expected_pair_ids: set[str]) -> None:
+    require(answer["pair_id"] in expected_pair_ids, "Unknown relation answer")
+    require(answer["identity"]["label"] in IDENTITY_LABELS, "Invalid relation identity")
+    require(set(answer["relations"]) == set(RELATION_HEADS), "Invalid relation answer heads")
+    require(all(answer["relations"][head]["label"] in RELATION_LABELS for head in RELATION_HEADS),
+            "Invalid relation answer label")
+
+
+def relation_agreement(rows: list, left_key: str, right_key: str, labels: tuple[str, ...]) -> dict:
+    agreements = sum(row[left_key] == row[right_key] for row in rows)
+    return {
+        "paired_success": len(rows),
+        "agreements": agreements,
+        "disagreements": len(rows) - agreements,
+        "agreement_rate": agreements / len(rows) if rows else None,
+        "matrix_gpt_rows_jev_columns": {
+            left: {right: sum(row[left_key] == left and row[right_key] == right for row in rows) for right in labels}
+            for left in labels
+        },
+    }
+
+
+def flatten_relation_judgment(row: dict, provider: str, name: str, judgment: dict | None) -> None:
+    row[f"{provider}_{name}"] = judgment["label"] if judgment else None
+    row[f"{provider}_{name}_reason"] = judgment.get("reason") if judgment else None
+    row[f"{provider}_{name}_confidence"] = judgment.get("confidence") if judgment else None
+    probabilities = judgment.get("probabilities") if judgment else None
+    row[f"{provider}_{name}_probabilities"] = (
+        json.dumps(probabilities, sort_keys=True) if probabilities is not None else None
+    )
+    row[f"{provider}_{name}_choice_probability_warning"] = (
+        judgment.get("choice_probability_warning", False) if judgment else None
+    )
+
+
+def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
+    raw_manifest = manifest_path.read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V2, "Expected v2 report manifest")
+    log_path = output_dir / "requests.jsonl"
+    records, truncated = read_request_log(log_path)
+    start = records[0]
+    require(start["manifest_sha256"] == sha256(raw_manifest), "Run/manifest digest mismatch")
+    require(start["concurrency"] == manifest["concurrency"], "Run/manifest concurrency mismatch")
+    experiment, baseline = experiment_snapshot(output_dir, raw_manifest, manifest, start)
+    saved_resolver_version = experiment["resolver_version"]
+    require(saved_resolver_version in RESOLVERS,
+            f"Unsupported saved resolver version: {saved_resolver_version}")
+    groups = {("jev", shop) for shop in manifest["shops"]}
+    expected = {
+        ("jev", shop, batch["batch_id"]): batch
+        for shop, data in manifest["shops"].items()
+        for batch in data["batches"]
+    }
+    observed, starts, ends = {}, {}, {}
+    finished = False
+    for record in records[1:]:
+        require(not finished, "Unexpected records after run_end")
+        kind = record["record_type"]
+        if kind == "run_end":
+            finished = True
+            continue
+        group = (record["provider"], record["shop"])
+        require(group in groups, "Unknown provider/shop in relation log")
+        if kind in ("group_start", "group_end"):
+            if kind == "group_start":
+                require(record["requested_model"] == manifest["models"]["jev"]["model"], "Group model mismatch")
+                require(record["batches"] == len(manifest["shops"][group[1]]["batches"]),
+                        "Group batch-count mismatch")
+            target = starts if kind == "group_start" else ends
+            require(group not in target, "Duplicate group record")
+            target[group] = record
+            continue
+        require(kind == "batch", "Unknown request-log record type")
+        key = (*group, record["batch_id"])
+        require(key in expected and key not in observed, "Unknown or duplicate batch record")
+        batch = expected[key]
+        require(record["requested_model"] == record["request"]["model"] == manifest["models"]["jev"]["model"],
+                "Batch model mismatch")
+        require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][record["batch_id"]],
+                "Jev request differs from experiment snapshot")
+        require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]], "Batch pair mismatch")
+        require(record["batch_size"] == len(batch["candidates"]), "Batch size mismatch")
+        require(record["status"] in ("ok", "partial", "error") and bool(record["attempts"]),
+                "Invalid batch status/attempts")
+        answers = index_records(record["answers"], "pair_id")
+        if record["status"] == "partial":
+            require(bool(answers) and set(answers) < set(record["pair_ids"]), "Invalid partial answer coverage")
+        else:
+            required_ids = set(record["pair_ids"]) if record["status"] == "ok" else set()
+            require(set(answers) == required_ids, "Invalid batch answer coverage")
+        for answer in answers.values():
+            validate_normalized_relation_answer(answer, set(record["pair_ids"]))
+        recovered = reextract_record(record, batch, MANIFEST_V2)
+        for answer in recovered["answers"]:
+            validate_normalized_relation_answer(answer, set(record["pair_ids"]))
+        observed[key] = recovered
+
+    classifications = {"gpt": {}, "jev": {}}
+    for answer in baseline["classifications"]:
+        resolution = resolve_basket_judgment(answer, saved_resolver_version)
+        classifications["gpt"][answer["pair_id"]] = {
+            **answer,
+            "cached": True,
+            "error": None,
+            "baseline_fingerprint": baseline["fingerprint"],
+            "resolution": resolution,
+        }
+    summary = {
+        "schema_version": "jev-sbs-relation-report-v1",
+        "manifest_sha256": sha256(raw_manifest),
+        "extraction": {
+            "version": RELATION_EXTRACTION_VERSION,
+            "probability_sum_tolerance": PROBABILITY_SUM_TOLERANCE,
+            "choice_max_tolerance": CHOICE_MAX_TOLERANCE,
+            "request_log_sha256": sha256(log_path.read_bytes()),
+        },
+        "models": manifest["models"],
+        "pricing": experiment["pricing"],
+        "run_settings": start,
+        "truncated_final_line": truncated,
+        "limitations": [
+            *manifest["limitations"],
+            "Identity and all relation heads were requested together; this does not measure two-pass cost savings.",
+            "Interrupted runs can omit in-flight attempts; usage subtotals cover recorded attempts only.",
+        ],
+        "experiment": experiment,
+        "gpt_baseline": {
+            "fingerprint": baseline["fingerprint"],
+            "cached": True,
+            "classifications": len(classifications["gpt"]),
+            "accounting": baseline["accounting"],
+            "pricing": baseline["pricing"],
+            "distributions": {
+                shop: relation_distribution(
+                    [answer for answer in baseline["classifications"] if answer["shop"] == shop],
+                    saved_resolver_version,
+                )
+                for shop in manifest["shops"]
+            },
+            "note": "Historical measurements, not inference performed during this Jev experiment.",
+        },
+        "groups": {},
+        "agreement": {},
+        "classifications": {"gpt": {}, "jev": {}},
+        "resolution_review": {"gpt": {}, "jev": {}},
+    }
+    for _, shop in sorted(groups):
+        data = manifest["shops"][shop]
+        group_records = [observed["jev", shop, batch["batch_id"]] for batch in data["batches"]
+                         if ("jev", shop, batch["batch_id"]) in observed]
+        end = ends.get(("jev", shop)) if ("jev", shop) in starts else None
+        summary["groups"][f"jev/{shop}"] = summarize_group(
+            "jev", group_records, data["batches"], end, manifest["concurrency"], experiment["pricing"], MANIFEST_V2,
+            saved_resolver_version,
+        )
+        for batch in data["batches"]:
+            record = observed.get(("jev", shop, batch["batch_id"]))
+            answers = {answer["pair_id"]: answer for answer in record["answers"]} if record else {}
+            for item in batch["candidates"]:
+                answer = answers.get(item["pair_id"])
+                classifications["jev"][item["pair_id"]] = {
+                    "provider": "jev",
+                    "shop": shop,
+                    "direction": batch["direction"],
+                    "pair_id": item["pair_id"],
+                    "batch_id": batch["batch_id"],
+                    "anchor_id": batch["anchor_id"],
+                    "candidate_id": item["candidate_id"],
+                    "status": "ok" if answer else ("error" if record else "missing"),
+                    "error": None if answer else (
+                        "missing_candidate_answer" if record and record["status"] == "partial"
+                        else record["error"] if record else "batch_not_recorded"
+                    ),
+                    "recorded_batch_status": record.get("recorded_status", record["status"]) if record else None,
+                    "served_model": record["served_model"] if record else None,
+                    "identity": answer["identity"] if answer else None,
+                    "relations": answer["relations"] if answer else None,
+                    "resolution": resolve_basket_judgment(answer, saved_resolver_version) if answer else None,
+                }
+
+    paired = []
+    item_index = {
+        item["pair_id"]: item
+        for data in manifest["shops"].values()
+        for batch in data["batches"]
+        for item in batch["candidates"]
+    }
+    for identity, gpt in classifications["gpt"].items():
+        jev = classifications["jev"][identity]
+        data = manifest["shops"][gpt["shop"]]
+        anchor, candidate = data["products"][gpt["anchor_id"]], data["products"][gpt["candidate_id"]]
+        item = item_index[identity]
+        success = gpt["status"] == jev["status"] == "ok"
+        row = {
+            **{key: gpt[key] for key in ("pair_id", "shop", "direction", "anchor_id", "candidate_id")},
+            "retrieved_forward_rank": item["retrieved_forward_rank"],
+            "retrieval_source": item["retrieval_source"],
+            "anchor_name": anchor["name"],
+            "anchor_category": anchor["category"],
+            "anchor_description": anchor["description"],
+            "anchor_text": anchor["text"],
+            "candidate_name": candidate["name"],
+            "candidate_category": candidate["category"],
+            "candidate_description": candidate["description"],
+            "gpt_status": gpt["status"],
+            "gpt_error": gpt["error"],
+            "jev_status": jev["status"],
+            "jev_error": jev["error"],
+            "paired_success": success,
+        }
+        flatten_relation_judgment(row, "gpt", "identity", gpt["identity"])
+        flatten_relation_judgment(row, "jev", "identity", jev["identity"])
+        for head in RELATION_HEADS:
+            flatten_relation_judgment(row, "gpt", head, gpt["relations"][head])
+            flatten_relation_judgment(row, "jev", head, jev["relations"][head] if jev["relations"] else None)
+        for provider, classification in (("gpt", gpt), ("jev", jev)):
+            resolution = classification["resolution"]
+            for field in ("identity_action", "basket_label", "resolution_status", "resolution", "conflict"):
+                row[f"{provider}_{field}"] = resolution[field] if resolution else None
+        for name in ("identity", *RELATION_HEADS):
+            row[f"{name}_agreement"] = (
+                row[f"gpt_{name}"] == row[f"jev_{name}"] if success else None
+            )
+        row["basket_agreement"] = (
+            row["gpt_basket_label"] == row["jev_basket_label"] if success else None
+        )
+        row["any_disagreement"] = (
+            any(row[f"{name}_agreement"] is False for name in ("identity", *RELATION_HEADS, "basket"))
+            if success else None
+        )
+        paired.append(row)
+
+    for provider in ("gpt", "jev"):
+        for shop in manifest["shops"]:
+            successful = [row for row in classifications[provider].values()
+                          if row["shop"] == shop and row["status"] == "ok"]
+            summary["classifications"][provider][shop] = relation_distribution(successful, saved_resolver_version)
+            resolutions = [row["resolution"] for row in successful]
+            summary["resolution_review"][provider][shop] = {
+                "conflicts": sum(resolution["conflict"] for resolution in resolutions),
+                "identity_filtered": sum(resolution["identity_action"] == "filter" for resolution in resolutions),
+                "identity_uncertain": sum(resolution["identity_action"] == "continue_uncertain"
+                                          for resolution in resolutions),
+            }
+    for shop in manifest["shops"]:
+        eligible = [row for row in paired if row["shop"] == shop and row["paired_success"]]
+        heads = {
+            "identity": relation_agreement(eligible, "gpt_identity", "jev_identity", IDENTITY_LABELS),
+            **{
+                head: relation_agreement(eligible, f"gpt_{head}", f"jev_{head}", RELATION_LABELS)
+                for head in RELATION_HEADS
+            },
+            "basket": relation_agreement(eligible, "gpt_basket_label", "jev_basket_label", BASKET_LABELS),
+        }
+        summary["agreement"][shop] = {
+            "paired_success": len(eligible),
+            "unpaired": sum(row["shop"] == shop and not row["paired_success"] for row in paired),
+            "pairs_with_any_disagreement": sum(row["any_disagreement"] for row in eligible),
+            "heads": heads,
+        }
+    summary["run_complete"] = finished and not truncated and all(
+        group["complete"] for group in summary["groups"].values()
+    )
+    summary["all_pairs_classified"] = all(row["paired_success"] for row in paired)
+    costs = [group["cost_estimate"]["total_usd"] for group in summary["groups"].values()]
+    summary["new_inference"] = {
+        "gpt_http_attempts": 0,
+        "gpt_cost_usd": 0.0,
+        "jev_http_attempts": sum(group["http_attempts"] for group in summary["groups"].values()),
+        "jev_cost_estimate_usd": math.fsum(costs) if all(cost is not None for cost in costs) else None,
+    }
+    for provider, rows in classifications.items():
+        (output_dir / f"{provider}_classifications.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows.values()),
+            encoding="utf-8",
+        )
+    columns = list(paired[0])
+    write_csv(output_dir / "paired_results.csv", paired, columns)
+    write_csv(output_dir / "disagreements.csv", [row for row in paired if row["any_disagreement"] is True], columns)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    return summary
+
+
+def decomposed_classifications(manifest: dict, records: list[dict]) -> dict:
+    observed = {
+        (record["shop"], record["stream"], record["batch_id"]): record
+        for record in records if record["record_type"] == "batch"
+    }
+    result = {}
+    contract = manifest["decomposed_contract"]
+    for shop, data in manifest["shops"].items():
+        streams = decomposed_stream_names(contract, data["objective"])
+        for batch in data["batches"]:
+            by_stream = {
+                stream: observed.get((shop, stream, batch["batch_id"])) for stream in streams
+            }
+            answers = {
+                stream: index_records(record["answers"], "pair_id") if record else {}
+                for stream, record in by_stream.items()
+            }
+            for item in batch["candidates"]:
+                stream_rows = {}
+                for stream in streams:
+                    record, answer = by_stream[stream], answers[stream].get(item["pair_id"])
+                    stream_rows[stream] = {
+                        "status": "ok" if answer else ("error" if record else "missing"),
+                        "error": None if answer else (
+                            "missing_candidate_answer" if record and record["status"] == "partial"
+                            else record["error"] if record else "batch_not_recorded"
+                        ),
+                        "recorded_batch_status": record.get("recorded_status", record["status"]) if record else None,
+                        "served_model": record["served_model"] if record else None,
+                        **({key: copy.deepcopy(answer[key]) for key in (
+                            "label", "probabilities", "confidence", "probability_sum",
+                            "probability_rounding_warning", "choice_probability_warning",
+                        )} if answer else {key: None for key in (
+                            "label", "probabilities", "confidence", "probability_sum",
+                            "probability_rounding_warning", "choice_probability_warning",
+                        )}),
+                    }
+                result[item["pair_id"]] = {
+                    "provider": "jev", "shop": shop, "objective": data["objective"],
+                    "direction": batch["direction"], "pair_id": item["pair_id"],
+                    "batch_id": batch["batch_id"], "anchor_id": batch["anchor_id"],
+                    "candidate_id": item["candidate_id"], "streams": stream_rows,
+                    "status": "ok" if all(row["status"] == "ok" for row in stream_rows.values()) else "incomplete",
+                    "resolution": None,
+                }
+    return result
+
+
+def completed_review_rows(labels: list[dict], evidence: list[dict], contract: dict,
+                          split: str) -> tuple[list[tuple[dict, dict]], bool]:
+    require(split in {"development", "holdout"}, "Invalid review split")
+    by_pair = index_records(labels, "pair_id")
+    selected = []
+    complete = True
+    development_groups, holdout_groups = set(), set()
+    for row in evidence:
+        group_target = development_groups if row["split"] == "development" else holdout_groups
+        group_target.add(row["pair_group_id"])
+        if row["split"] != split:
+            continue
+        review = by_pair.get(row["pair_id"])
+        if review is None or review.get("split") != split:
+            complete = False
+            continue
+        streams = set(decomposed_stream_names(contract, row["objective"])) - {"identity"}
+        if (review.get("identity") not in IDENTITY_LABELS
+                or review.get("final_label") not in BASKET_LABELS
+                or not isinstance(review.get("mechanisms"), dict)
+                or set(review["mechanisms"]) != streams
+                or any(review["mechanisms"][stream] not in contract["objectives"][row["objective"]][stream]["criteria"]
+                       for stream in streams)):
+            complete = False
+            continue
+        selected.append((row, review))
+    require(not development_groups & holdout_groups, "Review groups cross development and holdout")
+    return selected, complete and len(selected) == sum(row["split"] == split for row in evidence)
+
+
+def curve_points(examples: list[tuple[dict, str]]) -> list[dict]:
+    points = []
+    total = len(examples)
+    for minimum_probability in POLICY_THRESHOLD_GRID:
+        for minimum_margin in POLICY_THRESHOLD_GRID:
+            accepted = [
+                (answer, expected) for answer, expected in examples
+                if probability_margin(answer)[0] >= minimum_probability - 1e-12
+                and probability_margin(answer)[1] >= minimum_margin - 1e-12
+            ]
+            correct = sum(answer["label"] == expected for answer, expected in accepted)
+            points.append({
+                "min_probability": minimum_probability,
+                "min_margin": minimum_margin,
+                "accepted": len(accepted),
+                "correct": correct,
+                "incorrect": len(accepted) - correct,
+                "precision": correct / len(accepted) if accepted else None,
+                "coverage": len(accepted) / total if total else None,
+                "abstentions": total - len(accepted),
+            })
+    return points
+
+
+def build_probability_curves(classifications: dict, labels: list[dict], evidence: list[dict],
+                             contract: dict) -> dict:
+    reviewed, complete = completed_review_rows(labels, evidence, contract, "development")
+    require(complete, "Probability curves require complete development review")
+    identity_examples = []
+    for evidence_row, review in reviewed:
+        classification = classifications.get(evidence_row["pair_id"])
+        require(classification is not None and classification["objective"] == evidence_row["objective"],
+                "Development review/classification mismatch")
+        answer = classification["streams"]["identity"]
+        require(answer["status"] == "ok", "Probability curves require complete development inference")
+        identity_examples.append((answer, review["identity"]))
+    streams = {
+        "identity": {
+            "objective": "all", "stream": "identity", "reviewed_pairs": len(identity_examples),
+            "points": curve_points(identity_examples),
+        },
+    }
+    for objective in contract["objectives"]:
+        objective_rows = [(row, review) for row, review in reviewed if row["objective"] == objective]
+        for stream in decomposed_stream_names(contract, objective)[1:]:
+            examples = []
+            for evidence_row, review in objective_rows:
+                classification = classifications.get(evidence_row["pair_id"])
+                require(classification is not None and classification["objective"] == objective,
+                        "Development review/classification mismatch")
+                answer = classification["streams"][stream]
+                require(answer["status"] == "ok", "Probability curves require complete development inference")
+                expected = review["identity"] if stream == "identity" else review["mechanisms"][stream]
+                examples.append((answer, expected))
+            streams[f"{objective}/{stream}"] = {
+                "objective": objective, "stream": stream, "reviewed_pairs": len(examples),
+                "points": curve_points(examples),
+            }
+    return {
+        "schema_version": "decomposed-probability-curves-v1",
+        "selection_split": "development",
+        "threshold_grid": list(POLICY_THRESHOLD_GRID),
+        "reviewed_pairs": len(reviewed),
+        "streams": streams,
+        "auto_selected_policy": None,
+    }
+
+
+def validate_policy_selection(selection: object, contract: dict) -> dict:
+    require(isinstance(selection, dict) and set(selection) == {
+        "schema_version", "chosen_by", "chosen_at", "rules",
+    }, "Invalid probability-policy selection")
+    require(selection["schema_version"] == DECOMPOSED_POLICY_SELECTION_V1,
+            "Unsupported probability-policy selection")
+    require(selection["chosen_by"] == "Boris", "Probability policy must be chosen by Boris")
+    require(isinstance(selection["chosen_at"], str) and bool(selection["chosen_at"]),
+            "Probability policy requires chosen_at")
+    try:
+        chosen_at = datetime.fromisoformat(selection["chosen_at"].replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("Invalid probability-policy chosen_at") from None
+    require(chosen_at.tzinfo is not None, "Probability-policy chosen_at must include a timezone")
+    return {
+        "schema_version": DECOMPOSED_POLICY_SELECTION_V1,
+        "chosen_by": "Boris",
+        "chosen_at": selection["chosen_at"],
+        "rules": validate_probability_rules(selection["rules"], contract),
+    }
+
+
+def policy_identity(output_dir: Path, experiment: dict, review_manifest: dict,
+                    curves_bytes: bytes, selection: dict) -> dict:
+    return {
+        "schema_version": DECOMPOSED_POLICY_V1,
+        "chosen_by": selection["chosen_by"],
+        "chosen_at": selection["chosen_at"],
+        "selection_source": "development-only",
+        "selection_sha256": sha256(canonical_json(selection)),
+        "rules": selection["rules"],
+        "manifest_sha256": experiment["manifest_sha256"],
+        "experiment_sha256": sha256((output_dir / "experiment.json").read_bytes()),
+        "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes()),
+        "adjudication_artifact_id": review_manifest["artifact_id"],
+        "adjudication_manifest_sha256": review_manifest["artifact_manifest_sha256"],
+        "review_revision": review_manifest["revision"],
+        "review_labels_sha256": review_manifest["labels_sha256"],
+        "review_evidence_sha256": review_manifest["evidence_sha256"],
+        "probability_curves_sha256": sha256(curves_bytes),
+        "resolver_versions": experiment["resolver_versions"],
+    }
+
+
+def publish_probability_policy(output_dir: Path, selection: dict, experiment: dict,
+                               review_manifest: dict, curves_bytes: bytes) -> dict:
+    normalized = validate_policy_selection(selection, experiment["decomposed_contract"])
+    identity = policy_identity(output_dir, experiment, review_manifest, curves_bytes, normalized)
+    policy = {
+        **identity,
+        "policy_id": f"{DECOMPOSED_POLICY_V1}-{sha256(canonical_json(identity))[:12]}",
+    }
+    content = (json.dumps(policy, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+    immutable_bytes(output_dir / "probability-policy.json", content)
+    return policy
+
+
+def load_probability_policy(output_dir: Path, experiment: dict, review_manifest: dict,
+                            curves_bytes: bytes) -> dict | None:
+    path = output_dir / "probability-policy.json"
+    if not path.exists():
+        return None
+    policy = strict_json(path.read_text(encoding="utf-8"))
+    require(isinstance(policy, dict) and policy.get("schema_version") == DECOMPOSED_POLICY_V1,
+            "Invalid saved probability policy")
+    selection = validate_policy_selection({
+        "schema_version": DECOMPOSED_POLICY_SELECTION_V1,
+        "chosen_by": policy.get("chosen_by"), "chosen_at": policy.get("chosen_at"),
+        "rules": policy.get("rules"),
+    }, experiment["decomposed_contract"])
+    identity = policy_identity(output_dir, experiment, review_manifest, curves_bytes, selection)
+    expected = {**identity, "policy_id": f"{DECOMPOSED_POLICY_V1}-{sha256(canonical_json(identity))[:12]}"}
+    require(policy == expected, "Saved probability policy no longer matches its evidence")
+    return policy
+
+
+def metric_block(rows: list[tuple[dict, dict]], allocated_cost: float | None = None) -> dict:
+    expected = len(rows)
+    complete_rows = [(review, classification) for review, classification in rows
+                     if review.get("final_label") in BASKET_LABELS and classification.get("resolution") is not None]
+    if len(complete_rows) != expected:
+        return {"status": "incomplete", "expected": expected, "complete": len(complete_rows)}
+    accepted = [(review, classification) for review, classification in complete_rows
+                if classification["resolution"]["basket_label"] in {"positive", "hard_negative"}]
+    correct = sum(review["final_label"] == classification["resolution"]["basket_label"]
+                  for review, classification in accepted)
+    hard_negative = [(review, classification) for review, classification in accepted
+                     if classification["resolution"]["basket_label"] == "hard_negative"]
+    labels = (*BASKET_LABELS, "unavailable")
+    calibration = []
+    for lower in (0.0, 0.2, 0.4, 0.6, 0.8):
+        upper = lower + 0.2
+        bucket = [(review, classification) for review, classification in accepted
+                  if classification["resolution"]["decision_probability"] is not None
+                  and lower <= classification["resolution"]["decision_probability"]
+                  and (classification["resolution"]["decision_probability"] < upper or upper >= 1)]
+        calibration.append({
+            "lower": lower, "upper": min(upper, 1.0), "count": len(bucket),
+            "mean_probability": statistics.fmean(
+                classification["resolution"]["decision_probability"] for _, classification in bucket
+            ) if bucket else None,
+            "accuracy": sum(review["final_label"] == classification["resolution"]["basket_label"]
+                            for review, classification in bucket) / len(bucket) if bucket else None,
+        })
+    result = {
+        "status": "complete", "reviewed": expected, "accepted": len(accepted),
+        "accepted_correct": correct, "precision": correct / len(accepted) if accepted else None,
+        "hard_negative_precision": (
+            sum(review["final_label"] == "hard_negative" for review, _ in hard_negative) / len(hard_negative)
+            if hard_negative else None
+        ),
+        "coverage": len(accepted) / expected if expected else None,
+        "abstentions": sum(classification["resolution"]["resolution_status"] == "abstained"
+                           for _, classification in complete_rows),
+        "conflicts": sum(classification["resolution"]["conflict"] for _, classification in complete_rows),
+        "identity_filtered": sum(classification["resolution"]["identity_action"] == "filter"
+                                 for _, classification in complete_rows),
+        "confusion_human_rows_jev_columns": {
+            human: {predicted: sum(review["final_label"] == human
+                                   and classification["resolution"]["basket_label"] == predicted
+                                   for review, classification in complete_rows)
+                    for predicted in labels}
+            for human in BASKET_LABELS
+        },
+        "calibration": calibration,
+    }
+    result["allocated_inference_cost_usd"] = allocated_cost
+    result["cost_per_accepted_correct_label_usd"] = (
+        allocated_cost / correct if allocated_cost is not None and correct else None
+    )
+    return result
+
+
+def evaluate_human_metrics(classifications: dict, labels: list[dict], evidence: list[dict],
+                           contract: dict, split: str, allocated_cost: float | None = None) -> dict:
+    reviewed, complete = completed_review_rows(labels, evidence, contract, split)
+    indexed = [(review, classifications.get(row["pair_id"], {})) for row, review in reviewed]
+    if not complete:
+        return {"status": "incomplete", "expected": sum(row["split"] == split for row in evidence),
+                "complete": len(reviewed)}
+    result = metric_block(indexed, allocated_cost)
+    result["slices"] = {
+        "objective": {
+            objective: metric_block([(review, classification) for review, classification in indexed
+                                     if classification["objective"] == objective])
+            for objective in contract["objectives"]
+        },
+        "shop": {
+            shop: metric_block([(review, classification) for review, classification in indexed
+                                if classification["shop"] == shop])
+            for shop in sorted({classification["shop"] for _, classification in indexed})
+        },
+        "direction": {
+            direction: metric_block([(review, classification) for review, classification in indexed
+                                     if classification["direction"] == direction])
+            for direction in ("forward", "reverse")
+        },
+    }
+    return result
+
+
+def write_decomposed_reports(manifest_path: Path, output_dir: Path, *,
+                             adjudication_dir: Path | None = None, review_revision: int | None = None,
+                             policy_selection: dict | None = None) -> dict:
+    raw_manifest = manifest_path.read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V3, "Expected decomposed report manifest")
+    experiment, baseline = validate_v3_experiment_log(output_dir)
+    records, truncated = read_request_log(output_dir / "requests.jsonl")
+    classifications = decomposed_classifications(manifest, records)
+    contract = experiment["decomposed_contract"]
+    saved_review = load_saved_review(output_dir, experiment)
+    external_review = None
+    if review_revision is not None:
+        require(adjudication_dir is not None, "Review revision requires an adjudication directory")
+        external_review = load_experiment_review_revision(adjudication_dir, review_revision, experiment)
+    review = external_review or saved_review
+    require(policy_selection is None or review is not None,
+            "Probability-policy selection requires a saved review revision")
+    policy_path, curves_path = output_dir / "probability-policy.json", output_dir / "probability-curves.json"
+    curves, curves_bytes, policy = None, None, None
+    if policy_path.exists():
+        require(review is not None and curves_path.is_file(),
+                "Saved probability policy requires its review and curve snapshots")
+        labels, evidence, review_manifest = review
+        curves_bytes = curves_path.read_bytes()
+        curves = strict_json(curves_bytes.decode("utf-8"))
+        if policy_selection is not None:
+            publish_probability_policy(output_dir, policy_selection, experiment, review_manifest, curves_bytes)
+        policy = load_probability_policy(output_dir, experiment, review_manifest, curves_bytes)
+        if saved_review is None:
+            require(external_review is not None and policy_selection is not None,
+                    "Recovering a policy review snapshot requires the original selection input")
+            snapshot_review(output_dir, labels, evidence, review_manifest)
+            saved_review = load_saved_review(output_dir, experiment)
+            labels, evidence, review_manifest = saved_review
+            review = saved_review
+    elif review is not None:
+        labels, evidence, review_manifest = review
+        curve_context = {
+            "review_revision": review_manifest["revision"],
+            "review_labels_sha256": review_manifest["labels_sha256"],
+            "review_evidence_sha256": review_manifest["evidence_sha256"],
+            "manifest_sha256": experiment["manifest_sha256"],
+            "experiment_sha256": sha256((output_dir / "experiment.json").read_bytes()),
+            "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes()),
+        }
+        if curves_path.exists():
+            curves_bytes = curves_path.read_bytes()
+            curves = strict_json(curves_bytes.decode("utf-8"))
+            require(all(curves.get(key) == value for key, value in curve_context.items()),
+                    "Saved probability curves no longer match their evidence")
+        else:
+            curves = build_probability_curves(classifications, labels, evidence, contract)
+            curves.update(curve_context)
+            curves_bytes = (json.dumps(curves, indent=2, sort_keys=True, ensure_ascii=False,
+                                       allow_nan=False) + "\n").encode()
+            immutable_bytes(curves_path, curves_bytes)
+        if policy_selection is not None:
+            policy = publish_probability_policy(
+                output_dir, policy_selection, experiment, review_manifest, curves_bytes,
+            )
+            snapshot_review(output_dir, labels, evidence, review_manifest)
+            saved_review = load_saved_review(output_dir, experiment)
+            labels, evidence, review_manifest = saved_review
+            review = saved_review
+    else:
+        labels, evidence, review_manifest, policy = None, None, None, None
+    if policy is not None:
+        for classification in classifications.values():
+            if classification["status"] != "ok":
+                continue
+            answers = {stream: row for stream, row in classification["streams"].items()}
+            objective = classification["objective"]
+            classification["resolution"] = resolve_decomposed_judgment(
+                objective, answers, policy["rules"], experiment["resolver_versions"][objective], contract,
+            )
+
+    starts = {(record["shop"], record["stream"]): record for record in records
+              if record["record_type"] == "group_start"}
+    ends = {(record["shop"], record["stream"]): record for record in records
+            if record["record_type"] == "group_end"}
+    batches = {(record["shop"], record["stream"], record["batch_id"]): record for record in records
+               if record["record_type"] == "batch"}
+    groups = {}
+    for shop, data in manifest["shops"].items():
+        for stream in decomposed_stream_names(contract, data["objective"]):
+            rows = [batches[shop, stream, batch["batch_id"]] for batch in data["batches"]]
+            groups[f"jev/{shop}/{stream}"] = summarize_group(
+                "jev", rows, data["batches"], ends.get((shop, stream)) if (shop, stream) in starts else None,
+                manifest["concurrency"], experiment["pricing"], MANIFEST_V3,
+            )
+    costs = [group["cost_estimate"]["total_usd"] for group in groups.values()]
+    total_cost = math.fsum(costs) if all(cost is not None for cost in costs) else None
+    gpt = {}
+    for answer in baseline["classifications"]:
+        gpt[answer["pair_id"]] = {
+            **answer, "resolution": resolve_basket_judgment(answer, manifest["contract"]["resolver_version"]),
+        }
+    visible_reviews = ([row for row in labels if policy is not None or row["split"] == "development"]
+                       if labels is not None else [])
+    review_by_pair = index_records(visible_reviews, "pair_id")
+    paired = []
+    for pair_id, classification in classifications.items():
+        baseline_row = gpt[pair_id]
+        data = manifest["shops"][classification["shop"]]
+        anchor = data["products"][classification["anchor_id"]]
+        candidate = data["products"][classification["candidate_id"]]
+        resolution = classification["resolution"]
+        review_row = review_by_pair.get(pair_id)
+        row = {
+            "pair_id": pair_id, "shop": classification["shop"], "objective": classification["objective"],
+            "direction": classification["direction"], "anchor_id": classification["anchor_id"],
+            "candidate_id": classification["candidate_id"], "anchor_name": anchor["name"],
+            "anchor_category": anchor["category"], "anchor_description": anchor["description"],
+            "candidate_name": candidate["name"], "candidate_category": candidate["category"],
+            "candidate_description": candidate["description"], "jev_status": classification["status"],
+            "gpt_basket_label": baseline_row["resolution"]["basket_label"],
+            "jev_basket_label": resolution["basket_label"] if resolution else None,
+            "jev_resolution_status": resolution["resolution_status"] if resolution else None,
+            "jev_conflict": resolution["conflict"] if resolution else None,
+            "gpt_agreement": (baseline_row["resolution"]["basket_label"] == resolution["basket_label"]
+                              if resolution else None),
+            "review_split": review_row["split"] if review_row else None,
+            "human_final_label": review_row["final_label"] if review_row else None,
+            "human_agreement": (review_row["final_label"] == resolution["basket_label"]
+                                if review_row and resolution else None),
+        }
+        for stream, answer in classification["streams"].items():
+            flatten_relation_judgment(row, "jev", stream, answer if answer["status"] == "ok" else None)
+            decision = resolution["decisions"][stream] if resolution else None
+            row[f"jev_{stream}_policy_status"] = decision["status"] if decision else None
+            row[f"jev_{stream}_policy_margin"] = decision["margin"] if decision else None
+        paired.append(row)
+    agreement = {}
+    if policy is not None:
+        for shop in manifest["shops"]:
+            eligible = [row for row in paired if row["shop"] == shop and row["jev_basket_label"] is not None]
+            agreement[shop] = relation_agreement(
+                eligible, "gpt_basket_label", "jev_basket_label", BASKET_LABELS,
+            )
+    human_metrics = {"status": "unavailable"}
+    if review is not None and policy is None:
+        human_metrics = {"status": "awaiting_policy", "development_review_complete": True,
+                         "holdout_not_used_for_selection": True, "holdout_status": "sealed"}
+    elif review is not None:
+        development_count = sum(row["split"] == "development" for row in evidence)
+        holdout_count = sum(row["split"] == "holdout" for row in evidence)
+        development_cost = total_cost * development_count / len(classifications) if total_cost is not None else None
+        holdout_cost = total_cost * holdout_count / len(classifications) if total_cost is not None else None
+        development_metrics = evaluate_human_metrics(
+            classifications, labels, evidence, contract, "development", development_cost,
+        )
+        holdout_metrics = evaluate_human_metrics(
+            classifications, labels, evidence, contract, "holdout", holdout_cost,
+        )
+        human_metrics = {
+            "status": ("complete" if development_metrics["status"] == holdout_metrics["status"] == "complete"
+                       else "incomplete"),
+            "holdout_not_used_for_selection": True,
+            "development": development_metrics,
+            "holdout": holdout_metrics,
+        }
+    summary = {
+        "schema_version": DECOMPOSED_REPORT_V1, "manifest_sha256": sha256(raw_manifest),
+        "extraction": {
+            "version": experiment["decomposed_extraction_version"],
+            "probability_sum_tolerance": DECOMPOSED_PROBABILITY_SUM_TOLERANCE_V1,
+            "choice_max_tolerance": DECOMPOSED_CHOICE_MAX_TOLERANCE_V1,
+            "request_log_sha256": sha256((output_dir / "requests.jsonl").read_bytes()),
+        },
+        "models": manifest["models"], "pricing": experiment["pricing"], "run_settings": records[0],
+        "truncated_final_line": truncated, "limitations": [
+            *manifest["limitations"],
+            "Probability curves use development review only; the sealed holdout never selects thresholds.",
+            "Review-split cost metrics allocate whole-run cost pro rata by pair count.",
+            "GPT agreement is a secondary comparison and is not ground truth.",
+        ],
+        "experiment": experiment,
+        "gpt_baseline": {
+            "fingerprint": baseline["fingerprint"], "cached": True,
+            "classifications": len(baseline["classifications"]), "accounting": baseline["accounting"],
+            "pricing": baseline["pricing"],
+            "note": "Historical measurements, not inference performed during this Jev experiment.",
+        },
+        "groups": groups,
+        "raw_stream_outputs": {
+            objective: {
+                stream: dict(sorted(Counter(
+                    classification["streams"][stream]["label"]
+                    for classification in classifications.values()
+                    if classification["objective"] == objective
+                    and classification["streams"][stream]["status"] == "ok"
+                ).items()))
+                for stream in decomposed_stream_names(contract, objective)
+            }
+            for objective in contract["objectives"]
+        },
+        "probability_curves": ({"status": "available", "sha256": sha256(curves_bytes),
+                                "selection_split": "development"} if curves_bytes else {"status": "unavailable"}),
+        "policy": ({"status": "selected", "policy": policy} if policy else {
+            "status": "not_selected", "auto_selection": False,
+        }),
+        "human_metrics": human_metrics, "agreement": agreement,
+        "run_complete": not truncated and records[-1]["record_type"] == "run_end"
+                        and all(group["complete"] for group in groups.values()),
+        "all_pairs_classified": all(row["status"] == "ok" for row in classifications.values()),
+        "new_inference": {
+            "gpt_http_attempts": 0, "gpt_cost_usd": 0.0,
+            "jev_http_attempts": sum(group["http_attempts"] for group in groups.values()),
+            "jev_cost_estimate_usd": total_cost,
+        },
+    }
+    (output_dir / "gpt_classifications.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in gpt.values()),
+        encoding="utf-8",
+    )
+    (output_dir / "jev_stream_classifications.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+                for row in classifications.values()), encoding="utf-8",
+    )
+    columns = list(dict.fromkeys(key for row in paired for key in row))
+    write_csv(output_dir / "paired_results.csv", paired, columns)
+    write_csv(output_dir / "disagreements.csv", [
+        row for row in paired if row["human_agreement"] is False or row["gpt_agreement"] is False
+    ], columns)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return summary
+
+
+def write_reports(manifest_path: Path, output_dir: Path, **kwargs) -> dict:
+    manifest = strict_json(manifest_path.read_text(encoding="utf-8"))
+    schema = manifest_schema(manifest)
+    if schema == MANIFEST_V1:
+        return write_legacy_reports(manifest_path, output_dir)
+    if schema == MANIFEST_V2:
+        return write_relation_reports(manifest_path, output_dir)
+    return write_decomposed_reports(manifest_path, output_dir, **kwargs)
+
+
+def load_operator_environment(data_dir: Path) -> None:
+    candidates = (Path.cwd() / ".env", data_dir.resolve().parent / ".env")
+    for path in dict.fromkeys(candidates):
+        load_dotenv(dotenv_path=path, override=False)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--manifest", type=Path, help="Frozen workload path; defaults to results/manifest.json or the experiment snapshot")
+    parser.add_argument("--manifest", type=Path,
+                        help="Frozen workload path; defaults to results/relation-manifest.json outside report-only mode")
     parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--jev-arm", choices=("combined", "decomposed"), default="combined",
+                        help="Jev request topology; combined remains the historical default")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true", help="Make paid API requests (Boris runs this explicitly)")
     mode.add_argument("--report-only", action="store_true", help="Rebuild reports from the saved manifest and request log, offline")
@@ -1202,59 +3736,110 @@ def main() -> None:
     parser.add_argument("--prepare-baseline", action="store_true", help="Import/prepare the GPT baseline; add --execute for paid completion")
     parser.add_argument("--import-run", type=Path, help="Existing comparison run directory to seed the GPT baseline")
     parser.add_argument("--baseline-root", type=Path, default=Path("results/baselines"))
+    parser.add_argument("--adjudication-dir", type=Path,
+                        default=Path("results/adjudication/jev-sbs-adjudication-v1"))
+    parser.add_argument("--review-revision", type=int,
+                        help="Completed append-only human-review revision used for decomposed offline reporting")
+    parser.add_argument("--policy-selection", type=Path,
+                        help="Boris-authored decomposed probability-policy selection JSON (report-only)")
     args = parser.parse_args()
     if args.import_run and not args.prepare_baseline:
         parser.error("--import-run requires --prepare-baseline")
     if args.prepare_baseline and args.report_only:
         parser.error("--prepare-baseline cannot be combined with --report-only")
+    if (args.review_revision is not None or args.policy_selection is not None) and not args.report_only:
+        parser.error("--review-revision and --policy-selection require --report-only")
+    if args.policy_selection is not None and args.review_revision is None:
+        parser.error("--policy-selection requires --review-revision")
+    if args.jev_arm == "decomposed" and args.prepare_baseline and (args.execute or args.import_run):
+        parser.error("The decomposed arm only reuses an already completed GPT baseline")
+    if args.execute:
+        load_operator_environment(args.data_dir)
     if args.report_only:
         directory = args.output_dir or Path("results/run")
         manifest_path = args.manifest or (directory / "manifest.json" if (directory / "experiment.json").exists()
                                           else Path("results/manifest.json"))
         try:
-            summary = write_reports(manifest_path, directory)
+            selection = (strict_json(args.policy_selection.read_text(encoding="utf-8"))
+                         if args.policy_selection is not None else None)
+            summary = write_reports(
+                manifest_path, directory, adjudication_dir=args.adjudication_dir,
+                review_revision=args.review_revision, policy_selection=selection,
+            )
         except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as error:
             parser.exit(1, f"Reporting failed: {error}\n")
         print(f"Reports rebuilt offline in {directory}; run_complete={summary['run_complete']}, "
               f"all_pairs_classified={summary['all_pairs_classified']}")
         return
     try:
-        manifest = build_manifest(args.data_dir, args.concurrency)
-        manifest_path = args.manifest or Path("results/manifest.json")
+        manifest = (build_decomposed_manifest(args.data_dir, args.concurrency)
+                    if args.jev_arm == "decomposed" else build_relation_manifest(args.data_dir, args.concurrency))
+        manifest_path = args.manifest or Path(
+            "results/decomposed-manifest.json" if args.jev_arm == "decomposed"
+            else "results/relation-manifest.json"
+        )
         digest = write_manifest(manifest_path, manifest)
         if args.prepare_baseline:
-            directory, baseline = prepare_gpt_baseline(
-                manifest, args.baseline_root, import_run=args.import_run, paid=args.execute)
+            if manifest_schema(manifest) == MANIFEST_V3:
+                baseline = load_completed_baseline(manifest, args.baseline_root)
+                directory = args.baseline_root / baseline["fingerprint"]
+            else:
+                directory, baseline = prepare_gpt_baseline(
+                    manifest, args.baseline_root, import_run=args.import_run, paid=args.execute)
             print(f"GPT baseline: {directory}")
-            print(f"Retained {len(baseline['classifications'])} labels; {len(baseline['missing_pair_ids'])} missing. "
+            result_name = "labels" if manifest_schema(manifest) == MANIFEST_V1 else "judgments"
+            print(f"Retained {len(baseline['classifications'])} {result_name}; "
+                  f"{len(baseline['missing_pair_ids'])} missing. "
                   f"Complete: {baseline['complete']}.")
             if not args.execute:
                 print("No API requests made. Add --execute only when ready to complete missing GPT answers.")
             elif not baseline["complete"]:
                 parser.exit(1, "GPT baseline remains incomplete after bounded attempts; saved progress is reusable.\n")
             return
-        prepare_requests(manifest)  # Validate payload rendering during offline preflight.
+        if manifest_schema(manifest) == MANIFEST_V3:
+            prepare_decomposed_requests(manifest)
+            artifact, _, _ = validate_adjudication_artifact(args.adjudication_dir)
+            require(artifact["source_manifest_sha256"] == sha256(canonical_json(manifest)),
+                    "Adjudication artifact does not match the decomposed manifest")
+        else:
+            prepare_requests(manifest)  # Validate payload rendering during offline preflight.
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(1, f"Preparation failed: {error}\n")
     print(f"Offline manifest: {manifest_path} (SHA256 {digest})")
     print(f"Models: {GPT_SETTINGS['model']} / jev-1.13.0; concurrency: {args.concurrency}")
     for shop, data in manifest["shops"].items():
+        stream_count = (len(decomposed_stream_names(manifest["decomposed_contract"], data["objective"]))
+                        if manifest_schema(manifest) == MANIFEST_V3 else 1)
         for direction in ("forward", "reverse"):
             batches = [batch for batch in data["batches"] if batch["direction"] == direction]
             sizes = [len(batch["candidates"]) for batch in batches]
-            print(f"{shop} {direction}: {sum(sizes)} rows, {len(batches)} Jev requests, batch sizes {sizes}")
+            print(f"{shop} {direction}: {sum(sizes)} rows, {len(batches) * stream_count} Jev requests "
+                  f"across {stream_count} stream(s), batch sizes {sizes}")
         print(f"  Source checks: {json.dumps(data['diagnostics'], sort_keys=True)}")
-    print(f"Jev prompt: {JEV_PROMPT_VERSION}. GPT labels must come from a completed saved baseline.")
+    if manifest_schema(manifest) == MANIFEST_V1:
+        print(f"Jev prompt: {JEV_PROMPT_VERSION}. GPT labels must come from a completed saved baseline.")
+    elif manifest_schema(manifest) == MANIFEST_V2:
+        print(f"Relation contract: {manifest['contract']['version']}. "
+              "GPT judgments must come from a completed saved baseline.")
+    else:
+        print(f"Decomposed contract: {manifest['decomposed_contract']['version']}; "
+              f"adjudication: {artifact['artifact_id']}. GPT judgments reuse the completed v2 baseline.")
     if not args.execute:
         print("No API requests made. Use --execute only when ready for the paid run.")
         return
     try:
-        directory, failures = run_jev_experiment(manifest, args.baseline_root, args.output_dir)
+        directory, failures = run_jev_experiment(
+            manifest, args.baseline_root, args.output_dir, adjudication_dir=args.adjudication_dir,
+        )
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(1, f"Execution failed: {error}\n")
     if failures:
         parser.exit(1, f"Run finished with {failures} incomplete batches; inspect requests.jsonl before any rerun.\n")
-    print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
+    if manifest_schema(manifest) in {MANIFEST_V1, MANIFEST_V2}:
+        print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
+    else:
+        print(f"All decomposed streams completed and raw reports written in {directory}. "
+              "Select a reviewed policy offline; no threshold was chosen automatically.")
 
 
 if __name__ == "__main__":
