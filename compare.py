@@ -54,6 +54,12 @@ MANIFEST_V1 = "jev-sbs-manifest-v1"
 MANIFEST_V2 = "jev-sbs-manifest-v2"
 MANIFEST_V3 = "jev-sbs-decomposed-manifest-v1"
 DECOMPOSED_CONTRACT_VERSION = "objective-mechanisms-v1"
+DECOMPOSED_COMPLEMENTS_RESOLVER_V1 = "decomposed-complements-v1"
+DECOMPOSED_STYLE_RESOLVER_V1 = "decomposed-style-compatibility-v1"
+DECOMPOSED_EXTRACTION_V1 = "decomposed-choice-extraction-v1"
+DECOMPOSED_EXTRACTION_VERSION = DECOMPOSED_EXTRACTION_V1
+DECOMPOSED_PROBABILITY_SUM_TOLERANCE_V1 = 0.015
+DECOMPOSED_CHOICE_MAX_TOLERANCE_V1 = 0.01
 ADJUDICATION_SCHEMA_VERSION = "jev-sbs-adjudication-v1"
 ADJUDICATION_SEED = "FERODEV-8283-adjudication-v1"
 GPT_INPUT_V1 = "gpt-input-v1"
@@ -62,6 +68,7 @@ GPT_BASELINE_V1 = "gpt-baseline-v1"
 GPT_BASELINE_V2 = "gpt-baseline-v2"
 JEV_EXPERIMENT_V1 = "jev-experiment-v1"
 JEV_EXPERIMENT_V2 = "jev-experiment-v2"
+JEV_EXPERIMENT_V3 = "jev-decomposed-experiment-v1"
 ENDPOINTS = {
     "gpt": "https://api.openai.com/v1/chat/completions",
     "jev": "https://api.typesafe.ai/v1/systemone",
@@ -629,6 +636,10 @@ def decomposed_contract_snapshot() -> dict:
             "batch_size": BATCH_SIZE,
             "direction_is_semantic": True,
         },
+        "resolver_versions": {
+            "complements": DECOMPOSED_COMPLEMENTS_RESOLVER_V1,
+            "style_compatibility": DECOMPOSED_STYLE_RESOLVER_V1,
+        },
     }
 
 
@@ -886,6 +897,17 @@ def prepare_decomposed_requests(manifest: dict) -> dict:
     }
 
 
+def decomposed_request_id(batch: dict, stream: str) -> str:
+    return f"{batch['batch_id']}/{stream}"
+
+
+def decomposed_payload_labels(payload: dict) -> tuple[str, ...]:
+    choices = [tuple(question["criteria"]) for question in payload["questions"].values()]
+    require(bool(choices) and all(labels == choices[0] for labels in choices),
+            "Inconsistent decomposed Choice labels")
+    return choices[0]
+
+
 def strict_json(text: str) -> object:
     def pairs(items):
         result = {}
@@ -962,7 +984,8 @@ def validate_relation_result(result: object, labels: tuple[str, ...]) -> dict:
     }
 
 
-def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
+def parse_jev_choice_with_tolerances(answer: object, labels: tuple[str, ...],
+                                     probability_sum_tolerance: float, choice_max_tolerance: float) -> dict:
     require(isinstance(answer, dict), "Invalid Choice answer")
     require(answer.get("type") == "choice" and answer.get("choice") in labels, "Invalid Choice answer")
     probabilities = answer.get("probabilities")
@@ -972,12 +995,12 @@ def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
     require(all(type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1 for value in values),
             "Invalid probability or confidence")
     probability_sum = sum(probabilities.values())
-    tolerance = max(PROBABILITY_SUM_TOLERANCE, 0.005 * len(labels))
+    tolerance = max(probability_sum_tolerance, 0.005 * len(labels))
     require(math.isclose(probability_sum, 1, rel_tol=0, abs_tol=tolerance + 1e-12),
             "Probabilities do not sum to one within rounding tolerance")
     choice_probability = probabilities[answer["choice"]]
     max_probability = max(probabilities.values())
-    require(choice_probability >= max_probability - CHOICE_MAX_TOLERANCE - 1e-12,
+    require(choice_probability >= max_probability - choice_max_tolerance - 1e-12,
             "Choice differs from maximum probability beyond rounding tolerance")
     return {
         "label": answer["choice"],
@@ -988,6 +1011,12 @@ def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
         "probability_rounding_warning": not math.isclose(probability_sum, 1, abs_tol=1e-6),
         "choice_probability_warning": choice_probability < max_probability - 1e-6,
     }
+
+
+def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
+    return parse_jev_choice_with_tolerances(
+        answer, labels, PROBABILITY_SUM_TOLERANCE, CHOICE_MAX_TOLERANCE,
+    )
 
 
 def parse_relation_answers(provider: str, body: dict, batch: dict) -> list:
@@ -1040,11 +1069,41 @@ def parse_relation_answers(provider: str, body: dict, batch: dict) -> list:
     ]
 
 
-def parse_provider_answers(schema: str, provider: str, body: dict, batch: dict) -> list:
+def parse_decomposed_answers_v1(body: dict, batch: dict, labels: tuple[str, ...]) -> list:
+    require(isinstance(body.get("model"), str) and bool(body["model"]), "Missing served model")
+    require(bool(labels), "Missing decomposed Choice labels")
+    answers = body["answers"]
+    expected = {f"candidate_{index}" for index in range(len(batch["candidates"]))}
+    require(set(answers) == expected, "Missing or unknown question answers")
+    return [
+        {
+            "pair_id": item["pair_id"],
+            "candidate_id": item["candidate_id"],
+            **parse_jev_choice_with_tolerances(
+                answers[f"candidate_{index}"], labels,
+                DECOMPOSED_PROBABILITY_SUM_TOLERANCE_V1,
+                DECOMPOSED_CHOICE_MAX_TOLERANCE_V1,
+            ),
+        }
+        for index, item in enumerate(batch["candidates"])
+    ]
+
+
+DECOMPOSED_EXTRACTORS = {DECOMPOSED_EXTRACTION_V1: parse_decomposed_answers_v1}
+
+
+def parse_provider_answers(schema: str, provider: str, body: dict, batch: dict,
+                           choice_labels: tuple[str, ...] | None = None,
+                           extraction_version: str | None = None) -> list:
     if schema == MANIFEST_V1:
         return parse_answers(provider, body, batch)
-    require(schema == MANIFEST_V2, "Unsupported manifest schema")
-    return parse_relation_answers(provider, body, batch)
+    if schema == MANIFEST_V2:
+        return parse_relation_answers(provider, body, batch)
+    require(schema == MANIFEST_V3 and provider == "jev" and choice_labels is not None,
+            "Unsupported manifest schema")
+    version = DECOMPOSED_EXTRACTION_VERSION if extraction_version is None else extraction_version
+    require(version in DECOMPOSED_EXTRACTORS, f"Unsupported decomposed extraction version: {version}")
+    return DECOMPOSED_EXTRACTORS[version](body, batch, choice_labels)
 
 
 def resolve_basket_judgment_v1(answer: dict) -> dict:
@@ -1139,8 +1198,14 @@ def retry_delay(header: str | None, attempt: int) -> float | None:
 
 
 def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, payload: dict, key: str,
-              *, initial_answers: list | None = None, on_attempt=None, schema_version: str = MANIFEST_V1) -> dict:
-    require(schema_version in {MANIFEST_V1, MANIFEST_V2}, "Unsupported manifest schema")
+              *, initial_answers: list | None = None, on_attempt=None, schema_version: str = MANIFEST_V1,
+              stream: str | None = None, request_id: str | None = None,
+              choice_labels: tuple[str, ...] | None = None,
+              extraction_version: str | None = None) -> dict:
+    require(schema_version in {MANIFEST_V1, MANIFEST_V2, MANIFEST_V3}, "Unsupported manifest schema")
+    require((schema_version == MANIFEST_V3) == (stream is not None and request_id is not None
+                                                and choice_labels is not None and extraction_version is not None),
+            "Decomposed execution metadata mismatch")
     started = time.perf_counter()
     record = {
         "record_type": "batch", "provider": provider, "shop": shop,
@@ -1149,6 +1214,8 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
         "requested_model": payload["model"], "served_model": None, "request": payload,
         "status": "error", "error": None, "answers": [], "raw_response": None, "attempts": [],
     }
+    if stream is not None:
+        record.update(stream=stream, request_id=request_id, extraction_version=extraction_version)
     collected = index_records(initial_answers or [], "pair_id")
     require(set(collected) <= set(record["pair_ids"]), "Unexpected initial answers")
     if len(collected) == record["batch_size"]:
@@ -1184,7 +1251,9 @@ def run_batch(client: httpx.Client, provider: str, shop: str, batch: dict, paylo
                 attempt["raw_usage"] = body.get("usage")
                 attempt["usage"] = normalize_usage(provider, attempt["raw_usage"])
                 if status == 200:
-                    attempt["answers"] = parse_provider_answers(schema_version, provider, body, batch)
+                    attempt["answers"] = parse_provider_answers(
+                        schema_version, provider, body, batch, choice_labels, extraction_version,
+                    )
                     _, attempt["error"] = extraction_status(attempt["answers"], record["batch_size"])
                     for answer in attempt["answers"]:
                         collected.setdefault(answer["pair_id"], answer)
@@ -1237,8 +1306,12 @@ def execute(manifest: dict, jobs: dict, output_dir: Path, manifest_digest: str, 
               "concurrency": manifest["concurrency"], "timeout_seconds": TIMEOUT_SECONDS,
               "max_retries": MAX_RETRIES, "max_retry_delay_seconds": MAX_RETRY_DELAY, **(run_metadata or {})})
         for provider, shops in jobs.items():
-            for shop, work in shops.items():
-                emit({"record_type": "group_start", "provider": provider, "shop": shop,
+            for group, work in shops.items():
+                shop, stream = group if isinstance(group, tuple) else (group, None)
+                group_record = {"provider": provider, "shop": shop}
+                if stream is not None:
+                    group_record["stream"] = stream
+                emit({"record_type": "group_start", **group_record,
                       "requested_model": manifest["models"][provider]["model"], "batches": len(work)})
                 started = time.perf_counter()
                 with httpx.Client(timeout=TIMEOUT_SECONDS, follow_redirects=False, transport=transport) as client:
@@ -1246,12 +1319,16 @@ def execute(manifest: dict, jobs: dict, output_dir: Path, manifest_digest: str, 
                         futures = [pool.submit(
                             run_batch, client, provider, shop, batch, payload, credentials[provider],
                             schema_version=manifest_schema(manifest),
+                            stream=stream,
+                            request_id=decomposed_request_id(batch, stream) if stream is not None else None,
+                            choice_labels=decomposed_payload_labels(payload) if stream is not None else None,
+                            extraction_version=DECOMPOSED_EXTRACTION_VERSION if stream is not None else None,
                         ) for batch, payload in work]
                         for future in as_completed(futures):
                             record = future.result()
                             emit(record)
                             failures += record["status"] != "ok"
-                emit({"record_type": "group_end", "provider": provider, "shop": shop,
+                emit({"record_type": "group_end", **group_record,
                       "wall_seconds": time.perf_counter() - started})
         emit({"record_type": "run_end", "failed_batches": failures})
     return failures
@@ -1296,7 +1373,11 @@ def reextract_record(record: dict, batch: dict, schema_version: str = MANIFEST_V
         return record
     try:
         normalize_usage(record["provider"], record["raw_response"].get("usage"))
-        answers = parse_provider_answers(schema_version, record["provider"], record["raw_response"], batch)
+        choice_labels = decomposed_payload_labels(record["request"]) if schema_version == MANIFEST_V3 else None
+        answers = parse_provider_answers(
+            schema_version, record["provider"], record["raw_response"], batch, choice_labels,
+            record.get("extraction_version"),
+        )
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         return record
     result = copy.deepcopy(record)
@@ -1933,28 +2014,66 @@ def prepare_gpt_baseline(manifest: dict, root: Path, *, import_run: Path | None 
 
 def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | None = None,
                        *, experiments_root: Path = Path("results/experiments"),
+                       adjudication_dir: Path = Path("results/adjudication/jev-sbs-adjudication-v1"),
                        transport: httpx.BaseTransport | None = None) -> tuple[Path, int]:
     baseline = load_completed_baseline(manifest, baseline_root)
     key = os.environ.get("TYPESAFE_API_KEY")
     require(bool(key), "Missing credential: TYPESAFE_API_KEY; no requests started")
     schema = manifest_schema(manifest)
-    jobs = {"jev": {shop: [(batch, render_provider_request(
-        schema, "jev", manifest["models"]["jev"], data, batch, manifest.get("contract")
-    ))
-                           for batch in data["batches"]] for shop, data in manifest["shops"].items()}}
+    adjudication = None
+    if schema == MANIFEST_V3:
+        prepared = prepare_decomposed_requests(manifest)["jev"]
+        jobs = {"jev": {
+            (shop, stream): work
+            for shop, streams in prepared.items()
+            for stream, work in streams.items()
+        }}
+        artifact, _, artifact_manifest_digest = validate_adjudication_artifact(adjudication_dir)
+        require(artifact["source_manifest_sha256"] == sha256(canonical_json(manifest)),
+                "Adjudication artifact does not match the decomposed manifest")
+        adjudication_bytes = (adjudication_dir / "manifest.json").read_bytes()
+        require(sha256(adjudication_bytes) == artifact_manifest_digest, "Adjudication snapshot digest mismatch")
+        adjudication = {
+            "artifact_id": artifact["artifact_id"],
+            "manifest_sha256": artifact_manifest_digest,
+            "evidence_sha256": artifact["evidence_sha256"],
+            "contract_sha256": artifact["contract_sha256"],
+            "selection_sha256": artifact["selection_sha256"],
+            "group_assignments_sha256": artifact["group_assignments_sha256"],
+            "labels_template_sha256": artifact["labels_template_sha256"],
+        }
+    else:
+        jobs = {"jev": {shop: [(batch, render_provider_request(
+            schema, "jev", manifest["models"]["jev"], data, batch, manifest.get("contract")
+        )) for batch in data["batches"]] for shop, data in manifest["shops"].items()}}
     identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:12]
     directory = output_dir if output_dir is not None else experiments_root / identifier
     directory.mkdir(parents=True, exist_ok=False)
     manifest_digest = write_manifest(directory / "manifest.json", manifest)
     baseline_bytes = canonical_json(baseline)
     immutable_bytes(directory / "baseline.json", baseline_bytes)
+    if adjudication is not None:
+        immutable_bytes(directory / "adjudication.json", adjudication_bytes)
+    experiment_schema = {
+        MANIFEST_V1: JEV_EXPERIMENT_V1,
+        MANIFEST_V2: JEV_EXPERIMENT_V2,
+        MANIFEST_V3: JEV_EXPERIMENT_V3,
+    }[schema]
+    if schema == MANIFEST_V3:
+        request_hashes = {
+            decomposed_request_id(batch, stream): sha256(canonical_json(payload))
+            for (_, stream), work in jobs["jev"].items()
+            for batch, payload in work
+        }
+    else:
+        request_hashes = {batch["batch_id"]: sha256(canonical_json(payload))
+                          for work in jobs["jev"].values() for batch, payload in work}
     experiment = {
-        "schema_version": JEV_EXPERIMENT_V1 if schema == MANIFEST_V1 else JEV_EXPERIMENT_V2,
+        "schema_version": experiment_schema,
         "id": directory.name,
         "manifest_sha256": manifest_digest, "baseline_fingerprint": baseline["fingerprint"],
         "baseline_sha256": sha256(baseline_bytes), "pricing": PRICING,
-        "jev_request_hashes": {batch["batch_id"]: sha256(canonical_json(payload))
-                                for work in jobs["jev"].values() for batch, payload in work},
+        "jev_request_hashes": request_hashes,
     }
     if schema == MANIFEST_V1:
         experiment.update(
@@ -1962,7 +2081,7 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
             jev_criteria=JEV_CRITERIA,
             jev_instructions=JEV_INSTRUCTIONS,
         )
-    else:
+    elif schema == MANIFEST_V2:
         contract = manifest["contract"]
         experiment.update(
             manifest_schema_version=MANIFEST_V2,
@@ -1973,6 +2092,25 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
             jev_relation_criteria=contract["relation_criteria"],
             jev_relation_instructions=contract["relation_instructions"],
         )
+    else:
+        contract = manifest["decomposed_contract"]
+        experiment.update(
+            manifest_schema_version=MANIFEST_V3,
+            relation_contract_version=manifest["contract"]["version"],
+            decomposed_contract_version=contract["version"],
+            decomposed_contract_sha256=sha256(canonical_json(contract)),
+            decomposed_contract=contract,
+            decomposed_extraction_version=DECOMPOSED_EXTRACTION_VERSION,
+            resolver_versions=contract["resolver_versions"],
+            adjudication=adjudication,
+            script_sha256=sha256(Path(__file__).read_bytes()),
+            execution_policy={
+                "concurrency": manifest["concurrency"],
+                "timeout_seconds": TIMEOUT_SECONDS,
+                "max_retries": MAX_RETRIES,
+                "max_retry_delay_seconds": MAX_RETRY_DELAY,
+            },
+        )
     experiment_bytes = canonical_json(experiment)
     immutable_bytes(directory / "experiment.json", experiment_bytes)
     print(f"Jev experiment: {directory}; reusing {len(baseline['classifications'])} GPT labels. "
@@ -1980,10 +2118,10 @@ def run_jev_experiment(manifest: dict, baseline_root: Path, output_dir: Path | N
     failures = execute(manifest, jobs, directory, manifest_digest, {"jev": key}, transport=transport,
                        run_metadata={"experiment_sha256": sha256(experiment_bytes),
                                      "baseline_fingerprint": baseline["fingerprint"]})
-    if schema == MANIFEST_V1:
+    if schema in {MANIFEST_V1, MANIFEST_V2}:
         write_reports(directory / "manifest.json", directory)
     else:
-        write_reports(directory / "manifest.json", directory)
+        validate_v3_experiment_log(directory)
     return directory, failures
 
 
@@ -1994,7 +2132,11 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
     experiment = strict_json(raw_experiment.decode("utf-8"))
     baseline = strict_json(raw_baseline.decode("utf-8"))
     schema = manifest_schema(manifest)
-    expected_experiment_schema = JEV_EXPERIMENT_V1 if schema == MANIFEST_V1 else JEV_EXPERIMENT_V2
+    expected_experiment_schema = {
+        MANIFEST_V1: JEV_EXPERIMENT_V1,
+        MANIFEST_V2: JEV_EXPERIMENT_V2,
+        MANIFEST_V3: JEV_EXPERIMENT_V3,
+    }[schema]
     expected_baseline_schema = GPT_BASELINE_V1 if schema == MANIFEST_V1 else GPT_BASELINE_V2
     require(experiment["schema_version"] == expected_experiment_schema, "Experiment schema mismatch")
     require(experiment["manifest_sha256"] == sha256(raw_manifest), "Experiment manifest mismatch")
@@ -2028,6 +2170,41 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
                 "Experiment relation criteria mismatch")
         require(experiment.get("jev_relation_instructions") == contract["relation_instructions"],
                 "Experiment relation instructions mismatch")
+    elif schema == MANIFEST_V3:
+        contract = manifest["decomposed_contract"]
+        require(experiment.get("manifest_schema_version") == MANIFEST_V3, "Experiment manifest schema mismatch")
+        require(experiment.get("relation_contract_version") == manifest["contract"]["version"],
+                "Experiment GPT relation contract mismatch")
+        require(experiment.get("decomposed_contract_version") == contract["version"],
+                "Experiment decomposed contract mismatch")
+        require(experiment.get("decomposed_contract_sha256") == sha256(canonical_json(contract)),
+                "Experiment decomposed contract digest mismatch")
+        require(experiment.get("decomposed_contract") == contract, "Experiment decomposed contract snapshot mismatch")
+        require(experiment.get("decomposed_extraction_version") in DECOMPOSED_EXTRACTORS,
+                "Unsupported saved decomposed extraction version")
+        require(experiment.get("resolver_versions") == contract["resolver_versions"],
+                "Experiment decomposed resolver mismatch")
+        require(start.get("script_sha256") == experiment.get("script_sha256"),
+                "Experiment script snapshot mismatch")
+        require(experiment.get("execution_policy") == {
+            "concurrency": manifest["concurrency"],
+            "timeout_seconds": start.get("timeout_seconds"),
+            "max_retries": start.get("max_retries"),
+            "max_retry_delay_seconds": start.get("max_retry_delay_seconds"),
+        }, "Experiment execution policy mismatch")
+        raw_adjudication = (directory / "adjudication.json").read_bytes()
+        saved_adjudication = strict_json(raw_adjudication.decode("utf-8"))
+        adjudication = experiment.get("adjudication")
+        require(isinstance(adjudication, dict), "Missing experiment adjudication snapshot")
+        require(adjudication == {
+            "artifact_id": saved_adjudication["artifact_id"],
+            "manifest_sha256": sha256(raw_adjudication),
+            "evidence_sha256": saved_adjudication["evidence_sha256"],
+            "contract_sha256": saved_adjudication["contract_sha256"],
+            "selection_sha256": saved_adjudication["selection_sha256"],
+            "group_assignments_sha256": saved_adjudication["group_assignments_sha256"],
+            "labels_template_sha256": saved_adjudication["labels_template_sha256"],
+        }, "Experiment adjudication snapshot mismatch")
     expected = {item["pair_id"]: (shop, batch, item) for shop, data in manifest["shops"].items()
                 for batch in data["batches"] for item in batch["candidates"]}
     answers = index_records(baseline["classifications"], "pair_id")
@@ -2045,8 +2222,16 @@ def experiment_snapshot(directory: Path, raw_manifest: bytes, manifest: dict, st
             require(set(answer["relations"]) == set(RELATION_HEADS), "Invalid cached relation heads")
             require(all(answer["relations"][head]["label"] in RELATION_LABELS for head in RELATION_HEADS),
                     "Invalid cached relation label")
-    require(set(experiment["jev_request_hashes"]) == {batch["batch_id"] for data in manifest["shops"].values()
-                                                     for batch in data["batches"]}, "Experiment request coverage mismatch")
+    if schema == MANIFEST_V3:
+        expected_requests = {
+            decomposed_request_id(batch, stream)
+            for data in manifest["shops"].values()
+            for stream in decomposed_stream_names(manifest["decomposed_contract"], data["objective"])
+            for batch in data["batches"]
+        }
+    else:
+        expected_requests = {batch["batch_id"] for data in manifest["shops"].values() for batch in data["batches"]}
+    require(set(experiment["jev_request_hashes"]) == expected_requests, "Experiment request coverage mismatch")
     return experiment, baseline
 
 
@@ -2074,6 +2259,126 @@ def validate_v2_experiment_log(directory: Path) -> tuple[dict, dict]:
         require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][record["batch_id"]],
                 "Jev request differs from experiment snapshot")
     require(observed == set(expected), "Experiment batch coverage mismatch")
+    return experiment, baseline
+
+
+def validate_decomposed_record_evidence(record: dict, batch: dict, extraction_version: str,
+                                        max_retries: int) -> None:
+    labels = decomposed_payload_labels(record["request"])
+    collected = {}
+    require(record.get("extraction_version") == extraction_version, "Decomposed extraction version mismatch")
+    require(record["retries"] == len(record["attempts"]) - 1, "Decomposed retry count mismatch")
+    require(1 <= len(record["attempts"]) <= max_retries + 1, "Invalid decomposed attempt count")
+    for attempt in record["attempts"]:
+        if attempt["raw_response"] is None:
+            require(attempt["answers"] == [], "Answers require a recorded raw response")
+            continue
+        require(attempt["http_status"] == 200, "Raw response requires HTTP 200")
+        try:
+            parsed = parse_provider_answers(
+                MANIFEST_V3, "jev", attempt["raw_response"], batch, labels, extraction_version,
+            )
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+            require(attempt["error"] == "invalid_response" and attempt["answers"] == [],
+                    "Invalid raw response normalization mismatch")
+            continue
+        require(attempt["answers"] == parsed and attempt["error"] is None,
+                "Normalized decomposed answers differ from raw response")
+        for answer in parsed:
+            collected.setdefault(answer["pair_id"], answer)
+    expected_answers = [collected[pair_id] for pair_id in record["pair_ids"] if pair_id in collected]
+    require(record["answers"] == expected_answers, "Recorded decomposed answers differ from attempt evidence")
+    expected_status, missing_error = extraction_status(expected_answers, record["batch_size"])
+    expected_error = (record["attempts"][-1]["error"] or missing_error) if missing_error else None
+    require(record["status"] == expected_status and record["error"] == expected_error,
+            "Decomposed batch completion status mismatch")
+    require(record["raw_response"] == record["attempts"][-1]["raw_response"],
+            "Decomposed final raw response mismatch")
+
+
+def validate_v3_experiment_log(directory: Path) -> tuple[dict, dict]:
+    raw_manifest = (directory / "manifest.json").read_bytes()
+    manifest = strict_json(raw_manifest.decode("utf-8"))
+    require(manifest_schema(manifest) == MANIFEST_V3, "Expected v3 experiment manifest")
+    records, truncated = read_request_log(directory / "requests.jsonl")
+    require(not truncated and records[-1].get("record_type") == "run_end", "Incomplete experiment log")
+    experiment, baseline = experiment_snapshot(directory, raw_manifest, manifest, records[0])
+    start = records[0]
+    require(start.get("manifest_sha256") == sha256(raw_manifest), "Run/manifest digest mismatch")
+    require(start.get("concurrency") == manifest["concurrency"], "Run/manifest concurrency mismatch")
+    execution_policy = experiment["execution_policy"]
+    extraction_version = experiment["decomposed_extraction_version"]
+    prepared = prepare_decomposed_requests(manifest)["jev"]
+    expected = {
+        decomposed_request_id(batch, stream): {
+            "shop": shop, "stream": stream, "batch": batch, "request": payload,
+        }
+        for shop, streams in prepared.items()
+        for stream, work in streams.items()
+        for batch, payload in work
+    }
+    require(experiment["jev_request_hashes"] == {
+        request_id: sha256(canonical_json(job["request"])) for request_id, job in expected.items()
+    }, "Experiment request snapshot mismatch")
+    expected_groups = {(job["shop"], job["stream"]) for job in expected.values()}
+    starts, ends, observed = set(), set(), set()
+    finished = False
+    run_end = None
+    for record in records[1:]:
+        require(not finished, "Unexpected records after run_end")
+        kind = record["record_type"]
+        if kind == "run_end":
+            require(run_end is None, "Duplicate run_end record")
+            run_end = record
+            finished = True
+            continue
+        require(record.get("provider") == "jev", "Unexpected provider in decomposed experiment")
+        group = (record.get("shop"), record.get("stream"))
+        require(group in expected_groups, "Unknown decomposed experiment group")
+        if kind in {"group_start", "group_end"}:
+            target = starts if kind == "group_start" else ends
+            require(group not in target, "Duplicate decomposed experiment group")
+            if kind == "group_start":
+                require(record["requested_model"] == manifest["models"]["jev"]["model"],
+                        "Decomposed group model mismatch")
+                require(record["batches"] == sum(job["shop"] == group[0] and job["stream"] == group[1]
+                                                  for job in expected.values()),
+                        "Decomposed group batch-count mismatch")
+            target.add(group)
+            continue
+        require(kind == "batch", "Invalid decomposed experiment record")
+        request_id = record.get("request_id")
+        require(request_id in expected and request_id not in observed, "Unknown or duplicate decomposed request")
+        observed.add(request_id)
+        job = expected[request_id]
+        batch = job["batch"]
+        require(group == (job["shop"], job["stream"]), "Decomposed request group mismatch")
+        require(record["batch_id"] == batch["batch_id"], "Decomposed batch identity mismatch")
+        require(record["pair_ids"] == [item["pair_id"] for item in batch["candidates"]],
+                "Decomposed experiment pair mismatch")
+        require(record["batch_size"] == len(batch["candidates"]), "Decomposed experiment batch-size mismatch")
+        require(record["requested_model"] == record["request"]["model"] == manifest["models"]["jev"]["model"],
+                "Decomposed request model mismatch")
+        require(sha256(canonical_json(record["request"])) == experiment["jev_request_hashes"][request_id],
+                "Jev request differs from experiment snapshot")
+        require(record["status"] in {"ok", "partial", "error"} and bool(record["attempts"]),
+                "Invalid decomposed batch status")
+        answers = index_records(record["answers"], "pair_id")
+        if record["status"] == "partial":
+            require(bool(answers) and set(answers) < set(record["pair_ids"]), "Invalid partial answer coverage")
+        else:
+            required = set(record["pair_ids"]) if record["status"] == "ok" else set()
+            require(set(answers) == required, "Invalid decomposed answer coverage")
+        labels = set(decomposed_payload_labels(record["request"]))
+        require(all(answer["label"] in labels for answer in answers.values()), "Invalid decomposed answer choice")
+        validate_decomposed_record_evidence(
+            record, batch, extraction_version, execution_policy["max_retries"],
+        )
+    require(starts == ends == expected_groups, "Decomposed experiment group coverage mismatch")
+    require(observed == set(expected), "Decomposed experiment request coverage mismatch")
+    require(run_end is records[-1], "Missing final run_end record")
+    failed_batches = sum(record["record_type"] == "batch" and record["status"] != "ok" for record in records)
+    require(run_end.get("failed_batches") == failed_batches, "Decomposed run failure count mismatch")
     return experiment, baseline
 
 
@@ -2653,6 +2958,8 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path,
                         help="Frozen workload path; defaults to results/relation-manifest.json outside report-only mode")
     parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--jev-arm", choices=("combined", "decomposed"), default="combined",
+                        help="Jev request topology; combined remains the historical default")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--execute", action="store_true", help="Make paid API requests (Boris runs this explicitly)")
     mode.add_argument("--report-only", action="store_true", help="Rebuild reports from the saved manifest and request log, offline")
@@ -2660,11 +2967,15 @@ def main() -> None:
     parser.add_argument("--prepare-baseline", action="store_true", help="Import/prepare the GPT baseline; add --execute for paid completion")
     parser.add_argument("--import-run", type=Path, help="Existing comparison run directory to seed the GPT baseline")
     parser.add_argument("--baseline-root", type=Path, default=Path("results/baselines"))
+    parser.add_argument("--adjudication-dir", type=Path,
+                        default=Path("results/adjudication/jev-sbs-adjudication-v1"))
     args = parser.parse_args()
     if args.import_run and not args.prepare_baseline:
         parser.error("--import-run requires --prepare-baseline")
     if args.prepare_baseline and args.report_only:
         parser.error("--prepare-baseline cannot be combined with --report-only")
+    if args.jev_arm == "decomposed" and args.prepare_baseline and (args.execute or args.import_run):
+        parser.error("The decomposed arm only reuses an already completed GPT baseline")
     if args.execute:
         load_operator_environment(args.data_dir)
     if args.report_only:
@@ -2679,12 +2990,20 @@ def main() -> None:
               f"all_pairs_classified={summary['all_pairs_classified']}")
         return
     try:
-        manifest = build_relation_manifest(args.data_dir, args.concurrency)
-        manifest_path = args.manifest or Path("results/relation-manifest.json")
+        manifest = (build_decomposed_manifest(args.data_dir, args.concurrency)
+                    if args.jev_arm == "decomposed" else build_relation_manifest(args.data_dir, args.concurrency))
+        manifest_path = args.manifest or Path(
+            "results/decomposed-manifest.json" if args.jev_arm == "decomposed"
+            else "results/relation-manifest.json"
+        )
         digest = write_manifest(manifest_path, manifest)
         if args.prepare_baseline:
-            directory, baseline = prepare_gpt_baseline(
-                manifest, args.baseline_root, import_run=args.import_run, paid=args.execute)
+            if manifest_schema(manifest) == MANIFEST_V3:
+                baseline = load_completed_baseline(manifest, args.baseline_root)
+                directory = args.baseline_root / baseline["fingerprint"]
+            else:
+                directory, baseline = prepare_gpt_baseline(
+                    manifest, args.baseline_root, import_run=args.import_run, paid=args.execute)
             print(f"GPT baseline: {directory}")
             result_name = "labels" if manifest_schema(manifest) == MANIFEST_V1 else "judgments"
             print(f"Retained {len(baseline['classifications'])} {result_name}; "
@@ -2695,35 +3014,50 @@ def main() -> None:
             elif not baseline["complete"]:
                 parser.exit(1, "GPT baseline remains incomplete after bounded attempts; saved progress is reusable.\n")
             return
-        prepare_requests(manifest)  # Validate payload rendering during offline preflight.
+        if manifest_schema(manifest) == MANIFEST_V3:
+            prepare_decomposed_requests(manifest)
+            artifact, _, _ = validate_adjudication_artifact(args.adjudication_dir)
+            require(artifact["source_manifest_sha256"] == sha256(canonical_json(manifest)),
+                    "Adjudication artifact does not match the decomposed manifest")
+        else:
+            prepare_requests(manifest)  # Validate payload rendering during offline preflight.
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(1, f"Preparation failed: {error}\n")
     print(f"Offline manifest: {manifest_path} (SHA256 {digest})")
     print(f"Models: {GPT_SETTINGS['model']} / jev-1.13.0; concurrency: {args.concurrency}")
     for shop, data in manifest["shops"].items():
+        stream_count = (len(decomposed_stream_names(manifest["decomposed_contract"], data["objective"]))
+                        if manifest_schema(manifest) == MANIFEST_V3 else 1)
         for direction in ("forward", "reverse"):
             batches = [batch for batch in data["batches"] if batch["direction"] == direction]
             sizes = [len(batch["candidates"]) for batch in batches]
-            print(f"{shop} {direction}: {sum(sizes)} rows, {len(batches)} Jev requests, batch sizes {sizes}")
+            print(f"{shop} {direction}: {sum(sizes)} rows, {len(batches) * stream_count} Jev requests "
+                  f"across {stream_count} stream(s), batch sizes {sizes}")
         print(f"  Source checks: {json.dumps(data['diagnostics'], sort_keys=True)}")
     if manifest_schema(manifest) == MANIFEST_V1:
         print(f"Jev prompt: {JEV_PROMPT_VERSION}. GPT labels must come from a completed saved baseline.")
-    else:
+    elif manifest_schema(manifest) == MANIFEST_V2:
         print(f"Relation contract: {manifest['contract']['version']}. "
               "GPT judgments must come from a completed saved baseline.")
+    else:
+        print(f"Decomposed contract: {manifest['decomposed_contract']['version']}; "
+              f"adjudication: {artifact['artifact_id']}. GPT judgments reuse the completed v2 baseline.")
     if not args.execute:
         print("No API requests made. Use --execute only when ready for the paid run.")
         return
     try:
-        directory, failures = run_jev_experiment(manifest, args.baseline_root, args.output_dir)
+        directory, failures = run_jev_experiment(
+            manifest, args.baseline_root, args.output_dir, adjudication_dir=args.adjudication_dir,
+        )
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         parser.exit(1, f"Execution failed: {error}\n")
     if failures:
         parser.exit(1, f"Run finished with {failures} incomplete batches; inspect requests.jsonl before any rerun.\n")
-    if manifest_schema(manifest) == MANIFEST_V1:
+    if manifest_schema(manifest) in {MANIFEST_V1, MANIFEST_V2}:
         print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
     else:
-        print(f"All batches completed. Inspect {directory / 'summary.json'} and disagreements.csv.")
+        print(f"All decomposed streams completed and snapshotted in {directory}. "
+              "Offline policy/report generation follows in the next approved step.")
 
 
 if __name__ == "__main__":

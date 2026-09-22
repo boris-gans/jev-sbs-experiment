@@ -1,4 +1,5 @@
 import copy
+from collections import Counter
 import csv
 import fcntl
 import hashlib
@@ -380,6 +381,23 @@ def relation_response_for(provider, payload, batch):
     return {"model": payload["model"], "answers": answers}
 
 
+def decomposed_response_for(payload, *, missing: str | None = None):
+    answers = {}
+    for key, question in payload["questions"].items():
+        labels = list(question["criteria"])
+        choice = "distinct" if payload["state"]["stream"] == "identity" else labels[-1]
+        remainder = 0.2 / (len(labels) - 1)
+        answers[key] = {
+            "type": "choice",
+            "choice": choice,
+            "confidence": 0.8,
+            "probabilities": {label: (0.8 if label == choice else remainder) for label in labels},
+        }
+    if missing is not None:
+        del answers[missing]
+    return {"model": payload["model"], "answers": answers, "usage": {"input_tokens": 100, "output_tokens": 0}}
+
+
 def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
     manifest, _ = prepared
     data = manifest["shops"]["furniture.co.uk"]
@@ -502,6 +520,59 @@ def test_decomposed_requests_are_narrow_objective_streams_for_all_pairs(decompos
     furniture = jobs["furniture.co.uk"]
     assert "Same role is not automatically negative" in furniture["placement_context"][0][1]["questions"]["candidate_0"]["instructions"]
     assert "plausible joint purchase" in jobs["themeatboys.nl"]["together_use"][0][1]["questions"]["candidate_0"]["instructions"]
+
+
+def test_decomposed_answers_are_strict_and_normalized(decomposed_manifest):
+    batch, payload = compare.prepare_decomposed_requests(decomposed_manifest)["jev"]["themeatboys.nl"]["together_use"][0]
+    labels = compare.decomposed_payload_labels(payload)
+    answers = compare.parse_provider_answers(
+        compare.MANIFEST_V3, "jev", decomposed_response_for(payload), batch, labels,
+    )
+    assert [answer["pair_id"] for answer in answers] == [item["pair_id"] for item in batch["candidates"]]
+    assert all(answer["label"] == "no_concrete_mechanism" for answer in answers)
+    assert all(answer["probability_sum"] == pytest.approx(1) for answer in answers)
+
+    with pytest.raises(ValueError, match="Missing or unknown question answers"):
+        compare.parse_provider_answers(
+            compare.MANIFEST_V3, "jev",
+            decomposed_response_for(payload, missing="candidate_0"), batch, labels,
+        )
+
+
+def test_decomposed_batch_retries_transport_failures_and_rejects_partial_choice_sets(
+        decomposed_manifest, monkeypatch):
+    batch, payload = compare.prepare_decomposed_requests(decomposed_manifest)["jev"]["furniture.co.uk"]["identity"][0]
+    calls = []
+    monkeypatch.setattr(compare.time, "sleep", lambda delay: None)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json=decomposed_response_for(payload))
+
+    request_id = compare.decomposed_request_id(batch, "identity")
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        record = compare.run_batch(
+            client, "jev", "furniture.co.uk", batch, payload, "dummy",
+            schema_version=compare.MANIFEST_V3, stream="identity", request_id=request_id,
+            choice_labels=compare.decomposed_payload_labels(payload),
+            extraction_version=compare.DECOMPOSED_EXTRACTION_VERSION,
+        )
+    assert record["status"] == "ok" and record["retries"] == 1
+    assert record["stream"] == "identity" and record["request_id"] == request_id
+    assert len(record["answers"]) == len(batch["candidates"])
+
+    partial = decomposed_response_for(payload, missing="candidate_0")
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=partial))) as client:
+        failed = compare.run_batch(
+            client, "jev", "furniture.co.uk", batch, payload, "dummy",
+            schema_version=compare.MANIFEST_V3, stream="identity", request_id=request_id,
+            choice_labels=compare.decomposed_payload_labels(payload),
+            extraction_version=compare.DECOMPOSED_EXTRACTION_VERSION,
+        )
+    assert failed["status"] == "error" and failed["error"] == "invalid_response"
+    assert failed["answers"] == [] and failed["retries"] == 0
 
 
 def write_adjudication_sources(manifest, first_path, second_path):
@@ -1799,6 +1870,172 @@ def test_baseline_recovers_checkpoint_before_interrupted_tail(baseline_seed, tmp
     assert interrupted.read_bytes() == snapshot
     assert complete["accounting"]["repair"]["cost_estimate_usd"] is None
     assert compare.load_completed_baseline(manifest, root) == complete
+
+
+def test_v3_jev_experiment_uses_stream_qualified_immutable_snapshots(
+        relation_baseline_ready, tmp_path, monkeypatch):
+    relation_manifest, baseline_root, baseline_directory, baseline = relation_baseline_ready
+    manifest = compare.decompose_relation_manifest(relation_manifest)
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(manifest, first, second)
+    adjudication_dir = tmp_path / "adjudication"
+    artifact = compare.prepare_adjudication_artifact(manifest, first, second, adjudication_dir)
+    baseline_files = {str(path.relative_to(baseline_directory)): path.read_bytes()
+                      for path in baseline_directory.rglob("*") if path.is_file()}
+    calls = []
+
+    def handler(request):
+        assert request.url.host == "api.typesafe.ai"
+        payload = json.loads(request.content)
+        calls.append(payload)
+        return httpx.Response(200, json=decomposed_response_for(payload))
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "dummy-decomposed-jev-key")
+    directory, failures = compare.run_jev_experiment(
+        manifest, baseline_root, experiments_root=tmp_path / "decomposed-experiments",
+        adjudication_dir=adjudication_dir, transport=httpx.MockTransport(handler),
+    )
+
+    assert failures == 0 and len(calls) == 160
+    assert not (directory / "summary.json").exists()
+    assert {path.name for path in directory.iterdir()} == {
+        "manifest.json", "baseline.json", "adjudication.json", "experiment.json", "requests.jsonl",
+    }
+    experiment = json.loads((directory / "experiment.json").read_text())
+    assert experiment["schema_version"] == compare.JEV_EXPERIMENT_V3
+    assert experiment["manifest_schema_version"] == compare.MANIFEST_V3
+    assert experiment["decomposed_contract"] == manifest["decomposed_contract"]
+    assert experiment["resolver_versions"] == manifest["decomposed_contract"]["resolver_versions"]
+    assert experiment["adjudication"]["artifact_id"] == artifact["artifact_id"]
+    assert len(experiment["jev_request_hashes"]) == 160
+    assert all(request_id.rsplit("/", 1)[-1] in {
+        "identity", "construction_finish", "design_language", "placement_context",
+        "together_use", "substitute", "incompatibility",
+    } for request_id in experiment["jev_request_hashes"])
+    validated_experiment, validated_baseline = compare.validate_v3_experiment_log(directory)
+    assert validated_experiment == experiment and validated_baseline == baseline
+    with monkeypatch.context() as patch:
+        patch.setattr(compare, "MAX_RETRIES", 0)
+        patch.setattr(compare, "DECOMPOSED_EXTRACTION_VERSION", "future-live-extraction")
+        patch.setattr(compare, "PROBABILITY_SUM_TOLERANCE", 0)
+        patch.setattr(compare, "CHOICE_MAX_TOLERANCE", 0)
+        assert compare.validate_v3_experiment_log(directory) == (experiment, baseline)
+    records, _ = compare.read_request_log(directory / "requests.jsonl")
+    starts = [record for record in records if record["record_type"] == "group_start"]
+    batches = [record for record in records if record["record_type"] == "batch"]
+    assert len(starts) == 8 and len(batches) == 160
+    assert len({record["request_id"] for record in batches}) == 160
+    assert all(record["stream"] == record["request"]["state"]["stream"] for record in batches)
+    assert {record["extraction_version"] for record in batches} == {compare.DECOMPOSED_EXTRACTION_V1}
+    assert {str(path.relative_to(baseline_directory)): path.read_bytes()
+            for path in baseline_directory.rglob("*") if path.is_file()} == baseline_files
+
+    log_path = directory / "requests.jsonl"
+    original_log = log_path.read_bytes()
+
+    def rejects(mutator, message):
+        changed = copy.deepcopy(records)
+        mutator(changed)
+        write_blocks(log_path, changed)
+        with pytest.raises(ValueError, match=message):
+            compare.validate_v3_experiment_log(directory)
+        log_path.write_bytes(original_log)
+
+    rejects(lambda changed: changed[0].update(concurrency=99), "concurrency mismatch")
+    rejects(lambda changed: changed[-1].update(failed_batches=1), "failure count mismatch")
+    rejects(lambda changed: changed.insert(-1, copy.deepcopy(changed[-1])), "after run_end")
+
+    def tamper_probability(changed):
+        record = next(row for row in changed if row["record_type"] == "batch")
+        probabilities = record["answers"][0]["probabilities"]
+        choice = record["answers"][0]["label"]
+        other = next(label for label in probabilities if label != choice)
+        probabilities[choice] -= 0.01
+        probabilities[other] += 0.01
+
+    rejects(tamper_probability, "differ from attempt evidence")
+
+    def tamper_candidate(changed):
+        record = next(row for row in changed if row["record_type"] == "batch")
+        record["answers"][0]["candidate_id"] = "tampered"
+
+    rejects(tamper_candidate, "differ from attempt evidence")
+
+    def tamper_request(changed):
+        record = next(row for row in changed if row["record_type"] == "batch")
+        record["request"]["state"]["stream"] = "tampered"
+
+    rejects(tamper_request, "differs from experiment snapshot")
+
+    failed_once = False
+    failure_lock = threading.Lock()
+
+    def mixed_handler(request):
+        nonlocal failed_once
+        payload = json.loads(request.content)
+        with failure_lock:
+            if not failed_once:
+                failed_once = True
+                return httpx.Response(200, json=decomposed_response_for(payload, missing="candidate_0"))
+        return httpx.Response(200, json=decomposed_response_for(payload))
+
+    mixed_directory, mixed_failures = compare.run_jev_experiment(
+        manifest, baseline_root, experiments_root=tmp_path / "mixed-experiments",
+        adjudication_dir=adjudication_dir, transport=httpx.MockTransport(mixed_handler),
+    )
+    assert mixed_failures == 1
+    compare.validate_v3_experiment_log(mixed_directory)
+    mixed_records, _ = compare.read_request_log(mixed_directory / "requests.jsonl")
+    statuses = Counter(record["status"] for record in mixed_records if record["record_type"] == "batch")
+    assert statuses == {"ok": 159, "error": 1}
+
+
+def test_decomposed_cli_preflight_is_offline(catalogs, tmp_path, monkeypatch, capsys):
+    manifest = compare.build_decomposed_manifest(catalogs)
+    first = tmp_path / "first/paired_results.csv"
+    second = tmp_path / "second/paired_results.csv"
+    write_adjudication_sources(manifest, first, second)
+    adjudication_dir = tmp_path / "adjudication"
+    compare.prepare_adjudication_artifact(manifest, first, second, adjudication_dir)
+    monkeypatch.setattr(compare.httpx, "Client", lambda *args, **kwargs: pytest.fail("Preflight used network"))
+    monkeypatch.setattr("sys.argv", [
+        "compare.py", "--jev-arm", "decomposed", "--data-dir", str(catalogs),
+        "--manifest", str(tmp_path / "decomposed-manifest.json"),
+        "--adjudication-dir", str(adjudication_dir),
+    ])
+
+    compare.main()
+
+    output = capsys.readouterr().out
+    assert "No API requests made" in output
+    assert "Decomposed contract" in output
+    assert output.count("40 Jev requests across 4 stream(s)") == 4
+
+
+def test_decomposed_baseline_cli_only_reuses_completed_gpt_baseline(
+        relation_baseline_ready, tmp_path, monkeypatch, capsys):
+    relation_manifest, baseline_root, _, baseline = relation_baseline_ready
+    manifest = compare.decompose_relation_manifest(relation_manifest)
+    monkeypatch.setattr(compare, "build_decomposed_manifest", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(compare.httpx, "Client", lambda *args, **kwargs: pytest.fail("Decomposed baseline used network"))
+    monkeypatch.setattr("sys.argv", [
+        "compare.py", "--jev-arm", "decomposed", "--prepare-baseline",
+        "--manifest", str(tmp_path / "manifest.json"), "--baseline-root", str(baseline_root),
+    ])
+
+    compare.main()
+
+    output = capsys.readouterr().out
+    assert f"Retained {len(baseline['classifications'])} judgments; 0 missing" in output
+    monkeypatch.setattr(compare, "load_operator_environment", lambda *args: pytest.fail("Read operator environment"))
+    monkeypatch.setattr("sys.argv", [
+        "compare.py", "--jev-arm", "decomposed", "--prepare-baseline", "--execute",
+    ])
+    with pytest.raises(SystemExit) as error:
+        compare.main()
+    assert error.value.code == 2
 
 
 def test_v2_jev_experiment_uses_immutable_relation_snapshots(
