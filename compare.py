@@ -20,6 +20,7 @@ import time
 import uuid
 
 import httpx
+from dotenv import load_dotenv
 
 
 SHOPS = {
@@ -2023,6 +2024,12 @@ def write_reports(manifest_path: Path, output_dir: Path) -> dict:
     return write_relation_reports(manifest_path, output_dir)
 
 
+def load_operator_environment(data_dir: Path) -> None:
+    candidates = (Path.cwd() / ".env", data_dir.resolve().parent / ".env")
+    for path in dict.fromkeys(candidates):
+        load_dotenv(dotenv_path=path, override=False)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -2041,6 +2048,8 @@ def main() -> None:
         parser.error("--import-run requires --prepare-baseline")
     if args.prepare_baseline and args.report_only:
         parser.error("--prepare-baseline cannot be combined with --report-only")
+    if args.execute:
+        load_operator_environment(args.data_dir)
     if args.report_only:
         directory = args.output_dir or Path("results/run")
         manifest_path = args.manifest or (directory / "manifest.json" if (directory / "experiment.json").exists()

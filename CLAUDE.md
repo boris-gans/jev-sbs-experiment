@@ -7,7 +7,7 @@ themeatboys.nl. Deterministic code derives basket labels from the raw heads. Thi
 is a standalone research script, not a production pipeline integration.
 
 ## Stack
-Python 3.11+, httpx 0.28.1, pytest 8.x. One script: compare.py.
+Python 3.11+, httpx 0.28.1, python-dotenv 1.x, pytest 8.x. One script: compare.py.
 
 ## Supported platform versions
 n/a
@@ -27,8 +27,9 @@ None known. This local experiment does not change embedding-service contracts.
 
 ## Gotchas
 - Boris owns the paid run. Do not invoke `--execute` autonomously.
-- Credentials come from OPENAI_API_KEY and TYPESAFE_API_KEY in the process
-  environment. Never open .env files or log credentials.
+- Paid commands load OPENAI_API_KEY and TYPESAFE_API_KEY from `.env` without
+  overriding process-environment values. In worktrees, they also check beside the
+  supplied `data/` directory. Never open .env files or log credentials.
 - data/, results/, and .claude/plans/ are ignored; never commit their contents.
 - Worktrees do not inherit ignored data/results; use `--data-dir` to point at the
   original frozen catalog without copying or editing it.

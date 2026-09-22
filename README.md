@@ -15,9 +15,9 @@ remain directly comparable over all 800 pairs. A deterministic resolver derives 
 SBS basket label afterward. The raw heads remain the source of truth.
 
 This is not a production pipeline integration. Nothing imports or changes
-`embedding-service`; no retrieval, summarization, training, embedding, schema, or
-dependency change is involved. Historical FERODEV-8257 runs retain their original
-three-label report format.
+`embedding-service`; no retrieval, summarization, training, embedding, or schema
+change is involved. Historical FERODEV-8257 runs retain their original three-label
+report format.
 
 ## Setup
 
@@ -28,6 +28,10 @@ uv venv .venv
 uv pip install --python .venv/bin/python -r pyproject.toml --extra test
 .venv/bin/python -m pytest
 ```
+
+Copy `.env.sample` to `.env` and populate the provider keys needed for paid runs.
+The script loads `.env` only when `--execute` is present. Values already exported in
+the process environment take precedence and credentials are never printed.
 
 There is no build/package or configured linter. `git diff --check` checks patch
 whitespace. Tests use synthetic catalogs and mocked HTTP; they never call providers.
@@ -86,6 +90,9 @@ Outputs still go to the current worktree's ignored `results/` directory unless a
 explicit manifest, baseline root, or output directory is supplied. Do not copy or
 edit an existing experiment's snapshots merely to make them visible in a worktree.
 In a worktree, add the same `--data-dir` flag to every non-report-only command below.
+Paid commands first look for `.env` in the current worktree. If it is absent or does
+not define a key, they also load `.env` beside the supplied `data/` directory, so the
+original checkout's ignored credential file can be reused without copying it.
 
 ## Fresh GPT baseline — Boris operates paid completion
 
@@ -111,8 +118,8 @@ covers the GPT system/user prompts, strict schema, product evidence, candidate
 ordering, pair direction, model, and request settings. Jev-only criteria and
 pricing are excluded. Only the first valid answer for each pair is retained.
 
-After checking current provider limits and intended spend, set `OPENAI_API_KEY`
-securely and explicitly complete the baseline:
+After checking current provider limits and intended spend, define `OPENAI_API_KEY`
+in `.env` (or the process environment) and explicitly complete the baseline:
 
 ```sh
 .venv/bin/python compare.py --prepare-baseline --execute
@@ -134,7 +141,8 @@ GPT requests**. A legacy or differently prompted run is rejected.
 ## Jev execution — Boris operates the paid run
 
 Plain `--execute` never runs GPT. It requires a complete matching v2 baseline and
-only calls Jev. Set `TYPESAFE_API_KEY`; `OPENAI_API_KEY` is not needed:
+only calls Jev. Define `TYPESAFE_API_KEY` in `.env` or the process environment;
+`OPENAI_API_KEY` is not needed:
 
 ```sh
 .venv/bin/python compare.py --execute
@@ -146,9 +154,9 @@ Every invocation creates a fresh
 There is no automatic Jev resume: every new execution resends the entire workload
 and can incur new charges.
 
-Keep credentials out of source, shell history, chat, and logs. `.env.sample` lists
-the variable names; the script does not load `.env` files. Before execution, check
-provider limits, current prices, and intended spend. There is no hard dollar cap.
+Keep credentials out of source, shell history, chat, and logs. `.env` is ignored by
+Git and `.env.sample` lists only the variable names. Before execution, check provider
+limits, current prices, and intended spend. There is no hard dollar cap.
 
 Each request has a 120-second I/O timeout. Transport errors, 408, 429, and 5xx
 responses receive at most two retries. `Retry-After` is honored up to 60 seconds;

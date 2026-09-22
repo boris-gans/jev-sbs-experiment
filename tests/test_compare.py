@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import itertools
 import json
+import os
 import socket
 import threading
 
@@ -1846,6 +1847,27 @@ def test_ready_experiment_requires_only_jev_credential_before_directory_creation
     with pytest.raises(ValueError, match="TYPESAFE_API_KEY"):
         compare.run_jev_experiment(manifest, root, output)
     assert not output.exists()
+
+
+def test_operator_environment_loads_dotenv_without_overriding_process_values(tmp_path, monkeypatch):
+    worktree = tmp_path / "worktree"
+    source = tmp_path / "source"
+    worktree.mkdir()
+    (source / "data").mkdir(parents=True)
+    (worktree / ".env").write_text(
+        "OPENAI_API_KEY=dotenv-openai\nWORKTREE_DOTENV_MARKER=loaded\n",
+        encoding="utf-8",
+    )
+    (source / ".env").write_text("TYPESAFE_API_KEY=source-typesafe\n", encoding="utf-8")
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("OPENAI_API_KEY", "process-openai")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+
+    compare.load_operator_environment(source / "data")
+
+    assert os.environ["OPENAI_API_KEY"] == "process-openai"
+    assert os.environ["WORKTREE_DOTENV_MARKER"] == "loaded"
+    assert os.environ["TYPESAFE_API_KEY"] == "source-typesafe"
 
 
 def test_default_execute_cli_calls_only_jev(experiment_ready, tmp_path, monkeypatch, capsys):
