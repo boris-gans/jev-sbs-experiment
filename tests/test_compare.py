@@ -813,6 +813,7 @@ def test_completed_batch_is_flushed_before_group_finishes(prepared, tmp_path):
 def test_execute_flag_requires_completed_baseline_before_network(catalogs, tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr(compare, "load_operator_environment", lambda *args: None)
     output = tmp_path / "run"
     monkeypatch.setattr("sys.argv", ["compare.py", "--data-dir", str(catalogs),
                                     "--manifest", str(tmp_path / "manifest.json"),
@@ -1858,10 +1859,14 @@ def test_operator_environment_loads_dotenv_without_overriding_process_values(tmp
         "OPENAI_API_KEY=dotenv-openai\nWORKTREE_DOTENV_MARKER=loaded\n",
         encoding="utf-8",
     )
-    (source / ".env").write_text("TYPESAFE_API_KEY=source-typesafe\n", encoding="utf-8")
+    (source / ".env").write_text(
+        "TYPESAFE_API_KEY=source-typesafe\nWORKTREE_DOTENV_MARKER=source\n",
+        encoding="utf-8",
+    )
     monkeypatch.chdir(worktree)
     monkeypatch.setenv("OPENAI_API_KEY", "process-openai")
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("WORKTREE_DOTENV_MARKER", raising=False)
 
     compare.load_operator_environment(source / "data")
 
@@ -1882,6 +1887,7 @@ def test_default_execute_cli_calls_only_jev(experiment_ready, tmp_path, monkeypa
 
     monkeypatch.setattr(compare, "execute", mocked_execute)
     monkeypatch.setattr(compare, "build_relation_manifest", lambda *a: manifest)
+    monkeypatch.setattr(compare, "load_operator_environment", lambda *args: None)
     output = tmp_path / "cli-experiment"
     monkeypatch.setattr("sys.argv", ["compare.py", "--execute", "--baseline-root", str(root),
                                     "--manifest", str(tmp_path / "frozen.json"), "--output-dir", str(output)])
