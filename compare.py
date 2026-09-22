@@ -66,8 +66,9 @@ MAX_RETRIES = 2
 TIMEOUT_SECONDS = 120.0
 MAX_RETRY_DELAY = 60.0
 PROBABILITY_SUM_TOLERANCE = 0.015  # Three probabilities rounded to two decimal places.
+CHOICE_MAX_TOLERANCE = 0.01  # Selected choice may differ from rounded maximum by one percentage point.
 EXTRACTION_VERSION = "partial-answers-v2"
-RELATION_EXTRACTION_VERSION = "relation-heads-v1"
+RELATION_EXTRACTION_VERSION = "relation-heads-v2"
 JEV_PROMPT_VERSION = "objective-boundaries-v3"
 JEV_INSTRUCTIONS = {
     "style_compatibility": (
@@ -762,7 +763,10 @@ def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
     tolerance = max(PROBABILITY_SUM_TOLERANCE, 0.005 * len(labels))
     require(math.isclose(probability_sum, 1, rel_tol=0, abs_tol=tolerance + 1e-12),
             "Probabilities do not sum to one within rounding tolerance")
-    require(probabilities[answer["choice"]] >= max(probabilities.values()) - 1e-6, "Choice is not maximal")
+    choice_probability = probabilities[answer["choice"]]
+    max_probability = max(probabilities.values())
+    require(choice_probability >= max_probability - CHOICE_MAX_TOLERANCE - 1e-12,
+            "Choice differs from maximum probability beyond rounding tolerance")
     return {
         "label": answer["choice"],
         "reason": None,
@@ -770,6 +774,7 @@ def parse_jev_choice(answer: object, labels: tuple[str, ...]) -> dict:
         "confidence": confidence,
         "probability_sum": probability_sum,
         "probability_rounding_warning": not math.isclose(probability_sum, 1, abs_tol=1e-6),
+        "choice_probability_warning": choice_probability < max_probability - 1e-6,
     }
 
 
@@ -1499,6 +1504,11 @@ def relation_probability_warnings(answer: dict) -> int:
     return sum(judgment.get("probability_rounding_warning", False) for judgment in judgments)
 
 
+def relation_choice_probability_warnings(answer: dict) -> int:
+    judgments = [answer["identity"], *(answer["relations"][head] for head in RELATION_HEADS)]
+    return sum(judgment.get("choice_probability_warning", False) for judgment in judgments)
+
+
 def summarize_group(provider: str, records: list, expected: list, end: dict | None, concurrency: int,
                     pricing: dict | None = None, schema_version: str = MANIFEST_V1,
                     resolver_version: str = RESOLVER_VERSION) -> dict:
@@ -1565,6 +1575,9 @@ def summarize_group(provider: str, records: list, expected: list, end: dict | No
         result["label_counts"] = {label: sum(answer["label"] == label for answer in successes) for label in LABELS}
     else:
         require(schema_version == MANIFEST_V2, "Unsupported manifest schema")
+        result["choice_probability_warnings"] = sum(
+            relation_choice_probability_warnings(answer) for answer in successes
+        )
         result.update(relation_distribution(successes, resolver_version))
     return result
 
@@ -1765,6 +1778,9 @@ def flatten_relation_judgment(row: dict, provider: str, name: str, judgment: dic
     row[f"{provider}_{name}_probabilities"] = (
         json.dumps(probabilities, sort_keys=True) if probabilities is not None else None
     )
+    row[f"{provider}_{name}_choice_probability_warning"] = (
+        judgment.get("choice_probability_warning", False) if judgment else None
+    )
 
 
 def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
@@ -1846,6 +1862,7 @@ def write_relation_reports(manifest_path: Path, output_dir: Path) -> dict:
         "extraction": {
             "version": RELATION_EXTRACTION_VERSION,
             "probability_sum_tolerance": PROBABILITY_SUM_TOLERANCE,
+            "choice_max_tolerance": CHOICE_MAX_TOLERANCE,
             "request_log_sha256": sha256(log_path.read_bytes()),
         },
         "models": manifest["models"],

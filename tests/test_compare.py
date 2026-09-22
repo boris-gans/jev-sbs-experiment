@@ -459,6 +459,37 @@ def test_combined_relation_answers_are_normalized_in_pair_order(prepared, provid
         assert all(answer["identity"]["probability_sum"] == pytest.approx(1) for answer in answers)
 
 
+def test_jev_relation_choice_accepts_one_point_rounding_mismatch(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch)
+    body = relation_response_for("jev", payload, batch)
+    answer = body["answers"]["candidate_0_co_purchase"]
+    answer.update(choice="yes", probabilities={"yes": 0.49, "no": 0.50, "uncertain": 0.01})
+
+    parsed = compare.parse_relation_answers("jev", body, batch)
+
+    judgment = parsed[0]["relations"]["co_purchase"]
+    assert judgment["label"] == "yes"
+    assert judgment["probabilities"] == answer["probabilities"]
+    assert judgment["choice_probability_warning"] is True
+
+
+def test_jev_relation_choice_rejects_larger_probability_mismatch(prepared):
+    manifest, _ = prepared
+    data = manifest["shops"]["furniture.co.uk"]
+    batch = data["batches"][0]
+    payload = compare.render_relation_request("jev", manifest["models"]["jev"], data, batch)
+    body = relation_response_for("jev", payload, batch)
+    body["answers"]["candidate_0_co_purchase"].update(
+        choice="yes", probabilities={"yes": 0.489, "no": 0.501, "uncertain": 0.01}
+    )
+
+    with pytest.raises(ValueError, match="beyond rounding tolerance"):
+        compare.parse_relation_answers("jev", body, batch)
+
+
 @pytest.mark.parametrize("provider", ["gpt", "jev"])
 def test_combined_relation_answers_reject_missing_heads(prepared, provider):
     manifest, _ = prepared
@@ -1646,6 +1677,36 @@ def test_v2_jev_experiment_uses_immutable_relation_snapshots(
 
     log_path = directory / "requests.jsonl"
     original_log = log_path.read_bytes()
+    records, _ = compare.read_request_log(log_path)
+    rounded = next(record for record in records if record["record_type"] == "batch")
+    rounded_choice = rounded["raw_response"]["answers"]["candidate_0_incompatible"]
+    rounded_choice.update(choice="yes", probabilities={"yes": 0.49, "no": 0.50, "uncertain": 0.01})
+    rounded.update(status="error", error="invalid_response", answers=[])
+    rounded["attempts"][-1]["error"] = "invalid_response"
+    write_blocks(log_path, records)
+    recovered = compare.write_reports(directory / "manifest.json", directory)
+    shop = rounded["shop"]
+    group = recovered["groups"][f"jev/{shop}"]
+    assert recovered["all_pairs_classified"]
+    assert recovered["extraction"]["version"] == compare.RELATION_EXTRACTION_VERSION
+    assert recovered["extraction"]["choice_max_tolerance"] == compare.CHOICE_MAX_TOLERANCE
+    assert group["choice_probability_warnings"] == 1
+    assert group["reextracted_batches"] == group["recorded_failed_attempts"] == 1
+    assert group["failed_attempts"] == group["failed_pairs"] == 0
+    recovered_row = next(
+        json.loads(line)
+        for line in (directory / "jev_classifications.jsonl").read_text().splitlines()
+        if json.loads(line)["pair_id"] == rounded["pair_ids"][0]
+    )
+    assert recovered_row["relations"]["incompatible"]["choice_probability_warning"] is True
+    paired_row = next(
+        row for row in csv.DictReader((directory / "paired_results.csv").open())
+        if row["pair_id"] == rounded["pair_ids"][0]
+    )
+    assert paired_row["jev_incompatible_choice_probability_warning"] == "True"
+    log_path.write_bytes(original_log)
+    assert compare.write_reports(directory / "manifest.json", directory) == summary
+
     records, _ = compare.read_request_log(log_path)
     failed = next(record for record in records if record["record_type"] == "batch")
     failed.update(status="error", error="http_422", answers=[], raw_response=None)
