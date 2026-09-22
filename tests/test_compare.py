@@ -1627,6 +1627,16 @@ def test_v2_jev_experiment_uses_immutable_relation_snapshots(
         })
         assert compare.validate_v2_experiment_log(directory) == (experiment, baseline)
         assert compare.write_reports(directory / "manifest.json", directory) == summary
+        for provider in ("gpt", "jev"):
+            classifications = [
+                json.loads(line)
+                for line in (directory / f"{provider}_classifications.jsonl").read_text().splitlines()
+            ]
+            assert {
+                row["resolution"]["resolver_version"]
+                for row in classifications
+                if row["resolution"] is not None
+            } == {experiment["resolver_version"]}
     with monkeypatch.context() as patch:
         patch.setattr(compare, "RESOLVERS", {"future-resolver": future_resolver})
         with pytest.raises(ValueError, match="Unsupported saved resolver version"):

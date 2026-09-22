@@ -47,7 +47,8 @@ RELATION_LABELS = ("yes", "no", "uncertain")
 RELATION_HEADS = ("co_purchase", "alternative", "incompatible")
 BASKET_LABELS = ("positive", "hard_negative", "skip", "conflict")
 RELATION_CONTRACT_VERSION = "universal-relations-v1"
-RESOLVER_VERSION = "basket-projection-v1"
+RESOLVER_V1 = "basket-projection-v1"
+RESOLVER_VERSION = RESOLVER_V1
 MANIFEST_V1 = "jev-sbs-manifest-v1"
 MANIFEST_V2 = "jev-sbs-manifest-v2"
 GPT_INPUT_V1 = "gpt-input-v1"
@@ -836,7 +837,7 @@ def resolve_basket_judgment_v1(answer: dict) -> dict:
     yes = {head for head, label in relations.items() if label == "yes"}
     raw_conflict = len(yes) > 1
     result = {
-        "resolver_version": RESOLVER_VERSION,
+        "resolver_version": RESOLVER_V1,
         "identity_action": "continue_uncertain" if identity == "uncertain" else "continue",
         "basket_label": None,
         "resolution_status": None,
@@ -873,7 +874,7 @@ def resolve_basket_judgment_v1(answer: dict) -> dict:
     return result
 
 
-RESOLVERS = {RESOLVER_VERSION: resolve_basket_judgment_v1}
+RESOLVERS = {RESOLVER_V1: resolve_basket_judgment_v1}
 
 
 def resolve_basket_judgment(answer: dict, resolver_version: str = RESOLVER_VERSION) -> dict:
