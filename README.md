@@ -2,19 +2,23 @@
 
 A local experiment for FERODEV-8283. It compares Jev and GPT nano on **400
 directed rows per shop** (200 forward and 200 reverse) from furniture.co.uk and
-themeatboys.nl. Both providers receive the same frozen product evidence and answer
-the same four questions for every pair:
+themeatboys.nl. The default, historical arm gives both providers the same frozen
+product evidence and asks the same four questions for every pair:
 
 1. identity: `duplicate`, `variant`, `redundant`, `distinct`, or `uncertain`;
 2. co-purchase: `yes`, `no`, or `uncertain`;
 3. alternative: `yes`, `no`, or `uncertain`;
 4. incompatibility: `yes`, `no`, or `uncertain`.
 
-The experiment asks all four questions in one combined request so provider results
-remain directly comparable over all 800 pairs. A deterministic resolver derives an
-SBS basket label afterward. The raw heads remain the source of truth.
+That arm asks all four questions in one combined request so provider results remain
+directly comparable over all 800 pairs. A separate `--jev-arm decomposed` experiment
+asks Jev four independent evidence questions applicable to each pair—identity plus
+three streams for that shop's objective—and reuses the completed combined-arm GPT
+baseline without making GPT calls. Deterministic, versioned resolvers derive SBS
+basket labels afterward. Raw heads or streams remain the source of truth in both
+arms.
 
-This is not a production pipeline integration. Nothing imports or changes
+Neither arm is a production pipeline integration. Nothing imports or changes
 `embedding-service`; no retrieval, summarization, training, embedding, or schema
 change is involved. Historical FERODEV-8257 runs retain their original three-label
 report format.
@@ -98,7 +102,8 @@ original checkout's ignored credential file can be reused without copying it.
 
 The FERODEV-8257 GPT labels are not valid for the revised objectives. Do **not**
 import `results/run` or reuse its baseline. First prepare a fresh v2 baseline
-offline:
+offline. Once completed, this exact baseline is shared by the combined and
+decomposed Jev arms:
 
 ```sh
 .venv/bin/python compare.py --prepare-baseline
@@ -138,11 +143,11 @@ reached the provider before its checkpoint may be billed again.
 `--import-run` remains available only for a run containing the **exact matching v2
 GPT requests**. A legacy or differently prompted run is rejected.
 
-## Jev execution — Boris operates the paid run
+## Combined Jev execution — Boris operates the paid run
 
-Plain `--execute` never runs GPT. It requires a complete matching v2 baseline and
-only calls Jev. Define `TYPESAFE_API_KEY` in `.env` or the process environment;
-`OPENAI_API_KEY` is not needed:
+Plain `--execute` selects the combined arm, never runs GPT, and requires a complete
+matching v2 baseline. It only calls Jev. Define `TYPESAFE_API_KEY` in `.env` or the
+process environment; `OPENAI_API_KEY` is not needed:
 
 ```sh
 .venv/bin/python compare.py --execute
@@ -172,6 +177,8 @@ Jev probabilities are preserved exactly. Three-choice relation distributions may
 sum within 0.015 of one; the five-choice identity distribution may sum within 0.025
 to accommodate two-decimal rounding. A selected choice within 0.01 of the reported
 maximum is retained with an explicit warning; larger mismatches fail validation.
+Decomposed streams use the same versioned rule: the sum tolerance is the greater of
+0.015 and 0.005 per available choice, while selected-choice tolerance remains 0.01.
 Reports flag discrepancies and never renormalize provider values.
 
 ## Relation contract and basket projection
@@ -220,6 +227,158 @@ Use that same `--manifest` argument, plus the worktree's `--data-dir` argument w
 needed, for the later developer-owned `--execute` command. Do not replace the
 original `results/relation-manifest.json`.
 
+## Decomposed Jev arm — operator handoff
+
+The decomposed arm keeps the same 800 directed pairs and byte-equivalent GPT input
+fingerprint. Jev receives four independent streams for every pair; requests are not
+conditionally skipped, so raw evidence remains comparable before the offline
+identity gate is applied:
+
+| Objective | Streams |
+|---|---|
+| both | identity |
+| complements | together-use, substitute, incompatibility |
+| style compatibility | construction/finish, design language, placement/context |
+
+Each stream preserves the selected choice, complete probability distribution,
+confidence, and rounding warnings. Identity must be accepted as `distinct` before
+an objective signal can produce an actionable basket label. The complements and
+style-compatibility resolvers are separate. Accepted positive and negative evidence
+in one objective becomes an explicit conflict rather than silently choosing a side.
+
+The canonical ignored adjudication artifact is
+`results/adjudication/jev-sbs-adjudication-v1/`. It freezes 48 development pairs and
+96 sealed holdout pairs, balanced by shop and direction. An unordered product-pair
+group cannot cross splits. Reviewer-facing evidence contains no
+provider outputs; holdout rows must not be compared with Jev output until the
+probability policy is immutable.
+
+### 1. Offline preparation
+
+Use a new decomposed manifest path and validate the canonical adjudication artifact:
+
+```sh
+.venv/bin/python compare.py --jev-arm decomposed \
+  --manifest results/decomposed-manifest-v1.json \
+  --adjudication-dir results/adjudication/jev-sbs-adjudication-v1
+```
+
+This is offline. For the frozen catalogs it prints 800 pairs and 248 Jev requests.
+It does not alter the GPT baseline. In a worktree, also pass the original checkout's
+absolute `--data-dir` as described above.
+
+### 2. Complete and publish the human review
+
+Copy `labels-template.jsonl` to a separate working file; never edit the template.
+Complete every identity, objective mechanism, final label, ambiguity flag, reviewer
+timestamp, and notes field from the frozen provider-blind evidence. Boris is the
+approved initial reviewer. Publish the completed file as append-only revision 1:
+
+```sh
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+import compare
+
+artifact = Path("results/adjudication/jev-sbs-adjudication-v1")
+completed = compare.jsonl_records(Path("/absolute/path/to/completed-labels-v1.jsonl"))
+print(json.dumps(compare.publish_adjudication_labels(artifact, completed, 1), indent=2))
+PY
+```
+
+Publication validates all 144 labels, mechanisms, timestamps, split identities, and
+the append-only digest chain. A changed revision must use the next revision number;
+existing revision files cannot be replaced.
+
+### 3. Developer-owned paid Jev run
+
+After checking current TypeSafe limits, pricing, and intended spend, Boris runs:
+
+```sh
+.venv/bin/python compare.py --jev-arm decomposed \
+  --manifest results/decomposed-manifest-v1.json \
+  --adjudication-dir results/adjudication/jev-sbs-adjudication-v1 \
+  --execute
+```
+
+This is the only paid command in this handoff. It requires `TYPESAFE_API_KEY`, makes
+no GPT calls, reuses the completed matching v2 baseline, and creates a fresh
+experiment directory. The frozen workload currently produces 248 Jev requests
+before retries. Every pair receives all four applicable streams; identity covers all
+800 pairs, while each objective-specific stream covers that objective's 400 pairs.
+The experiment does not measure the savings of a production identity cascade. Never
+rerun merely to repair derived reports—use report-only processing.
+
+The completed run immediately writes raw stream reports with no selected threshold.
+Missing or malformed answers remain failures, not semantic skips or zero usage.
+
+### 4. Generate development curves while the holdout stays sealed
+
+Replace `YOUR-RUN-ID` and the revision number as needed:
+
+```sh
+.venv/bin/python compare.py --report-only \
+  --output-dir results/experiments/YOUR-RUN-ID \
+  --adjudication-dir results/adjudication/jev-sbs-adjudication-v1 \
+  --review-revision 1
+```
+
+This creates immutable `probability-curves.json` from the 48 development pairs only.
+It does not choose thresholds, copy the full review into the run, or reveal holdout
+labels in CSV reports. Inspect precision and coverage for the global identity rule
+and each objective stream. Do not open or join the holdout labels with provider
+output during policy selection.
+
+### 5. Boris selects and freezes the probability policy
+
+Create a JSON file with this exact shape. Every placeholder must be replaced with a
+reviewed numeric value from 0 to 1; the script never supplies or optimizes one:
+
+```json
+{
+  "schema_version": "decomposed-probability-policy-selection-v1",
+  "chosen_by": "Boris",
+  "chosen_at": "YYYY-MM-DDTHH:MM:SS+00:00",
+  "rules": {
+    "identity": {"min_probability": "<reviewed>", "min_margin": "<reviewed>"},
+    "objectives": {
+      "complements": {
+        "together_use": {"min_probability": "<reviewed>", "min_margin": "<reviewed>"},
+        "substitute": {"min_probability": "<reviewed>", "min_margin": "<reviewed>"},
+        "incompatibility": {"min_probability": "<reviewed>", "min_margin": "<reviewed>"}
+      },
+      "style_compatibility": {
+        "construction_finish": {"min_probability": "<reviewed>", "min_margin": "<reviewed>"},
+        "design_language": {"min_probability": "<reviewed>", "min_margin": "<reviewed>"},
+        "placement_context": {"min_probability": "<reviewed>", "min_margin": "<reviewed>"}
+      }
+    }
+  }
+}
+```
+
+The quoted placeholders deliberately make the template invalid for publication;
+replace them with JSON numbers. Then freeze the policy and generate human-grounded
+development and holdout reports:
+
+```sh
+.venv/bin/python compare.py --report-only \
+  --output-dir results/experiments/YOUR-RUN-ID \
+  --adjudication-dir results/adjudication/jev-sbs-adjudication-v1 \
+  --review-revision 1 \
+  --policy-selection /absolute/path/to/boris-policy-selection.json
+```
+
+The command binds the immutable policy to the exact manifest, experiment, request
+log, review revision, and already-reviewed curve bytes before copying the full review
+snapshot and evaluating the holdout. A different policy cannot replace it. After
+publication, deterministic reconstruction needs only the saved run directory:
+
+```sh
+.venv/bin/python compare.py --report-only \
+  --output-dir results/experiments/YOUR-RUN-ID
+```
+
 ## Results
 
 All outputs are ignored by Git. Each v2 experiment directory contains:
@@ -235,8 +394,28 @@ All outputs are ignored by Git. Each v2 experiment directory contains:
 | `disagreements.csv` | Successful pairs differing on any raw head or basket result |
 | `summary.json` | Per-head/basket matrices, distributions, filtered/conflict counts, failures, and separated historical GPT versus new Jev accounting |
 
+A decomposed experiment uses the same immutable manifest, baseline, experiment, and
+request log, plus:
+
+| File | Contents |
+|---|---|
+| `adjudication.json` | Frozen base adjudication manifest used when execution started |
+| `jev_stream_classifications.jsonl` | One record per pair with every raw objective stream and status |
+| `probability-curves.json` | Immutable development-only threshold/margin curves; never an automatically selected policy |
+| `probability-policy.json` | Boris-selected immutable rules bound to the run, review revision, and curve bytes |
+| `review-labels.jsonl`, `review-evidence.jsonl`, `review-labels.manifest.json` | Full reviewed snapshot copied only after policy publication |
+| `paired_results.csv` | Raw streams and, once selected, per-stream policy decisions and objective resolution |
+| `summary.json` | Stream counts, operational accounting, policy status, human metrics/slices, conflicts, calibration, and secondary GPT agreement |
+
+Before policy selection, decomposed `paired_results.csv` can expose development
+labels but not holdout labels. After selection, human metrics report precision,
+hard-negative precision, coverage, abstention, confusion, calibration, conflicts,
+objective/shop/direction slices, and pair-count-pro-rata cost per accepted correct
+label. Group sections retain latency, retries, usage, and total run cost.
+
 The CSV writer prefixes formula-like catalog text with an apostrophe. JSON retains
-the original text. Usage belongs to requests and is not apportioned across pairs.
+the original text. Raw usage belongs to requests and is not apportioned across pairs;
+the decomposed human metric explicitly labels its pair-count-pro-rata cost estimate.
 
 Regenerate reports without catalog inputs, credentials, or network access:
 
@@ -246,12 +425,13 @@ Regenerate reports without catalog inputs, credentials, or network access:
 ```
 
 Reports use only that directory's immutable manifest, GPT baseline, experiment,
-and raw request log. They verify snapshot digests and Jev request hashes. Changing
-live provider prompts, criteria, or pricing cannot rewrite the snapshotted inputs.
-Basket projection dispatches to the saved resolver version; an unavailable version
-stops reporting rather than reinterpreting historical judgments. Derived reports
-are replaced deterministically by the report extraction and resolver versions; raw
-snapshots and `requests.jsonl` are not.
+raw request log, and any published review/policy snapshots. They verify snapshot
+digests and Jev request hashes. Changing live provider prompts, criteria, pricing,
+or the curve grid cannot rewrite snapshotted inputs or a published policy. Basket
+projection dispatches to the saved resolver version; an unavailable version stops
+reporting rather than reinterpreting historical judgments. Derived reports are
+replaced deterministically by the report extraction, policy, and resolver versions;
+raw snapshots and `requests.jsonl` are not.
 
 For the original FERODEV-8257 combined run, use:
 
@@ -287,6 +467,14 @@ re-extracted offline without editing the raw log or making new calls.
 - **Usage and cost:** every recorded attempt contributes. Missing provider usage
   leaves totals null rather than zero. Costs are dated estimates, not bills; verify
   them in provider consoles.
+- **Decomposed human metrics:** reviewed labels, not GPT, define correctness.
+  Development curves describe candidate thresholds; only the frozen policy is
+  evaluated on the holdout. Abstentions remain in coverage denominators, conflicts
+  stay explicit, and incomplete reviewed inference makes the metric status
+  incomplete rather than fabricating a score.
+- **Decomposed cost per accepted correct label:** the selected review split receives
+  a pair-count-pro-rata allocation of whole-run Jev cost. It is an experiment-level
+  comparison aid, not provider billing or a production serving estimate.
 
 Pricing references: [OpenAI](https://platform.openai.com/docs/pricing) and
 [TypeSafe](https://docs.typesafe.ai/models).
@@ -300,7 +488,16 @@ sample under the revised objectives. Forward/reverse direction is part of pair
 identity; the same product IDs can appear in both directions.
 
 Combined requests maximize provider comparability but do not measure the request or
-token savings of a future two-pass identity gate. Batch context and different API
-interfaces can affect answers. The experiment is a semantic prompt/extraction
-diagnostic, not calibrated accuracy, capacity, recommendation-quality, or production
-training validation. Paid-run results still require human or agent semantic review.
+token savings of a future two-pass identity gate. The decomposed arm also sends all
+four applicable streams for every pair: it repeats product evidence, increases
+request count, and does not implement a production cascade. Batch context and
+different API interfaces can affect answers. The 48-pair development set is small;
+its curves are selection evidence, not proof of calibrated probabilities. The
+96-pair holdout is used once against the frozen policy and must not be recycled into
+tuning.
+
+This experiment is a semantic prompt/extraction diagnostic, not capacity,
+recommendation-quality, embedding-quality, or production training validation. It
+does not change production retrieval, schemas, prompts, dependencies, or deployment
+code. Paid-run results still require human review. GPT agreement remains secondary
+comparison evidence and never substitutes for reviewed correctness.
