@@ -21,6 +21,7 @@ Run from the repository root after the README setup.
 - Offline reports: `.venv/bin/python compare.py --report-only`
 - For a newer experiment, add `--output-dir` with its printed directory path.
 - Offline fresh GPT baseline preparation: `.venv/bin/python compare.py --prepare-baseline`
+- After a Jev-only criteria change, use a new `--manifest` path and reuse the matching GPT baseline; never replace the prior manifest.
 
 ## Public interfaces other repos depend on
 None known. This local experiment does not change embedding-service contracts.

@@ -151,62 +151,92 @@ JEV_CRITERIA = {
 IDENTITY_CRITERIA = {
     "duplicate": "The two listings describe the same product, not merely similar products.",
     "variant": (
-        "The same named model or product family differs only on a variant axis such as size, colour, finish, scent, "
-        "origin, grade, or pack size."
+        "The same named model or clearly established product family differs only on a variant axis such as size, "
+        "colour, finish, scent, origin, grade, or pack size. Shared brand, collection, colour, or category without "
+        "the same named model or clearly established family is not enough."
     ),
     "redundant": (
         "In this direction the base already includes or integrates the candidate, so buying the candidate repeats "
         "something supplied by the base."
     ),
     "distinct": "The candidate is a genuinely distinct product from the base.",
-    "uncertain": "The supplied product evidence cannot safely establish identity or directional redundancy.",
+    "uncertain": (
+        "The supplied product evidence cannot safely distinguish a true identity/family relationship from merely "
+        "related products, or cannot establish directional redundancy."
+    ),
 }
 RELATION_CRITERIA = {
     "co_purchase": {
         "yes": (
-            "After selecting the base, the shopper would reasonably add the candidate to the same purchase. The "
-            "supplied text establishes a direct accessory, component, refill, setup, room, meal, outfit, activity, "
-            "or other concrete together-purchase relationship."
+            "The supplied text establishes a specific together-use relationship after selecting the base: an "
+            "accessory or component, compatible part, refill or consumable dependency, setup requirement, explicit "
+            "serving or recipe pairing, coordinated-use pairing, or bundle with directly complementary contents."
         ),
-        "no": "The supplied text establishes that the candidate is not useful to buy with the selected base.",
-        "uncertain": "The supplied text is insufficient to establish or reject a together-purchase relationship.",
+        "no": (
+            "The supplied text establishes that the candidate is not useful to buy with the selected base, including "
+            "a competing single-item role without multi-unit or bundle context, or an explicitly unrelated use context."
+        ),
+        "uncertain": (
+            "The supplied text establishes neither a concrete together-use relationship nor that the products should "
+            "not be bought together. Plausible joint purchase alone is uncertain."
+        ),
     },
     "alternative": {
         "yes": (
-            "Before selecting the base, the shopper could reasonably buy the distinct candidate instead. It has a "
-            "compatible functional role and use context supported by the supplied text."
+            "The distinct candidate has the same immediate purchasing role and compatible use context, so the "
+            "supplied text supports choosing it instead of the base."
         ),
-        "no": "The supplied text establishes that the candidate is not a credible instead-of choice for the base.",
-        "uncertain": "The supplied text is insufficient to establish or reject an alternative relationship.",
+        "no": (
+            "The supplied text establishes a different primary role or use context, or identifies the candidate as an "
+            "accessory, component, sauce, seasoning, side item, or other related product rather than a replacement."
+        ),
+        "uncertain": (
+            "The supplied text does not establish whether the distinct candidate fills the same immediate purchasing "
+            "role. Shared category or broad use alone is uncertain."
+        ),
     },
     "incompatible": {
         "yes": (
-            "The candidate is strongly related to the base but explicitly unusable, wrong-context, or incompatible "
-            "according to the supplied text."
+            "The supplied text explicitly establishes that the candidate is unusable with the base because of size, "
+            "interface, system, specification, use context, dietary constraint, or another concrete incompatibility."
         ),
-        "no": "The supplied text establishes no explicit incompatibility or wrong-context relationship.",
-        "uncertain": "The supplied text is insufficient to establish or reject incompatibility.",
+        "no": "The supplied text affirmatively establishes compatibility or rules out the relevant mismatch.",
+        "uncertain": (
+            "The supplied text establishes neither compatibility nor a concrete incompatibility. Different product "
+            "types, flavours, or missing fit information are uncertain, not incompatible."
+        ),
     },
 }
 IDENTITY_INSTRUCTION = (
     "Classify the IDENTITY of candidates[{index}] relative to base in this direction. Identity is separate from "
-    "whether the products complement, replace, or conflict with each other."
+    "whether the products complement, replace, or conflict with each other. Do not infer a variant from shared "
+    "brand, collection, colour, or category without the same named model or a clearly established product family."
+)
+RELATION_UNCERTAINTY_INSTRUCTION = (
+    "Use uncertain whenever the supplied listing text establishes neither yes nor no. Absence of evidence is not no, "
+    "and a merely plausible relationship is not yes."
 )
 RELATION_INSTRUCTIONS = {
     "co_purchase": (
         "Judge candidates[{index}] independently for CO-PURCHASE in this direction: after selecting base, would the "
-        "shopper reasonably add the candidate to the same purchase? Concrete functional or coordinated-use evidence "
-        "is required; broad similarity alone is insufficient. Do not suppress this answer because of identity."
+        "shopper reasonably add the candidate to the same purchase? Require a concrete accessory, dependency, "
+        "serving or recipe, bundle, or coordinated-use relationship. Shared category, brand, collection, colour, "
+        "style, cuisine, or plausible joint purchase is insufficient. Do not suppress this answer because of identity. "
+        + RELATION_UNCERTAINTY_INSTRUCTION
     ),
     "alternative": (
         "Judge candidates[{index}] independently as an ALTERNATIVE in this direction: before selecting base, would "
-        "the shopper reasonably buy the candidate instead? Require a compatible functional role and use context. "
-        "Do not suppress this answer because of identity."
+        "the shopper reasonably buy the candidate instead? Require the same immediate purchasing role and compatible "
+        "use context, not merely the same broad category. Variants, line extensions, accessories, components, sauces, "
+        "seasonings, and side items are not alternatives. Do not suppress this answer because of identity. "
+        + RELATION_UNCERTAINTY_INSTRUCTION
     ),
     "incompatible": (
         "Judge candidates[{index}] independently for INCOMPATIBILITY in this direction: is the candidate strongly "
-        "related but explicitly unusable, wrong-context, or incompatible with base? Do not infer incompatibility "
-        "from missing evidence or suppress this answer because of identity."
+        "related but explicitly unusable with base? Require a stated size, interface, system, specification, context, "
+        "dietary, or other concrete mismatch. Different product types, flavours, or missing fit information are not "
+        "evidence of incompatibility. Do not suppress this answer because of identity. "
+        + RELATION_UNCERTAINTY_INSTRUCTION
     ),
 }
 GPT_RELATION_SYSTEM_PROMPT = """You evaluate directed product pairs for four separate SBS decisions.

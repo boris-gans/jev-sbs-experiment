@@ -398,6 +398,11 @@ def test_combined_relation_payloads_use_same_products_and_all_heads(prepared):
             question = jev["questions"][f"candidate_{index}_{head}"]
             assert set(question["criteria"]) == set(compare.RELATION_LABELS)
             assert f"candidates[{index}]" in question["instructions"]
+            assert compare.RELATION_UNCERTAINTY_INSTRUCTION in question["instructions"]
+    assert "plausible joint purchase is insufficient" in jev["questions"]["candidate_0_co_purchase"]["instructions"]
+    assert "same immediate purchasing role" in jev["questions"]["candidate_0_alternative"]["instructions"]
+    assert "concrete mismatch" in jev["questions"]["candidate_0_incompatible"]["instructions"]
+    assert "shared brand, collection, colour, or category" in jev["questions"]["candidate_0_identity"]["instructions"]
     schema = gpt["response_format"]["json_schema"]["schema"]
     judgment = schema["properties"]["judgments"]["items"]
     assert judgment["properties"]["identity"]["properties"]["label"]["enum"] == list(compare.IDENTITY_LABELS)
@@ -1291,6 +1296,10 @@ def test_v2_gpt_fingerprint_tracks_only_gpt_relation_inputs(relation_prepared):
     assert compare.baseline_spec(changed) != original
     changed = copy.deepcopy(manifest)
     changed["contract"]["relation_criteria"]["co_purchase"]["yes"] += " Jev-only change."
+    assert compare.baseline_spec(changed) == original
+    changed = copy.deepcopy(manifest)
+    changed["contract"]["relation_instructions"]["alternative"] += " Jev-only change."
+    changed["contract"]["identity_instruction"] += " Jev-only change."
     assert compare.baseline_spec(changed) == original
     changed = copy.deepcopy(manifest)
     changed["shops"]["furniture.co.uk"]["batches"][0]["candidates"].reverse()

@@ -170,8 +170,9 @@ responses fail validation rather than becoming `uncertain` or `skip`.
 
 Jev probabilities are preserved exactly. Three-choice relation distributions may
 sum within 0.015 of one; the five-choice identity distribution may sum within 0.025
-to accommodate two-decimal rounding. Reports flag discrepancies and never
-renormalize provider values.
+to accommodate two-decimal rounding. A selected choice within 0.01 of the reported
+maximum is retained with an explicit warning; larger mismatches fail validation.
+Reports flag discrepancies and never renormalize provider values.
 
 ## Relation contract and basket projection
 
@@ -199,6 +200,25 @@ preserved even when identity filters the derived basket label.
 Changing the GPT prompt/schema or pair evidence selects a fresh baseline. A
 Jev-only criteria experiment may reuse the baseline, but creates a new manifest and
 experiment snapshot. Agreement with GPT is comparison evidence, not ground truth.
+
+The post-run Jev criteria require affirmative listing evidence for `yes` or `no`;
+missing evidence is `uncertain`. Co-purchase needs a concrete together-use reason,
+alternative needs the same immediate purchasing role, and incompatibility needs an
+explicit mismatch. Shared category, collection, brand, cuisine, colour, or plausible
+joint purchase is insufficient by itself.
+
+The original paid run and its manifest remain immutable. Prepare any later
+Jev-criteria experiment under a new manifest path while reusing the matching GPT
+baseline:
+
+```sh
+.venv/bin/python compare.py \
+  --manifest results/relation-manifest-evidence-v2.json
+```
+
+Use that same `--manifest` argument, plus the worktree's `--data-dir` argument when
+needed, for the later developer-owned `--execute` command. Do not replace the
+original `results/relation-manifest.json`.
 
 ## Results
 
